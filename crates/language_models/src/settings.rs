@@ -5,11 +5,11 @@ use settings::RegisterSetting;
 
 use crate::provider::{
     anthropic, anthropic::AnthropicSettings, anthropic_compatible::AnthropicCompatibleSettings,
-    bedrock, bedrock::AmazonBedrockSettings, cloud::ZedDotDevSettings, deepseek::DeepSeekSettings,
-    google::GoogleSettings, llama_cpp::LlamaCppSettings, lmstudio::LmStudioSettings, mistral,
-    mistral::MistralSettings, ollama::OllamaSettings, open_ai::OpenAiSettings,
-    open_ai_compatible::OpenAiCompatibleSettings, open_router, open_router::OpenRouterSettings,
-    opencode, opencode::OpenCodeSettings, resolve_custom_headers,
+    bedrock_settings, bedrock_settings::AmazonBedrockSettings, cloud::ZedDotDevSettings,
+    deepseek::DeepSeekSettings, google::GoogleSettings, llama_cpp::LlamaCppSettings,
+    lmstudio::LmStudioSettings, mistral, mistral::MistralSettings, ollama::OllamaSettings,
+    open_ai::OpenAiSettings, open_ai_compatible::OpenAiCompatibleSettings, open_router,
+    open_router::OpenRouterSettings, opencode, opencode::OpenCodeSettings, resolve_custom_headers,
     vercel_ai_gateway::VercelAiGatewaySettings, x_ai::XAiSettings,
 };
 
@@ -99,7 +99,7 @@ impl settings::Settings for AllLanguageModelSettings {
                 custom_headers: custom_headers_from(
                     "Amazon Bedrock",
                     bedrock.custom_headers,
-                    bedrock::RESERVED_HEADER_NAMES,
+                    bedrock_settings::RESERVED_HEADER_NAMES,
                 ),
                 region: bedrock.region,
                 endpoint: bedrock.endpoint_url, // todo(should be api_url)

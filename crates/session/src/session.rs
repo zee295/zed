@@ -58,6 +58,17 @@ impl Session {
     pub fn id(&self) -> &str {
         &self.session_id
     }
+
+    /// Creates a new session with no prior state. Intended for use in the
+    /// browser, where persistence is not yet implemented.
+    #[cfg(target_family = "wasm")]
+    pub fn for_web() -> Self {
+        Self {
+            session_id: uuid::Uuid::new_v4().to_string(),
+            old_session_id: None,
+            old_window_ids: None,
+        }
+    }
 }
 
 pub struct AppSession {

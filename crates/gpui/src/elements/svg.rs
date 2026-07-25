@@ -268,7 +268,14 @@ impl Asset for SvgAsset {
         _cx: &mut App,
     ) -> impl Future<Output = Self::Output> + Send + 'static {
         async move {
-            let bytes = fs::read(Path::new(source.as_ref())).map_err(|e| Arc::new(e))?;
+            // On wasm there is no local fs; read through the remote fs bridge
+            // (smol is patched to smol_wasm) so external SVGs (e.g. agent icons
+            // stored under the host's config dir) resolve from the server.
+            #[cfg(target_family = "wasm")]
+            let read_result = smol::fs::read(Path::new(source.as_ref())).await;
+            #[cfg(not(target_family = "wasm"))]
+            let read_result = fs::read(Path::new(source.as_ref()));
+            let bytes = read_result.map_err(|e| Arc::new(e))?;
             let bytes = Arc::from(bytes);
             Ok(bytes)
         }

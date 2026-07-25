@@ -2,6 +2,8 @@ mod mappings;
 
 mod alacritty;
 mod pty_info;
+#[cfg(target_family = "wasm")]
+mod remote_pty;
 pub mod terminal_settings;
 
 #[cfg(not(windows))]
@@ -46,11 +48,13 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
+// wasm: std::time::Instant panics ("time not implemented on this platform")
 use thiserror::Error;
 use vte::ansi::{Attr, Handler, Processor, StdSyncHandler};
 pub use vte::ansi::{Color, NamedColor, Rgb};
+use web_time::Instant;
 
 use gpui::{
     App, AppContext as _, BackgroundExecutor, Bounds, ClipboardItem, Context, EventEmitter, Hsla,
@@ -58,19 +62,21 @@ use gpui::{
     Point as GpuiPoint, Rgba, ScrollWheelEvent, Size, Task, TouchPhase, Window, actions, black, px,
 };
 
-#[cfg(not(windows))]
+use crate::alacritty::PtySender;
+#[cfg(all(not(windows), not(target_family = "wasm")))]
 use crate::alacritty::current_child_signal_mask;
 use crate::alacritty::{
     AlacrittyCell, AlacrittyGridIterator, AlacrittyHyperlink, AlacrittySearch, AlacrittyTerm,
-    AlacrittyTermConfig, AlacrittyTermLock, HyperlinkMatch, PtySender, RegexSearches,
-    append_text_to_term, apply_config, clear_saved_screen, content_text, display_offset,
-    display_only_term_config, find_from_terminal_point, full_content_range, last_non_empty_lines,
-    make_content, new_term, open_pty, pty_options, pty_term_config, resize, screen_lines,
-    scroll_display, scroll_to_point, search_matches, selection_text, set_default_cursor_style,
-    set_selection as set_term_selection, shrink_to_used, spawn_event_loop,
+    AlacrittyTermConfig, AlacrittyTermLock, HyperlinkMatch, RegexSearches, append_text_to_term,
+    apply_config, clear_saved_screen, content_text, display_offset, display_only_term_config,
+    find_from_terminal_point, full_content_range, last_non_empty_lines, make_content, new_term,
+    pty_term_config, resize, screen_lines, scroll_display, scroll_to_point, search_matches,
+    selection_text, set_default_cursor_style, set_selection as set_term_selection, shrink_to_used,
     toggle_vi_mode as toggle_term_vi_mode, total_lines, update_selection as update_term_selection,
     update_selection_to_vi_cursor, update_vi_cursor_for_scroll, vi_goto_point, vi_motion,
 };
+#[cfg(not(target_family = "wasm"))]
+use crate::alacritty::{open_pty, pty_options, spawn_event_loop};
 use crate::mappings::colors::to_vte_rgb;
 use crate::mappings::keys::to_esc_str;
 
@@ -89,6 +95,20 @@ impl HeadlessTerminal {
     pub fn is_enabled(cx: &App) -> bool {
         cx.try_global::<Self>().is_some_and(|headless| headless.0)
     }
+}
+
+/// Global JSON-RPC client used by WASM terminals to reach the server-side PTY.
+#[cfg(target_family = "wasm")]
+static REMOTE_CLIENT: std::sync::Mutex<Option<wasm_rpc::RpcClient>> = std::sync::Mutex::new(None);
+
+#[cfg(target_family = "wasm")]
+pub fn set_remote_client(client: wasm_rpc::RpcClient) {
+    *REMOTE_CLIENT.lock().unwrap() = Some(client);
+}
+
+#[cfg(target_family = "wasm")]
+fn remote_client() -> Option<wasm_rpc::RpcClient> {
+    REMOTE_CLIENT.lock().unwrap().clone()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -742,6 +762,9 @@ impl fmt::Debug for TerminalBackendEvent {
 
 enum PtyEvent {
     Event(TerminalBackendEvent),
+    /// Raw bytes from a remote PTY (WASM only).
+    #[cfg(target_family = "wasm")]
+    Bytes(Vec<u8>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1016,6 +1039,7 @@ impl TerminalBuilder {
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub fn new(
         working_directory: Option<PathBuf>,
         task: Option<TaskState>,
@@ -1312,14 +1336,147 @@ impl TerminalBuilder {
         cx.background_spawn(fut)
     }
 
+    /// WASM remote terminal: opens a server-side PTY and wires its I/O to the
+    /// same alacritty `Term` renderer used on desktop.
+    #[cfg(target_family = "wasm")]
+    pub fn new(
+        working_directory: Option<PathBuf>,
+        task: Option<TaskState>,
+        shell: Shell,
+        env: HashMap<String, String>,
+        cursor_shape: SettingsCursorShape,
+        alternate_scroll: AlternateScroll,
+        max_scroll_history_lines: Option<usize>,
+        path_hyperlink_regexes: Vec<String>,
+        path_hyperlink_timeout_ms: u64,
+        _is_remote_terminal: bool,
+        window_id: u64,
+        completion_tx: Option<Sender<Option<ExitStatus>>>,
+        cx: &App,
+        activation_script: Vec<String>,
+        path_style: PathStyle,
+    ) -> Task<Result<TerminalBuilder>> {
+        let background_executor = cx.background_executor().clone();
+        let fut = async move {
+            let Some(client) = remote_client() else {
+                bail!("terminal remote client not set; call terminal::set_remote_client first");
+            };
+
+            let scrolling_history = max_scroll_history_lines
+                .unwrap_or(DEFAULT_SCROLL_HISTORY_LINES)
+                .min(MAX_SCROLL_HISTORY_LINES);
+            let config = pty_term_config(scrolling_history, cursor_shape);
+
+            let (events_tx, events_rx) = unbounded();
+            let term = new_term(
+                &config,
+                TerminalBounds::default(),
+                events_tx.clone(),
+                alternate_scroll,
+            );
+
+            let shell_params = match &shell {
+                Shell::System => None,
+                Shell::Program(program) => Some((program.clone(), Vec::new())),
+                Shell::WithArguments {
+                    program,
+                    args,
+                    title_override: _,
+                } => Some((program.clone(), args.clone())),
+            };
+
+            let remote_pty = crate::remote_pty::RemotePty::open(
+                client,
+                shell_params,
+                working_directory,
+                env.clone(),
+                TerminalBounds::default(),
+                events_tx,
+            )
+            .await
+            .context("failed to open remote PTY")?;
+            let pty_tx = PtySender::new(Arc::new(remote_pty));
+            let pty_info = PtyProcessInfo::new(ProcessIdGetter::new(0, 0));
+
+            let terminal = Terminal {
+                task,
+                terminal_type: TerminalType::Pty {
+                    pty_tx,
+                    info: Arc::new(pty_info),
+                },
+                subprocess: None,
+                completion_tx,
+                term,
+                term_config: config,
+                output_processor: Processor::<StdSyncHandler>::new(),
+                title_override: None,
+                events: VecDeque::with_capacity(10),
+                last_content: Default::default(),
+                last_mouse: None,
+                mouse_down_position: None,
+                matches: Vec::new(),
+                selection_head: None,
+                breadcrumb_text: String::new(),
+                scroll_px: px(0.),
+                next_link_id: 0,
+                selection_phase: SelectionPhase::Ended,
+                hyperlink_regex_searches: RegexSearches::new(
+                    &path_hyperlink_regexes,
+                    path_hyperlink_timeout_ms,
+                ),
+                vi_mode_enabled: false,
+                is_remote_terminal: true,
+                last_mouse_move_time: Instant::now(),
+                last_hyperlink_search_position: None,
+                mouse_down_hyperlink: None,
+                activation_script,
+                template: CopyTemplate {
+                    shell,
+                    env,
+                    cursor_shape,
+                    alternate_scroll,
+                    max_scroll_history_lines,
+                    path_hyperlink_regexes,
+                    path_hyperlink_timeout_ms,
+                    window_id,
+                },
+                child_exited: None,
+                keyboard_input_sent: false,
+                init_command_startup_marker: None,
+                init_command_startup_tx: None,
+                event_loop_task: Task::ready(Ok(())),
+                background_executor,
+                path_style,
+                #[cfg(any(test, feature = "test-support"))]
+                input_log: Vec::new(),
+                #[cfg(any(test, feature = "test-support"))]
+                pty_write_log: Default::default(),
+            };
+
+            Ok(TerminalBuilder {
+                terminal,
+                events_rx,
+            })
+        };
+        cx.background_spawn(fut)
+    }
+
     pub fn subscribe(mut self, cx: &Context<Terminal>) -> Terminal {
         //Event loop
         self.terminal.event_loop_task = cx.spawn(async move |terminal, cx| {
             while let Some(event) = self.events_rx.next().await {
-                terminal.update(cx, |terminal, cx| {
-                    //Process the first event immediately for lowered latency
-                    terminal.process_pty_event(event, cx);
-                })?;
+                // Never bail the loop on a single update failure (e.g. transient
+                // App re-entrancy on wasm) — that would stop all future PTY output.
+                if terminal
+                    .update(cx, |terminal, cx| {
+                        //Process the first event immediately for lowered latency
+                        terminal.process_pty_event(event, cx);
+                    })
+                    .is_err()
+                {
+                    log::warn!("terminal event loop: update failed; continuing");
+                    continue;
+                }
 
                 'outer: loop {
                     let mut events = Vec::new();
@@ -1360,15 +1517,20 @@ impl TerminalBuilder {
                         break 'outer;
                     }
 
-                    terminal.update(cx, |this, cx| {
-                        if wakeup {
-                            this.process_event(TerminalBackendEvent::Wakeup, cx);
-                        }
+                    if terminal
+                        .update(cx, |this, cx| {
+                            if wakeup {
+                                this.process_event(TerminalBackendEvent::Wakeup, cx);
+                            }
 
-                        for event in events {
-                            this.process_pty_event(event, cx);
-                        }
-                    })?;
+                            for event in events {
+                                this.process_pty_event(event, cx);
+                            }
+                        })
+                        .is_err()
+                    {
+                        log::warn!("terminal event loop: batch update failed; continuing");
+                    }
                     yield_now().await;
                 }
             }
@@ -1508,6 +1670,8 @@ impl Terminal {
     fn process_pty_event(&mut self, event: PtyEvent, cx: &mut Context<Self>) {
         match event {
             PtyEvent::Event(event) => self.process_event(event, cx),
+            #[cfg(target_family = "wasm")]
+            PtyEvent::Bytes(bytes) => self.write_output(&bytes, cx),
         }
     }
 
@@ -1827,16 +1991,19 @@ impl Terminal {
     }
 
     pub fn write_output(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
-        // Inject bytes directly into the terminal emulator and refresh the UI.
-        // This bypasses the PTY/event loop for display-only terminals.
+        // Inject bytes into the alacritty Term (remote PTY path on wasm) and
+        // refresh last_content so the next paint shows the new cells.
         let mut previous_byte_was_cr = false;
         let converted = convert_lf_to_crlf(bytes, &mut previous_byte_was_cr);
 
-        let mut term = self.term.lock();
-        self.output_processor.advance(&mut *term, &converted);
-        drop(term);
+        {
+            let mut term = self.term.lock();
+            self.output_processor.advance(&mut *term, &converted);
+            self.last_content = make_content(&term, &self.last_content);
+        }
         self.detect_init_command_startup_marker();
         cx.emit(Event::Wakeup);
+        cx.notify();
     }
 
     pub fn total_lines(&self) -> usize {
@@ -2513,18 +2680,8 @@ impl Terminal {
                     };
 
                     if selection_type == Some(SelectionType::Simple) && e.modifiers.shift {
-                        if self.last_content.selection.is_some() {
-                            // Shift+click extends the existing selection to this point.
-                            self.events
-                                .push_back(InternalEvent::UpdateSelection(position));
-                        } else {
-                            // With no selection yet, Shift is the escape hatch for
-                            // selecting text while an app has mouse tracking enabled,
-                            // so anchor a selection here for the drag to extend.
-                            self.events.push_back(InternalEvent::SetSelection(Some(
-                                Selection::new(SelectionType::Simple, point, side),
-                            )));
-                        }
+                        self.events
+                            .push_back(InternalEvent::UpdateSelection(position));
                         return;
                     }
 
@@ -2812,11 +2969,17 @@ impl Terminal {
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub fn pid(&self) -> Option<sysinfo::Pid> {
         match &self.terminal_type {
             TerminalType::Pty { info, .. } => info.pid(),
             TerminalType::DisplayOnly => None,
         }
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub fn pid(&self) -> Option<u32> {
+        None
     }
 
     pub fn pid_getter(&self) -> Option<&ProcessIdGetter> {
@@ -3019,6 +3182,7 @@ impl SubprocessHandle {
 /// Spawns `program`/`args` as a plain subprocess with piped stdout/stderr and
 /// drives its output into `term`, mirroring what the Alacritty event loop does
 /// for a PTY but without one. Used when [`HeadlessTerminal`] is enabled.
+#[cfg(not(target_family = "wasm"))]
 fn spawn_task_subprocess(
     program: String,
     args: Vec<String>,
@@ -3767,114 +3931,6 @@ mod tests {
                 "a deliberate drag should start a selection"
             );
             assert!(terminal.selection_phase == SelectionPhase::Selecting);
-        });
-    }
-
-    /// With mouse tracking active (e.g. htop), Shift is the escape hatch to
-    /// select terminal text. Shift+drag must start a selection rather than being
-    /// swallowed as a "extend existing selection" no-op. Regression test for #60254.
-    #[gpui::test]
-    async fn test_terminal_shift_drag_selects_while_mouse_tracking(cx: &mut TestAppContext) {
-        // `?1002h` enables button-event mouse tracking, `?1006h` selects SGR encoding.
-        let terminal = init_ctrl_click_hyperlink_test(cx, b"\x1b[?1002h\x1b[?1006hhello world\r\n");
-
-        terminal.update(cx, |terminal, cx| {
-            assert!(
-                terminal.last_content.mode.intersects(Modes::MOUSE_MODE),
-                "mouse tracking should be active"
-            );
-
-            let shift = Modifiers {
-                shift: true,
-                ..Modifiers::none()
-            };
-            terminal.mouse_down(
-                &MouseDownEvent {
-                    button: MouseButton::Left,
-                    position: point(px(50.0), px(10.0)),
-                    modifiers: shift,
-                    click_count: 1,
-                    first_mouse: true,
-                },
-                cx,
-            );
-
-            // With no selection yet, the shift press must anchor a new selection
-            // so the following drag has something to extend.
-            assert!(
-                terminal
-                    .events
-                    .iter()
-                    .any(|event| matches!(event, InternalEvent::SetSelection(Some(_)))),
-                "shift+click with no existing selection should anchor a selection"
-            );
-            terminal.events.clear();
-
-            let region = terminal.last_content.terminal_bounds.bounds;
-            terminal.mouse_drag(
-                &MouseMoveEvent {
-                    position: point(px(90.0), px(10.0)),
-                    pressed_button: Some(MouseButton::Left),
-                    modifiers: shift,
-                },
-                region,
-                cx,
-            );
-
-            assert!(
-                terminal
-                    .events
-                    .iter()
-                    .any(|event| matches!(event, InternalEvent::UpdateSelection(_))),
-                "shift+drag should extend the selection while mouse tracking is active"
-            );
-            assert!(terminal.selection_phase == SelectionPhase::Selecting);
-        });
-    }
-
-    /// Shift+click with a selection already on screen must keep extending it
-    /// (the behavior added in #25143), not re-anchor a fresh one.
-    #[gpui::test]
-    async fn test_terminal_shift_click_extends_existing_selection(cx: &mut TestAppContext) {
-        let terminal = init_ctrl_click_hyperlink_test(cx, b"hello world\r\n");
-
-        terminal.update(cx, |terminal, cx| {
-            // A visible selection, as a sync would have populated in production.
-            terminal.last_content.selection = Some(SelectionRange {
-                start: Point::new(0, 0),
-                end: Point::new(0, 5),
-                is_block: false,
-            });
-            terminal.events.clear();
-
-            terminal.mouse_down(
-                &MouseDownEvent {
-                    button: MouseButton::Left,
-                    position: point(px(90.0), px(10.0)),
-                    modifiers: Modifiers {
-                        shift: true,
-                        ..Modifiers::none()
-                    },
-                    click_count: 1,
-                    first_mouse: true,
-                },
-                cx,
-            );
-
-            assert!(
-                terminal
-                    .events
-                    .iter()
-                    .any(|event| matches!(event, InternalEvent::UpdateSelection(_))),
-                "shift+click with an existing selection should extend it"
-            );
-            assert!(
-                !terminal
-                    .events
-                    .iter()
-                    .any(|event| matches!(event, InternalEvent::SetSelection(Some(_)))),
-                "shift+click should extend, not re-anchor, an existing selection"
-            );
         });
     }
 

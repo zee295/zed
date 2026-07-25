@@ -96,7 +96,7 @@ impl ExtensionBuilder {
         options: CompileExtensionOptions,
         fs: Arc<dyn Fs>,
     ) -> Result<()> {
-        let start = std::time::Instant::now();
+        let start = web_time::Instant::now();
 
         populate_defaults(extension_manifest, extension_dir, fs.clone()).await?;
 

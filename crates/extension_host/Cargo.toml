@@ -16,6 +16,7 @@ doctest = false
 test-support = []
 
 [dependencies]
+web-time.workspace = true
 anyhow.workspace = true
 async-compression.workspace = true
 async-tar.workspace = true

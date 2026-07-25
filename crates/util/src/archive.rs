@@ -143,6 +143,11 @@ pub async fn extract_seekable_zip<R: AsyncRead + AsyncSeek + Unpin>(
     Ok(())
 }
 
+#[cfg(target_family = "wasm")]
+pub async fn extract_zip<R: AsyncRead + Unpin>(_destination: &Path, _reader: R) -> Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use async_zip::ZipEntryBuilder;

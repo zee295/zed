@@ -1,13 +1,13 @@
 use gpui::{Context, Task};
-use parking_lot::{MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard};
+use parking_lot::Mutex;
 use std::{path::PathBuf, sync::Arc};
 
 #[cfg(target_os = "windows")]
 use windows::Win32::{Foundation::HANDLE, System::Threading::GetProcessId};
 
-use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-
-use crate::{Event, Terminal};
+#[cfg(not(target_family = "wasm"))]
+use crate::Event;
+use crate::Terminal;
 
 #[derive(Clone, Copy)]
 pub struct ProcessIdGetter {
@@ -23,24 +23,31 @@ impl ProcessIdGetter {
         }
     }
 
-    pub fn fallback_pid(&self) -> Pid {
-        Pid::from_u32(self.fallback_pid)
+    pub fn fallback_pid(&self) -> u32 {
+        self.fallback_pid
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_family = "wasm")]
 impl ProcessIdGetter {
-    fn pid(&self) -> Option<Pid> {
+    fn pid(&self) -> Option<u32> {
+        None
+    }
+}
+
+#[cfg(all(unix, not(target_family = "wasm")))]
+impl ProcessIdGetter {
+    fn pid(&self) -> Option<u32> {
         // Negative pid means error.
         // Zero pid means no foreground process group is set on the PTY yet.
         // Avoid killing the current process by returning a zero pid.
         let pid = unsafe { libc::tcgetpgrp(self.handle) };
         if pid > 0 {
-            return Some(Pid::from_u32(pid as u32));
+            return Some(pid as u32);
         }
 
         if self.fallback_pid > 0 {
-            return Some(Pid::from_u32(self.fallback_pid));
+            return Some(self.fallback_pid);
         }
 
         None
@@ -49,7 +56,7 @@ impl ProcessIdGetter {
 
 #[cfg(windows)]
 impl ProcessIdGetter {
-    fn pid(&self) -> Option<Pid> {
+    fn pid(&self) -> Option<u32> {
         let pid = unsafe { GetProcessId(HANDLE(self.handle as _)) };
         // the GetProcessId may fail and returns zero, which will lead to a stack overflow issue
         if pid == 0 {
@@ -59,9 +66,9 @@ impl ProcessIdGetter {
             if self.fallback_pid == 0 {
                 return None;
             }
-            return Some(Pid::from_u32(self.fallback_pid));
+            return Some(self.fallback_pid);
         }
-        Some(Pid::from_u32(pid))
+        Some(pid)
     }
 }
 
@@ -72,22 +79,26 @@ pub(crate) struct ProcessInfo {
     pub(crate) argv: Vec<String>,
 }
 
-/// Fetches Zed-relevant Pseudo-Terminal (PTY) process information
+/// Fetches Zed-relevant Pseudo-Terminal (PTY) process information.
+#[cfg(not(target_family = "wasm"))]
 pub(crate) struct PtyProcessInfo {
-    system: RwLock<System>,
-    refresh_kind: ProcessRefreshKind,
+    system: parking_lot::RwLock<sysinfo::System>,
+    refresh_kind: sysinfo::ProcessRefreshKind,
     pid_getter: ProcessIdGetter,
-    last_foreground_pid: Mutex<Option<Pid>>,
-    pub(crate) current: RwLock<Option<ProcessInfo>>,
+    last_foreground_pid: Mutex<Option<sysinfo::Pid>>,
+    pub(crate) current: parking_lot::RwLock<Option<ProcessInfo>>,
     task: Mutex<Option<Task<()>>>,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl PtyProcessInfo {
     pub(crate) fn new(pid_getter: ProcessIdGetter) -> PtyProcessInfo {
+        use sysinfo::{ProcessesToUpdate, System, UpdateKind};
+
         // Task enumeration is on by default and would retain a `Process` entry
         // per thread, each pinning an open `/proc/<pid>/task/<tid>/stat` handle
         // on Linux (#58651).
-        let process_refresh_kind = ProcessRefreshKind::nothing()
+        let process_refresh_kind = sysinfo::ProcessRefreshKind::nothing()
             .with_cmd(UpdateKind::Always)
             .with_cwd(UpdateKind::Always)
             .with_exe(UpdateKind::Always)
@@ -99,17 +110,17 @@ impl PtyProcessInfo {
         // `kill_child_process` works before the first foreground refresh.
         let mut system = System::new();
         system.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&[pid_getter.fallback_pid()]),
+            ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid_getter.fallback_pid())]),
             true,
             process_refresh_kind,
         );
 
         PtyProcessInfo {
-            system: RwLock::new(system),
+            system: parking_lot::RwLock::new(system),
             refresh_kind: process_refresh_kind,
             pid_getter,
             last_foreground_pid: Mutex::new(None),
-            current: RwLock::new(None),
+            current: parking_lot::RwLock::new(None),
             task: Mutex::new(None),
         }
     }
@@ -118,9 +129,11 @@ impl PtyProcessInfo {
         &self.pid_getter
     }
 
-    fn refresh(&self) -> Option<MappedRwLockReadGuard<'_, Process>> {
-        let pid = self.pid_getter.pid()?;
-        let fallback_pid = self.pid_getter.fallback_pid();
+    fn refresh(&self) -> Option<parking_lot::MappedRwLockReadGuard<'_, sysinfo::Process>> {
+        use sysinfo::{ProcessesToUpdate, System};
+
+        let pid = self.pid_getter.pid().map(sysinfo::Pid::from_u32)?;
+        let fallback_pid = sysinfo::Pid::from_u32(self.pid_getter.fallback_pid());
         let mut system = self.system.write();
         // sysinfo never evicts processes that are absent from the refreshed pid
         // set, so entries for former foreground processes (each pinning an open
@@ -138,12 +151,12 @@ impl PtyProcessInfo {
         };
         system.refresh_processes_specifics(ProcessesToUpdate::Some(pids), true, self.refresh_kind);
         drop(system);
-        RwLockReadGuard::try_map(self.system.read(), |system| system.process(pid)).ok()
+        parking_lot::RwLockReadGuard::try_map(self.system.read(), |system| system.process(pid)).ok()
     }
 
-    fn get_child(&self) -> Option<MappedRwLockReadGuard<'_, Process>> {
-        let pid = self.pid_getter.fallback_pid();
-        RwLockReadGuard::try_map(self.system.read(), |system| system.process(pid)).ok()
+    fn get_child(&self) -> Option<parking_lot::MappedRwLockReadGuard<'_, sysinfo::Process>> {
+        let pid = sysinfo::Pid::from_u32(self.pid_getter.fallback_pid());
+        parking_lot::RwLockReadGuard::try_map(self.system.read(), |system| system.process(pid)).ok()
     }
 
     #[cfg(unix)]
@@ -151,7 +164,7 @@ impl PtyProcessInfo {
         let Some(pid) = self.pid_getter.pid() else {
             return false;
         };
-        unsafe { libc::killpg(pid.as_u32() as i32, libc::SIGKILL) == 0 }
+        unsafe { libc::killpg(pid as i32, libc::SIGKILL) == 0 }
     }
 
     #[cfg(not(unix))]
@@ -166,7 +179,7 @@ impl PtyProcessInfo {
     #[cfg(unix)]
     pub(crate) fn terminate_child_process(&self) -> bool {
         let pid = self.pid_getter.fallback_pid();
-        unsafe { libc::killpg(pid.as_u32() as i32, libc::SIGTERM) == 0 }
+        unsafe { libc::killpg(pid as i32, libc::SIGTERM) == 0 }
     }
 
     #[cfg(not(unix))]
@@ -226,7 +239,50 @@ impl PtyProcessInfo {
         }));
     }
 
-    pub(crate) fn pid(&self) -> Option<Pid> {
+    pub(crate) fn pid(&self) -> Option<sysinfo::Pid> {
+        self.pid_getter.pid().map(sysinfo::Pid::from_u32)
+    }
+}
+
+/// WASM stub: there is no local child process to inspect.
+#[cfg(target_family = "wasm")]
+pub(crate) struct PtyProcessInfo {
+    pid_getter: ProcessIdGetter,
+    pub(crate) current: parking_lot::RwLock<Option<ProcessInfo>>,
+    task: Mutex<Option<Task<()>>>,
+}
+
+#[cfg(target_family = "wasm")]
+impl PtyProcessInfo {
+    pub(crate) fn new(pid_getter: ProcessIdGetter) -> PtyProcessInfo {
+        PtyProcessInfo {
+            pid_getter,
+            current: parking_lot::RwLock::new(None),
+            task: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn pid_getter(&self) -> &ProcessIdGetter {
+        &self.pid_getter
+    }
+
+    pub(crate) fn kill_current_process(&self) -> bool {
+        false
+    }
+
+    pub(crate) fn kill_child_process(&self) -> bool {
+        false
+    }
+
+    pub(crate) fn terminate_child_process(&self) -> bool {
+        false
+    }
+
+    pub(crate) fn emit_title_changed_if_changed(self: &Arc<Self>, _cx: &mut Context<'_, Terminal>) {
+        // No local process to track.
+    }
+
+    pub(crate) fn pid(&self) -> Option<u32> {
         self.pid_getter.pid()
     }
 }
@@ -271,10 +327,10 @@ mod tests {
             child.wait().expect("failed to wait for child process");
         }
 
-        let churned_len = info.system.read().processes().len();
+        let final_len = info.system.read().processes().len();
         assert!(
-            churned_len <= 2,
-            "foreground process churn retained {churned_len} process entries"
+            final_len <= 2,
+            "refreshing the foreground process retained {final_len} process entries"
         );
     }
 }

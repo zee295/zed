@@ -138,6 +138,7 @@ dependencies = [
  "util",
  "uuid",
  "watch",
+ "web-time",
 ]
 
 [[package]]
@@ -206,6 +207,7 @@ dependencies = [
  "smallvec",
  "ui",
  "util",
+ "web-time",
  "workspace",
 ]
 
@@ -315,6 +317,7 @@ dependencies = [
  "util",
  "uuid",
  "watch",
+ "web-time",
  "web_search",
  "zed_env_vars",
  "zlog",
@@ -324,8 +327,6 @@ dependencies = [
 [[package]]
 name = "agent-client-protocol"
 version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed34c8297a72c9d99fc7493ba6370f45c69fdcd51fdfb469d80f266cf63e5a98"
 dependencies = [
  "agent-client-protocol-derive",
  "agent-client-protocol-schema",
@@ -558,6 +559,7 @@ dependencies = [
  "uuid",
  "vim",
  "watch",
+ "web-time",
  "workspace",
  "zed_actions",
 ]
@@ -616,7 +618,6 @@ dependencies = [
 [[package]]
 name = "alacritty_terminal"
 version = "0.26.1-dev"
-source = "git+https://github.com/zed-industries/alacritty?rev=4c129667ce56611becdc82de6e28218c80e2e88f#4c129667ce56611becdc82de6e28218c80e2e88f"
 dependencies = [
  "base64 0.22.1",
  "bitflags 2.10.0",
@@ -628,9 +629,10 @@ dependencies = [
  "piper",
  "polling",
  "regex-automata",
- "rustix 1.1.2",
+ "rustix 1.1.4",
  "rustix-openpty",
  "serde",
+ "serde_json",
  "signal-hook",
  "unicode-width",
  "vte",
@@ -1102,7 +1104,7 @@ dependencies = [
  "futures-lite 2.6.1",
  "parking",
  "polling",
- "rustix 1.1.2",
+ "rustix 1.1.4",
  "slab",
  "windows-sys 0.61.2",
 ]
@@ -1152,7 +1154,7 @@ dependencies = [
  "cfg-if",
  "event-listener 5.4.1",
  "futures-lite 2.6.1",
- "rustix 1.1.2",
+ "rustix 1.1.4",
 ]
 
 [[package]]
@@ -1178,7 +1180,7 @@ dependencies = [
  "cfg-if",
  "futures-core",
  "futures-io",
- "rustix 1.1.2",
+ "rustix 1.1.4",
  "signal-hook-registry",
  "slab",
  "windows-sys 0.61.2",
@@ -1237,14 +1239,24 @@ dependencies = [
 [[package]]
 name = "async-tar"
 version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6affe71e5b6180fb5eaf9e8127a243694baf6ae1120c199227167302f56c14b"
+dependencies = [
+ "async-tar-real",
+ "futures-core",
+]
+
+[[package]]
+name = "async-tar-real"
+version = "0.6.1"
 dependencies = [
  "async-std",
  "filetime",
  "futures-core",
  "libc",
  "redox_syscall 0.7.5",
+ "static_assertions",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
  "xattr",
 ]
 
@@ -2720,7 +2732,7 @@ source = "git+https://github.com/zed-industries/calloop#eb6b4fd17b9af5ecc226546b
 dependencies = [
  "bitflags 2.10.0",
  "polling",
- "rustix 1.1.2",
+ "rustix 1.1.4",
  "slab",
  "tracing",
 ]
@@ -2732,7 +2744,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "138efcf0940a02ebf0cc8d1eff41a1682a46b431630f4c52450d6265876021fa"
 dependencies = [
  "calloop",
- "rustix 1.1.2",
+ "rustix 1.1.4",
  "wayland-backend",
  "wayland-client",
 ]
@@ -2766,7 +2778,7 @@ checksum = "9f83833816c66c986e913b22ac887cec216ea09301802054316fc5301809702c"
 dependencies = [
  "cap-primitives",
  "cap-std",
- "rustix 1.1.2",
+ "rustix 1.1.4",
  "smallvec",
 ]
 
@@ -2782,7 +2794,7 @@ dependencies = [
  "io-lifetimes",
  "ipnet",
  "maybe-owned",
- "rustix 1.1.2",
+ "rustix 1.1.4",
  "rustix-linux-procfs",
  "windows-sys 0.59.0",
  "winx",
@@ -2807,7 +2819,7 @@ dependencies = [
  "cap-primitives",
  "io-extras",
  "io-lifetimes",
- "rustix 1.1.2",
+ "rustix 1.1.4",
 ]
 
 [[package]]
@@ -2820,7 +2832,7 @@ dependencies = [
  "cap-primitives",
  "iana-time-zone",
  "once_cell",
- "rustix 1.1.2",
+ "rustix 1.1.4",
  "winx",
 ]
 
@@ -3241,6 +3253,7 @@ dependencies = [
  "tokio-socks",
  "url",
  "util",
+ "web-time",
  "windows 0.61.3",
  "worktree",
  "zed_credentials_provider",
@@ -3253,6 +3266,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "smallvec",
+ "web-time",
 ]
 
 [[package]]
@@ -3822,6 +3836,7 @@ dependencies = [
  "tempfile",
  "url",
  "util",
+ "web-time",
 ]
 
 [[package]]
@@ -5577,6 +5592,7 @@ dependencies = [
  "ui",
  "util",
  "uuid",
+ "web-time",
  "workspace",
  "worktree",
  "zed_actions",
@@ -5740,6 +5756,7 @@ dependencies = [
  "time",
  "ui",
  "util",
+ "web-time",
  "workspace",
  "zed_actions",
  "zeta_prompt",
@@ -5829,6 +5846,7 @@ dependencies = [
  "util",
  "uuid",
  "vim_mode_setting",
+ "web-time",
  "workspace",
  "zed_actions",
  "zlog",
@@ -6345,6 +6363,7 @@ dependencies = [
  "util",
  "wasm-encoder 0.252.0",
  "wasmparser 0.252.0",
+ "web-time",
  "ztracing",
 ]
 
@@ -6427,8 +6446,40 @@ dependencies = [
  "wasmparser 0.252.0",
  "wasmtime",
  "wasmtime-wasi",
+ "web-time",
  "zlog",
  "ztracing",
+]
+
+[[package]]
+name = "extension_runtime_cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "collections",
+ "dap",
+ "extension",
+ "extension_host",
+ "fs",
+ "gpui",
+ "gpui_platform",
+ "gpui_tokio",
+ "http_client",
+ "language",
+ "lsp",
+ "node_runtime",
+ "release_channel",
+ "reqwest_client",
+ "semver",
+ "serde",
+ "serde_json",
+ "settings",
+ "smol",
+ "task",
+ "util",
+ "watch",
+ "which 6.0.3",
 ]
 
 [[package]]
@@ -6436,18 +6487,25 @@ name = "extensions_ui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "base64 0.22.1",
  "cloud_api_types",
  "collections",
  "command_palette_hooks",
+ "context_server",
+ "dap",
  "db",
  "editor",
  "extension",
  "extension_host",
  "fs",
+ "futures 0.3.32",
  "fuzzy",
  "gpui",
  "language",
+ "language_model",
  "log",
+ "lsp",
  "num-format",
  "picker",
  "project",
@@ -6455,14 +6513,20 @@ dependencies = [
  "schemars 1.0.4",
  "semver",
  "serde",
+ "serde_json",
  "settings",
  "smallvec",
+ "snippet_provider",
  "strum 0.27.2",
+ "task",
  "telemetry",
+ "theme",
  "theme_settings",
+ "toml 0.8.23",
  "ui",
  "util",
  "vim_mode_setting",
+ "wasm_remote",
  "workspace",
  "zed_actions",
 ]
@@ -6478,6 +6542,12 @@ name = "fallible-iterator"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
+
+[[package]]
+name = "fallible-streaming-iterator"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
 name = "fancy-regex"
@@ -6552,7 +6622,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ce92ff622d6dadf7349484f42c93271a0d49b7cc4d466a936405bacbe10aa78"
 dependencies = [
  "cfg-if",
- "rustix 1.1.2",
+ "rustix 1.1.4",
  "windows-sys 0.59.0",
 ]
 
@@ -6943,6 +7013,7 @@ dependencies = [
  "trash",
  "unicode-normalization",
  "util",
+ "web-time",
  "windows 0.61.3",
 ]
 
@@ -6953,7 +7024,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94e7099f6313ecacbe1256e8ff9d617b75d1bcb16a6fddef94866d225a01a14a"
 dependencies = [
  "io-lifetimes",
- "rustix 1.1.2",
+ "rustix 1.1.4",
  "windows-sys 0.59.0",
 ]
 
@@ -7235,7 +7306,7 @@ version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1bd49230192a3797a9a4d6abe9b3eed6f7fa4c8a8a4947977c6f80025f92cbd8"
 dependencies = [
- "rustix 1.1.2",
+ "rustix 1.1.4",
  "windows-link 0.2.1",
 ]
 
@@ -7434,6 +7505,7 @@ dependencies = [
  "gpui",
  "indoc",
  "itertools 0.14.0",
+ "js-sys",
  "language",
  "language_model",
  "log",
@@ -7472,6 +7544,7 @@ dependencies = [
  "unindent",
  "util",
  "watch",
+ "web-time",
  "windows 0.61.3",
  "workspace",
  "zed_actions",
@@ -7861,6 +7934,7 @@ dependencies = [
  "serde_json",
  "slotmap",
  "smallvec",
+ "smol",
  "spin 0.10.0",
  "stacksafe",
  "strum 0.27.2",
@@ -8028,6 +8102,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "log",
+ "web-time",
  "which 6.0.3",
 ]
 
@@ -8315,6 +8390,15 @@ name = "hashlink"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8094feaf31ff591f651a2664fb9cfd92bba7a60ce3197265e9482ebe753c8f7"
+dependencies = [
+ "hashbrown 0.14.5",
+]
+
+[[package]]
+name = "hashlink"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ba4ff7128dee98c7dc9794b6a411377e1404dba1c97deb8d1a55297bd25d8af"
 dependencies = [
  "hashbrown 0.14.5",
 ]
@@ -9183,6 +9267,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e0242819d153cba4b4b05a5a8f2a7e9bbf97b6055b2a002b395c96b5ff3c0222"
 dependencies = [
  "cfg-if",
+ "js-sys",
+ "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]
@@ -9506,7 +9593,6 @@ dependencies = [
  "referencing",
  "regex",
  "regex-syntax",
- "reqwest 0.12.24",
  "serde",
  "serde_json",
  "unicode-general-category",
@@ -9764,6 +9850,7 @@ dependencies = [
  "unindent",
  "util",
  "watch",
+ "web-time",
  "zlog",
  "ztracing",
 ]
@@ -10283,9 +10370,9 @@ checksum = "d26c52dbd32dccf2d10cac7725f8eae5296885fb5703b261f7d0a0739ec807ab"
 
 [[package]]
 name = "linux-raw-sys"
-version = "0.11.0"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df1d3c3b53da64cf5760482273a98e575c651a67eec7f77df96b5b642de8f039"
+checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "litemap"
@@ -10600,13 +10687,13 @@ dependencies = [
  "serde",
  "serde_json",
  "util",
+ "web-time",
  "zlog",
 ]
 
 [[package]]
 name = "lsp-types"
 version = "0.95.1"
-source = "git+https://github.com/zed-industries/lsp-types?rev=f4dfa89a21ca35cd929b70354b1583fabae325f8#f4dfa89a21ca35cd929b70354b1583fabae325f8"
 dependencies = [
  "bitflags 1.3.2",
  "serde",
@@ -10987,7 +11074,7 @@ version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ad38eb12aea514a0466ea40a80fd8cc83637065948eb4a426e4aa46261175227"
 dependencies = [
- "rustix 1.1.2",
+ "rustix 1.1.4",
 ]
 
 [[package]]
@@ -11374,6 +11461,7 @@ dependencies = [
  "tree-sitter",
  "unicode-segmentation",
  "util",
+ "web-time",
  "zlog",
  "ztracing",
 ]
@@ -11519,6 +11607,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-io",
+ "futures 0.3.32",
  "smol",
  "tempfile",
  "windows 0.61.3",
@@ -11957,6 +12046,7 @@ dependencies = [
  "log",
  "tiny_http",
  "url",
+ "web-time",
 ]
 
 [[package]]
@@ -13841,7 +13931,7 @@ dependencies = [
  "concurrent-queue",
  "hermit-abi",
  "pin-project-lite",
- "rustix 1.1.2",
+ "rustix 1.1.4",
  "windows-sys 0.61.2",
 ]
 
@@ -14196,6 +14286,7 @@ dependencies = [
  "util",
  "watch",
  "wax",
+ "web-time",
  "which 6.0.3",
  "worktree",
  "zed_credentials_provider",
@@ -14265,6 +14356,7 @@ dependencies = [
  "theme_settings",
  "ui",
  "util",
+ "web-time",
  "workspace",
  "worktree",
  "zed_actions",
@@ -14493,6 +14585,7 @@ dependencies = [
  "prost 0.9.0",
  "prost-build 0.9.0",
  "serde",
+ "web-time",
 ]
 
 [[package]]
@@ -15262,6 +15355,7 @@ dependencies = [
  "thiserror 2.0.17",
  "urlencoding",
  "util",
+ "web-time",
  "which 6.0.3",
 ]
 
@@ -15716,11 +15810,13 @@ name = "rpc"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-tungstenite",
  "base64 0.22.1",
  "collections",
  "futures 0.3.32",
+ "getrandom 0.2.16",
+ "getrandom 0.3.4",
  "gpui",
+ "js-sys",
  "parking_lot",
  "proto",
  "rand 0.9.4",
@@ -15730,7 +15826,12 @@ dependencies = [
  "sha2",
  "strum 0.27.2",
  "tracing",
+ "tungstenite 0.27.0",
  "util",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
  "zlog",
  "zstd",
 ]
@@ -15795,6 +15896,20 @@ dependencies = [
  "thiserror 2.0.17",
  "uuid",
  "zeromq",
+]
+
+[[package]]
+name = "rusqlite"
+version = "0.32.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7753b721174eb8ff87a9a0e799e2d7bc3749323e773db92e0984debb00019d6e"
+dependencies = [
+ "bitflags 2.10.0",
+ "fallible-iterator",
+ "fallible-streaming-iterator",
+ "hashlink 0.9.1",
+ "libsqlite3-sys",
+ "smallvec",
 ]
 
 [[package]]
@@ -15890,14 +16005,14 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.2"
+version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd15f8a2c5551a84d56efdc1cd049089e409ac19a3072d5037a17fd70719ff3e"
+checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
 dependencies = [
  "bitflags 2.10.0",
  "errno 0.3.14",
  "libc",
- "linux-raw-sys 0.11.0",
+ "linux-raw-sys 0.12.1",
  "windows-sys 0.61.2",
 ]
 
@@ -15908,7 +16023,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2fc84bf7e9aa16c4f2c758f27412dc9841341e16aa682d9c7ac308fe3ee12056"
 dependencies = [
  "once_cell",
- "rustix 1.1.2",
+ "rustix 1.1.4",
 ]
 
 [[package]]
@@ -15919,7 +16034,7 @@ checksum = "1de16c7c59892b870a6336f185dc10943517f1327447096bbb7bb32cd85e2393"
 dependencies = [
  "errno 0.3.14",
  "libc",
- "rustix 1.1.2",
+ "rustix 1.1.4",
 ]
 
 [[package]]
@@ -16796,6 +16911,7 @@ dependencies = [
  "smallvec",
  "unindent",
  "util",
+ "wasm_remote",
  "zlog",
 ]
 
@@ -17255,9 +17371,8 @@ dependencies = [
 [[package]]
 name = "smol"
 version = "2.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a33bd3e260892199c3ccfc487c88b2da2265080acb316cd920da72fdfd7c599f"
 dependencies = [
+ "anyhow",
  "async-channel 2.5.0",
  "async-executor",
  "async-fs",
@@ -17265,8 +17380,14 @@ dependencies = [
  "async-lock",
  "async-net",
  "async-process",
+ "base64 0.22.1",
  "blocking",
- "futures-lite 2.6.1",
+ "futures 0.3.32",
+ "futures-lite 1.13.0",
+ "serde",
+ "serde_json",
+ "wasm-bindgen-futures",
+ "wasm_rpc",
 ]
 
 [[package]]
@@ -17427,6 +17548,7 @@ name = "sqlez"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "collections",
  "futures 0.3.32",
  "indoc",
@@ -17434,10 +17556,16 @@ dependencies = [
  "log",
  "parking_lot",
  "pollster 0.4.0",
+ "serde",
+ "serde_json",
  "sqlformat",
  "thread_local",
  "util",
  "uuid",
+ "wasm-bindgen",
+ "wasm_rpc",
+ "wasm_thread",
+ "web-sys",
 ]
 
 [[package]]
@@ -17510,7 +17638,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
- "webpki-roots",
+ "webpki-roots 0.26.8",
 ]
 
 [[package]]
@@ -18397,6 +18525,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 
 [[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
+ "xattr",
+]
+
+[[package]]
 name = "target-lexicon"
 version = "0.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -18483,14 +18622,14 @@ dependencies = [
 
 [[package]]
 name = "tempfile"
-version = "3.23.0"
+version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d31c77bdf42a745371d260a26ca7163f1e0924b64afa0b688e61b5a9fa02f16"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand 2.3.0",
- "getrandom 0.3.4",
+ "getrandom 0.4.1",
  "once_cell",
- "rustix 1.1.2",
+ "rustix 1.1.4",
  "windows-sys 0.61.2",
 ]
 
@@ -18532,6 +18671,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "async-channel 2.5.0",
+ "base64 0.22.1",
  "collections",
  "futures 0.3.32",
  "futures-lite 1.13.0",
@@ -18546,6 +18686,7 @@ dependencies = [
  "release_channel",
  "schemars 1.0.4",
  "serde",
+ "serde_json",
  "settings",
  "sysinfo 0.37.2",
  "task",
@@ -18557,6 +18698,9 @@ dependencies = [
  "util",
  "util_macros",
  "vte",
+ "wasm-bindgen-futures",
+ "wasm_rpc",
+ "web-time",
  "windows 0.61.3",
 ]
 
@@ -18566,7 +18710,7 @@ version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "60b8cb979cb11c32ce1603f8137b22262a9d131aaa5c37b5678025f22b8becd0"
 dependencies = [
- "rustix 1.1.2",
+ "rustix 1.1.4",
  "windows-sys 0.60.2",
 ]
 
@@ -18606,6 +18750,7 @@ dependencies = [
  "theme_settings",
  "ui",
  "util",
+ "web-time",
  "workspace",
  "zed_actions",
 ]
@@ -18628,6 +18773,7 @@ dependencies = [
  "smallvec",
  "sum_tree",
  "util",
+ "web-time",
  "zlog",
 ]
 
@@ -18649,6 +18795,7 @@ dependencies = [
  "syntax_theme",
  "thiserror 2.0.17",
  "uuid",
+ "web-time",
 ]
 
 [[package]]
@@ -19042,9 +19189,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-stream"
-version = "0.1.17"
+version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eca58d7bba4a75707817a2c44174253f9236b2d5fbd055602e9d5c07c139a047"
+checksum = "32da49809aab5c3bc678af03902d4ccddea2a87d028d86392a4b1560c6906c70"
 dependencies = [
  "futures-core",
  "pin-project-lite",
@@ -19443,8 +19590,6 @@ dependencies = [
 [[package]]
 name = "tree-sitter"
 version = "0.26.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4dab76d0b724ba557954125188cf0633a1ca43199ced82d95c7b9c32cc3de1f3"
 dependencies = [
  "cc",
  "regex",
@@ -19835,6 +19980,7 @@ dependencies = [
  "theme",
  "theme_settings",
  "ui_macros",
+ "web-time",
  "windows 0.61.3",
 ]
 
@@ -19997,8 +20143,6 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 [[package]]
 name = "url"
 version = "2.5.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08bc136a29a3d1758e07a9cca267be308aeebf5cfd5a10f3f67ab2097683ef5b"
 dependencies = [
  "form_urlencoded",
  "idna",
@@ -20580,10 +20724,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm_remote"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-channel 2.5.0",
+ "async-trait",
+ "base64 0.22.1",
+ "collections",
+ "fs",
+ "futures 0.3.32",
+ "git",
+ "gpui",
+ "rope",
+ "serde",
+ "serde_json",
+ "text",
+ "wasm_rpc",
+]
+
+[[package]]
+name = "wasm_rpc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures 0.3.32",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "wasm_thread"
 version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7516db7f32decdadb1c3b8deb1b7d78b9df7606c5cc2f6241737c2ab3a0258e"
 dependencies = [
  "futures 0.3.32",
  "js-sys",
@@ -20688,7 +20864,7 @@ dependencies = [
  "postcard",
  "pulley-interpreter",
  "rayon",
- "rustix 1.1.2",
+ "rustix 1.1.4",
  "semver",
  "serde",
  "serde_derive",
@@ -20713,9 +20889,9 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-c-api-impl"
-version = "36.0.9"
+version = "36.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5e71e971a27df819171b79597c0f1826fc7cf2c168111c64dbc5505a1ffbda7"
+checksum = "b2ecbea9b3efb193487c1d2cdd0222e13cfc60eaeab7c41c043a1708e0a079cd"
 dependencies = [
  "anyhow",
  "log",
@@ -20762,9 +20938,9 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-internal-c-api-macros"
-version = "36.0.9"
+version = "36.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20b9553165039d365931a998d9b60278cc968ba9d81531cecde8ffc3effa1fe3"
+checksum = "3873cfb0aaaf9e65c8978eb50990a5d2cb7c0c967a296329902084f867b00373"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -20828,7 +21004,7 @@ dependencies = [
  "cc",
  "cfg-if",
  "libc",
- "rustix 1.1.2",
+ "rustix 1.1.4",
  "wasmtime-internal-asm-macros",
  "wasmtime-internal-versioned-export-macros",
  "windows-sys 0.60.2",
@@ -20944,7 +21120,7 @@ dependencies = [
  "futures 0.3.32",
  "io-extras",
  "io-lifetimes",
- "rustix 1.1.2",
+ "rustix 1.1.4",
  "system-interface",
  "thiserror 2.0.17",
  "tokio",
@@ -21012,7 +21188,7 @@ checksum = "2857dd20b54e916ec7253b3d6b4d5c4d7d4ca2c33c2e11c6c76a99bd8744755d"
 dependencies = [
  "cc",
  "downcast-rs",
- "rustix 1.1.2",
+ "rustix 1.1.4",
  "scoped-tls",
  "smallvec",
  "wayland-sys",
@@ -21025,7 +21201,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c66a47e840dc20793f2264eb4b3e4ecb4b75d91c0dd4af04b456128e0bdd449d"
 dependencies = [
  "bitflags 2.10.0",
- "rustix 1.1.2",
+ "rustix 1.1.4",
  "wayland-backend",
  "wayland-scanner",
 ]
@@ -21036,7 +21212,7 @@ version = "0.31.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "447ccc440a881271b19e9989f75726d60faa09b95b0200a9b7eb5cc47c3eeb29"
 dependencies = [
- "rustix 1.1.2",
+ "rustix 1.1.4",
  "wayland-client",
  "xcursor",
 ]
@@ -21178,6 +21354,15 @@ name = "webpki-roots"
 version = "0.26.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2210b291f7ea53617fbafcc4939f10914214ec15aace5ba62293a668f322c5c9"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -21399,12 +21584,20 @@ dependencies = [
 [[package]]
 name = "which"
 version = "6.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4ee928febd44d98f2f459a4a79bd4d928591333a494a10a868418ac1b39cf1f"
+dependencies = [
+ "which-real",
+]
+
+[[package]]
+name = "which-real"
+version = "6.0.3"
 dependencies = [
  "either",
  "home",
+ "regex",
  "rustix 0.38.44",
+ "tempfile",
+ "tracing",
  "winsafe",
 ]
 
@@ -22724,6 +22917,7 @@ dependencies = [
  "url",
  "util",
  "uuid",
+ "web-time",
  "windows 0.61.3",
  "zed_actions",
  "zlog",
@@ -22762,6 +22956,7 @@ dependencies = [
  "text",
  "tracing",
  "util",
+ "web-time",
  "worktree",
  "zlog",
  "ztracing",
@@ -22832,7 +23027,7 @@ dependencies = [
  "as-raw-xcb-connection",
  "gethostname",
  "libc",
- "rustix 1.1.2",
+ "rustix 1.1.4",
  "x11rb-protocol",
  "xcursor",
 ]
@@ -22860,7 +23055,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
 dependencies = [
  "libc",
- "rustix 1.1.2",
+ "rustix 1.1.4",
 ]
 
 [[package]]
@@ -23000,9 +23195,9 @@ checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 
 [[package]]
 name = "yawc"
-version = "0.2.5"
+version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19a5d82922135b4ae73a079a4ffb5501e9aadb4d785b8c660eaa0a8b899028c5"
+checksum = "6f6a46c0f189bbef59a24169b1a6e4d8bc1e476f6ea05bc657cf8e67aa3fbb0c"
 dependencies = [
  "base64 0.22.1",
  "bytes 1.11.1",
@@ -23016,7 +23211,7 @@ dependencies = [
  "pin-project",
  "rand 0.8.6",
  "sha1",
- "thiserror 1.0.69",
+ "thiserror 2.0.17",
  "tokio",
  "tokio-rustls 0.26.4",
  "tokio-util",
@@ -23024,7 +23219,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "webpki-roots",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -23090,7 +23285,7 @@ dependencies = [
  "hex",
  "libc",
  "ordered-stream",
- "rustix 1.1.2",
+ "rustix 1.1.4",
  "serde",
  "serde_repr",
  "tracing",
@@ -23538,6 +23733,158 @@ dependencies = [
 ]
 
 [[package]]
+name = "zed_web_poc"
+version = "0.1.0"
+dependencies = [
+ "fs",
+ "futures 0.3.32",
+ "gpui",
+ "gpui_platform",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "smol",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm_remote",
+ "web-sys",
+ "web-time",
+]
+
+[[package]]
+name = "zed_web_server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "clap",
+ "flate2",
+ "fs2",
+ "futures 0.3.32",
+ "hex",
+ "hmac",
+ "mime_guess",
+ "portable-pty",
+ "rand 0.9.4",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
+ "walkdir",
+ "zed-reqwest",
+]
+
+[[package]]
+name = "zed_web_workspace"
+version = "0.1.0"
+dependencies = [
+ "activity_indicator",
+ "agent-client-protocol",
+ "agent_settings",
+ "agent_ui",
+ "anyhow",
+ "assets",
+ "async-trait",
+ "breadcrumbs",
+ "client",
+ "clock",
+ "collections",
+ "command_palette",
+ "csv_preview",
+ "dap",
+ "dap_adapters",
+ "db",
+ "debugger_ui",
+ "diagnostics",
+ "edit_prediction",
+ "edit_prediction_ui",
+ "editor",
+ "encoding_selector",
+ "extensions_ui",
+ "feature_flags",
+ "file_finder",
+ "fs",
+ "futures 0.3.32",
+ "git_ui",
+ "go_to_line",
+ "gpui",
+ "gpui_platform",
+ "gpui_web",
+ "http_client",
+ "image_viewer",
+ "instant",
+ "js-sys",
+ "keymap_editor",
+ "language",
+ "language_model",
+ "language_models",
+ "language_selector",
+ "language_tools",
+ "line_ending_selector",
+ "log",
+ "lsp",
+ "markdown_preview",
+ "menu",
+ "multi_buffer",
+ "node_runtime",
+ "open_path_prompt",
+ "outline",
+ "outline_panel",
+ "paths",
+ "platform_title_bar",
+ "project",
+ "project_panel",
+ "project_symbols",
+ "prompt_store",
+ "recent_projects",
+ "release_channel",
+ "search",
+ "semver",
+ "serde",
+ "serde_json",
+ "session",
+ "settings",
+ "settings_ui",
+ "sidebar",
+ "smallvec",
+ "smol",
+ "snippet_provider",
+ "snippets_ui",
+ "sqlez",
+ "svg_preview",
+ "tab_switcher",
+ "tar",
+ "task",
+ "tasks_ui",
+ "terminal",
+ "terminal_view",
+ "text",
+ "theme",
+ "theme_selector",
+ "theme_settings",
+ "toolchain_selector",
+ "ui",
+ "util",
+ "uuid",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm_remote",
+ "wasm_rpc",
+ "watch",
+ "web-sys",
+ "which_key",
+ "workspace",
+ "zed_actions",
+]
+
+[[package]]
 name = "zeno"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -23701,6 +24048,7 @@ dependencies = [
  "collections",
  "log",
  "tempfile",
+ "web-time",
 ]
 
 [[package]]

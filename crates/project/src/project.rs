@@ -19,7 +19,12 @@ pub mod search;
 pub mod task_inventory;
 pub mod task_store;
 pub mod telemetry_snapshot;
+#[cfg(not(target_family = "wasm"))]
 pub mod terminals;
+#[cfg(target_family = "wasm")]
+pub mod terminals_wasm;
+#[cfg(target_family = "wasm")]
+use terminals_wasm as terminals;
 pub mod toolchain_store;
 pub mod trusted_worktrees;
 pub mod worktree_store;
@@ -134,7 +139,10 @@ use std::{
 };
 
 use task_store::TaskStore;
+#[cfg(not(target_family = "wasm"))]
 use terminals::Terminals;
+#[cfg(target_family = "wasm")]
+use terminals_wasm::Terminals;
 use text::{Anchor, BufferId, Point, Rope};
 use toolchain_store::EmptyToolchainStore;
 use util::{
@@ -181,7 +189,10 @@ impl Default for LocalProjectFlags {
     fn default() -> Self {
         Self {
             init_worktree_trust: true,
+            #[cfg(not(target_family = "wasm"))]
             watch_global_configs: true,
+            #[cfg(target_family = "wasm")]
+            watch_global_configs: false,
         }
     }
 }
@@ -3885,6 +3896,7 @@ impl Project {
             WorktreeStoreEvent::WorktreeOrderChanged => cx.emit(Event::WorktreeOrderChanged),
             WorktreeStoreEvent::WorktreeUpdateSent(_) => {}
             WorktreeStoreEvent::WorktreeUpdatedEntries(worktree_id, changes) => {
+                #[cfg(not(target_family = "wasm"))]
                 self.client()
                     .telemetry()
                     .report_discovered_project_type_events(*worktree_id, changes);

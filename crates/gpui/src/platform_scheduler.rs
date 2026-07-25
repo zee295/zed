@@ -58,18 +58,32 @@ impl Scheduler for PlatformScheduler {
     fn block(
         &self,
         _session_id: Option<SessionId>,
-        #[cfg_attr(target_family = "wasm", allow(unused_mut))] mut future: Pin<
-            &mut dyn Future<Output = ()>,
-        >,
-        #[cfg_attr(target_family = "wasm", allow(unused_variables))] timeout: Option<Duration>,
+        mut future: Pin<&mut dyn Future<Output = ()>>,
+        timeout: Option<Duration>,
     ) -> bool {
         #[cfg(target_family = "wasm")]
         {
-            let _ = (&future, &timeout);
-            panic!("Cannot block on wasm")
+            // Browsers cannot park the main thread. For pure-compute futures
+            // (e.g. wrap-map flushes that only `yield` occasionally) we busy-poll
+            // with a noop waker until ready. If a timeout is set and the future is
+            // still pending after a few polls, return false so callers fall back
+            // to the async spawn path (see WrapMap::flush_edits).
+            use std::task::{Context, Poll, Waker};
+            let waker = Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            // Cap busy-poll iterations so we never hang the browser tab if the
+            // future is waiting on real I/O / timers.
+            let max_polls = if timeout.is_some() { 64usize } else { 10_000 };
+            for _ in 0..max_polls {
+                if let Poll::Ready(()) = future.as_mut().poll(&mut cx) {
+                    return true;
+                }
+            }
+            false
         }
         #[cfg(not(target_family = "wasm"))]
         {
+            use std::task::{Context, Poll};
             use waker_fn::waker_fn;
             let deadline = timeout.map(|t| Instant::now() + t);
             let parker = parking::Parker::new();

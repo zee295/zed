@@ -35,7 +35,7 @@ use std::fmt::{Formatter, Write};
 use std::ops::Range;
 use std::process::ExitStatus;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::{fmt::Display, mem, path::PathBuf, sync::Arc};
 use task::{Shell, ShellBuilder};
 pub use terminal::*;
@@ -48,6 +48,7 @@ use util::{
     paths::{PathStyle, is_absolute},
 };
 use uuid::Uuid;
+use web_time::Instant;
 
 /// Returned when the model stops because it exhausted its output token budget.
 #[derive(Debug)]

@@ -28,14 +28,12 @@ futures.workspace = true
 futures-lite.workspace = true
 gpui.workspace = true
 itertools.workspace = true
-libc.workspace = true
 log.workspace = true
 regex.workspace = true
 release_channel.workspace = true
 schemars.workspace = true
 serde.workspace = true
 settings.workspace = true
-sysinfo.workspace = true
 task.workspace = true
 theme.workspace = true
 theme_settings.workspace = true
@@ -46,6 +44,18 @@ urlencoding.workspace = true
 vte.workspace = true
 parking_lot.workspace = true
 percent-encoding.workspace = true
+# Instant/Duration that work on wasm (std::time::Instant panics: "time not implemented")
+web-time.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+libc.workspace = true
+sysinfo.workspace = true
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+base64 = "0.22"
+serde_json.workspace = true
+wasm-bindgen-futures = "0.4"
+wasm_rpc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true

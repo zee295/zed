@@ -1,7 +1,11 @@
+#[cfg(not(target_family = "wasm"))]
 mod codelldb;
 mod gdb;
+#[cfg(not(target_family = "wasm"))]
 mod go;
+#[cfg(not(target_family = "wasm"))]
 mod javascript;
+#[cfg(not(target_family = "wasm"))]
 mod python;
 
 #[cfg(test)]
@@ -10,6 +14,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
+#[cfg(not(target_family = "wasm"))]
 use codelldb::CodeLldbDebugAdapter;
 use dap::{
     DapRegistry,
@@ -19,18 +24,25 @@ use dap::{
     configure_tcp_connection,
 };
 use gdb::GdbDebugAdapter;
+#[cfg(not(target_family = "wasm"))]
 use go::GoDebugAdapter;
 use gpui::{App, BorrowAppContext};
+#[cfg(not(target_family = "wasm"))]
 use javascript::JsDebugAdapter;
+#[cfg(not(target_family = "wasm"))]
 use python::PythonDebugAdapter;
 use serde_json::json;
 use task::{DebugScenario, ZedDebugConfig};
 
 pub fn init(cx: &mut App) {
     cx.update_default_global(|registry: &mut DapRegistry, _cx| {
+        #[cfg(not(target_family = "wasm"))]
         registry.add_adapter(Arc::from(CodeLldbDebugAdapter::default()));
+        #[cfg(not(target_family = "wasm"))]
         registry.add_adapter(Arc::from(PythonDebugAdapter::default()));
+        #[cfg(not(target_family = "wasm"))]
         registry.add_adapter(Arc::from(JsDebugAdapter::default()));
+        #[cfg(not(target_family = "wasm"))]
         registry.add_adapter(Arc::from(GoDebugAdapter::default()));
         registry.add_adapter(Arc::from(GdbDebugAdapter));
 

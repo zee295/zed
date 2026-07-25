@@ -6,8 +6,9 @@ use image::Frame;
 use resvg::tiny_skia::Pixmap;
 use smallvec::SmallVec;
 use std::{
+    collections::HashSet,
     hash::Hash,
-    sync::{Arc, LazyLock, OnceLock},
+    sync::{Arc, LazyLock, Mutex, OnceLock},
 };
 
 #[cfg(target_os = "macos")]
@@ -92,6 +93,10 @@ pub struct RenderSvgParams {
 pub struct SvgRenderer {
     asset_source: Arc<dyn AssetSource>,
     usvg_options: Arc<usvg::Options<'static>>,
+    /// Paths that failed to load/render, so we don't retry (and re-log) them on
+    /// every frame. The sprite atlas only caches successes, so without this a
+    /// single missing/unrenderable SVG would rasterize+error every paint.
+    failed_paths: Arc<Mutex<HashSet<SharedString>>>,
 }
 
 /// The size in which to render the SVG.
@@ -166,6 +171,7 @@ impl SvgRenderer {
         Self {
             asset_source,
             usvg_options: Arc::new(options),
+            failed_paths: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -201,8 +207,17 @@ impl SvgRenderer {
     ) -> Result<Option<(Size<DevicePixels>, Vec<u8>)>> {
         anyhow::ensure!(!params.size.is_zero(), "can't render at a zero size");
 
-        let render_pixmap = |bytes| {
-            let pixmap = self.render_pixmap(bytes, SvgSize::Size(params.size))?;
+        // Skip paths that already failed — otherwise a single missing/unrenderable
+        // SVG would re-rasterize and re-log the error on every frame (the sprite
+        // atlas only caches successes).
+        if bytes.is_none() && self.failed_paths.lock().unwrap().contains(&params.path) {
+            return Ok(None);
+        }
+
+        let render_pixmap = |bytes| -> Result<Option<(Size<DevicePixels>, Vec<u8>)>> {
+            let pixmap = self
+                .render_pixmap(bytes, SvgSize::Size(params.size))
+                .map_err(anyhow::Error::from)?;
 
             // Convert the pixmap's pixels into an alpha mask.
             let size = Size::new(
@@ -218,13 +233,23 @@ impl SvgRenderer {
             Ok(Some((size, alpha_mask)))
         };
 
-        if let Some(bytes) = bytes {
+        let result = if let Some(bytes) = bytes {
             render_pixmap(bytes)
-        } else if let Some(bytes) = self.asset_source.load(&params.path)? {
-            render_pixmap(&bytes)
         } else {
-            Ok(None)
+            match self.asset_source.load(&params.path) {
+                Ok(Some(bytes)) => render_pixmap(&bytes),
+                Ok(None) => Ok(None),
+                Err(err) => Err(err),
+            }
+        };
+
+        if result.is_err() && bytes.is_none() {
+            self.failed_paths
+                .lock()
+                .unwrap()
+                .insert(params.path.clone());
         }
+        result
     }
 
     fn render_pixmap(&self, bytes: &[u8], size: SvgSize) -> Result<Pixmap, usvg::Error> {

@@ -3,6 +3,7 @@ use collections::HashMap;
 use context_server::{ContextServerCommand, ContextServerId};
 use editor::{Editor, EditorElement, EditorStyle};
 
+#[cfg(not(target_family = "wasm"))]
 use extension_host::ExtensionStore;
 use gpui::{
     AsyncWindowContext, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, ScrollHandle,
@@ -378,12 +379,15 @@ fn resolve_context_server_extension(
         return Task::ready(None);
     };
 
+    #[cfg(not(target_family = "wasm"))]
     let extension = ExtensionStore::global(cx)
         .read(cx)
         .installed_extensions()
         .iter()
         .find(|(_, entry)| entry.manifest.context_servers.contains_key(&id.0))
         .map(|(id, entry)| (id.clone(), entry.manifest.clone()));
+    #[cfg(target_family = "wasm")]
+    let extension: Option<(Arc<str>, Arc<extension::ExtensionManifest>)> = None;
     cx.spawn(async move |cx| {
         let installation = descriptor
             .configuration(worktree_store, cx)

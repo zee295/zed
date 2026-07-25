@@ -1629,18 +1629,17 @@ impl PickerDelegate for BranchListDelegate {
                 branch.most_recent_commit.as_ref().map(|commit| {
                     let subject = commit.subject.clone();
                     let commit_time = OffsetDateTime::from_unix_timestamp(commit.commit_timestamp)
-                        .unwrap_or_else(|_| OffsetDateTime::now_utc());
-                    let local_offset =
-                        time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+                        .unwrap_or_else(|_| crate::now_utc());
+                    let local_offset = crate::local_utc_offset();
                     let formatted_time = time_format::format_localized_timestamp(
                         commit_time,
-                        OffsetDateTime::now_utc(),
+                        crate::now_utc(),
                         local_offset,
                         time_format::TimestampFormat::Relative,
                     );
                     let absolute_time = time_format::format_localized_timestamp(
                         commit_time,
-                        OffsetDateTime::now_utc(),
+                        crate::now_utc(),
                         local_offset,
                         time_format::TimestampFormat::EnhancedAbsolute,
                     );

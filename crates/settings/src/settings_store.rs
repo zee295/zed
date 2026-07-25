@@ -284,6 +284,26 @@ pub struct SettingsJsonSchemaParams<'a> {
     pub deprecation_messages: &'a HashMap<&'a str, &'a str>,
 }
 
+async fn write_settings_with_fs(
+    fs: &Arc<dyn Fs>,
+    settings_path: &Path,
+    text: String,
+) -> Result<()> {
+    if fs.is_file(settings_path).await {
+        let resolved_path = fs
+            .canonicalize(settings_path)
+            .await
+            .with_context(|| format!("Failed to canonicalize settings path {:?}", settings_path))?;
+        fs.atomic_write(resolved_path.clone(), text)
+            .await
+            .with_context(|| format!("Failed to write settings to file {:?}", resolved_path))
+    } else {
+        fs.atomic_write(settings_path.to_path_buf(), text)
+            .await
+            .with_context(|| format!("Failed to write settings to file {:?}", settings_path))
+    }
+}
+
 impl SettingsStore {
     pub fn new(cx: &mut App, default_settings: &str) -> Self {
         Self::new_with_semantic_tokens(cx, default_settings)
@@ -566,31 +586,37 @@ impl SettingsStore {
             .unbounded_send(Box::new(move |cx: AsyncApp| {
                 async move {
                     let res = async move {
+                        #[cfg(target_family = "wasm")]
+                        let old_text = match cx.read_global(|store: &SettingsStore, _| {
+                            store.last_user_settings_content.clone()
+                        }) {
+                            Some(text) => text,
+                            None => Self::load_settings(&fs).await?,
+                        };
+                        #[cfg(not(target_family = "wasm"))]
                         let old_text = Self::load_settings(&fs).await?;
                         let new_text = update(old_text, cx.clone())?;
 
                         let settings_path = paths::settings_file().as_path();
-                        if fs.is_file(settings_path).await {
-                            let resolved_path =
-                                fs.canonicalize(settings_path).await.with_context(|| {
-                                    format!(
-                                        "Failed to canonicalize settings path {:?}",
-                                        settings_path
-                                    )
-                                })?;
-
-                            fs.atomic_write(resolved_path.clone(), new_text.clone())
-                                .await
-                                .with_context(|| {
-                                    format!("Failed to write settings to file {:?}", resolved_path)
-                                })?;
-                        } else {
-                            fs.atomic_write(settings_path.to_path_buf(), new_text.clone())
+                        #[cfg(target_family = "wasm")]
+                        if let Some(client) = wasm_remote::remote_client() {
+                            client
+                                .call_void(
+                                    "Fs::atomic_write",
+                                    &serde_json::json!({
+                                        "path": settings_path.to_string_lossy(),
+                                        "text": new_text,
+                                    }),
+                                )
                                 .await
                                 .with_context(|| {
                                     format!("Failed to write settings to file {:?}", settings_path)
                                 })?;
+                        } else {
+                            write_settings_with_fs(&fs, settings_path, new_text.clone()).await?;
                         }
+                        #[cfg(not(target_family = "wasm"))]
+                        write_settings_with_fs(&fs, settings_path, new_text.clone()).await?;
 
                         cx.update_global(|store: &mut SettingsStore, cx| {
                             store.set_user_settings(&new_text, cx).result().map(|_| ())
@@ -793,20 +819,27 @@ impl SettingsStore {
         let (settings, parse_status) = if user_settings_content.is_empty() {
             SettingsContentType::parse_json("{}")
         } else {
-            let migration_res = migrator::migrate_settings(user_settings_content);
-            migration_status = match &migration_res {
-                Ok(Some(_)) => MigrationStatus::Succeeded,
-                Ok(None) => MigrationStatus::NotNeeded,
-                Err(err) => MigrationStatus::Failed {
-                    error: err.to_string(),
-                },
-            };
-            let content = match &migration_res {
-                Ok(Some(content)) => content,
-                Ok(None) => user_settings_content,
-                Err(_) => user_settings_content,
-            };
-            SettingsContentType::parse_json(content)
+            #[cfg(not(target_family = "wasm"))]
+            {
+                let migration_res = migrator::migrate_settings(user_settings_content);
+                migration_status = match &migration_res {
+                    Ok(Some(_)) => MigrationStatus::Succeeded,
+                    Ok(None) => MigrationStatus::NotNeeded,
+                    Err(err) => MigrationStatus::Failed {
+                        error: err.to_string(),
+                    },
+                };
+                let content = match &migration_res {
+                    Ok(Some(content)) => content,
+                    Ok(None) => user_settings_content,
+                    Err(_) => user_settings_content,
+                };
+                SettingsContentType::parse_json(content)
+            }
+            #[cfg(target_family = "wasm")]
+            {
+                SettingsContentType::parse_json(user_settings_content)
+            }
         };
 
         let result = SettingsParseResult {

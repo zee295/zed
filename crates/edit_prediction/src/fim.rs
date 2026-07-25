@@ -9,7 +9,8 @@ use language::{
     Anchor, Buffer, BufferSnapshot, EditPredictionPromptFormat, ToOffset, ToPoint as _,
     language_settings::all_language_settings,
 };
-use std::{path::Path, sync::Arc, time::Instant};
+use std::{path::Path, sync::Arc};
+use web_time::Instant;
 use zeta_prompt::{Zeta2PromptInput, compute_editable_and_context_ranges};
 
 const FIM_CONTEXT_TOKENS: usize = 512;

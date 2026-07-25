@@ -17,6 +17,7 @@ path = "src/proto.rs"
 doctest = false
 
 [dependencies]
+web-time.workspace = true
 anyhow.workspace = true
 prost.workspace = true
 serde.workspace = true

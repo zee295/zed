@@ -108,6 +108,9 @@ heapless.workspace = true
 [target.'cfg(target_family = "wasm")'.dependencies]
 getrandom = { version = "0.3.4", features = ["wasm_js"] }
 uuid = { workspace = true, features = ["js"] }
+# smol is patched to smol_wasm (remote fs bridge) so SvgAsset can read files
+# (e.g. external agent icons) from the host instead of the unavailable local fs.
+smol.workspace = true
 
 
 [target.'cfg(target_os = "macos")'.dependencies]

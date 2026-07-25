@@ -253,7 +253,7 @@ fn init_logging_server(log_file_path: &Path) -> Result<Receiver<Vec<u8>>> {
 
         fn flush(&mut self) -> std::io::Result<()> {
             self.channel
-                .send_blocking(self.buffer.clone())
+                .try_send(self.buffer.clone())
                 .map_err(std::io::Error::other)?;
             self.buffer.clear();
             self.file.flush()

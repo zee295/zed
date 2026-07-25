@@ -40,7 +40,13 @@ use menu::{
 };
 use notifications::status_toast::StatusToast;
 use project::{AgentId, AgentRegistryStore, Event as ProjectEvent, WorktreeId};
+#[cfg(not(target_family = "wasm"))]
 use recent_projects::sidebar_recent_projects::SidebarRecentProjects;
+
+/// On wasm the recent-projects popover is unavailable (recent_projects pulls
+/// remote-SSH deps). Use a unit placeholder so the field compiles.
+#[cfg(target_family = "wasm")]
+type SidebarRecentProjects = ();
 use remote::{RemoteConnectionOptions, same_remote_connection_identity};
 use ui::utils::platform_title_bar_height;
 
@@ -6730,6 +6736,7 @@ impl Sidebar {
             .child(self.filter_editor.clone())
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn render_recent_projects_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let multi_workspace = self.multi_workspace.upgrade();
 
@@ -6774,6 +6781,12 @@ impl Sidebar {
                 y: px(-2.0),
             })
             .anchor(gpui::Anchor::BottomRight)
+    }
+
+    /// Recent-projects popover is unavailable on wasm; render nothing.
+    #[cfg(target_family = "wasm")]
+    fn render_recent_projects_button(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
     }
 
     fn new_thread_in_group(
@@ -8073,7 +8086,10 @@ impl Render for Sidebar {
             .on_action(cx.listener(Self::on_next_thread))
             .on_action(cx.listener(Self::on_previous_thread))
             .on_action(cx.listener(|this, _: &OpenRecent, window, cx| {
+                #[cfg(not(target_family = "wasm"))]
                 this.recent_projects_popover_handle.toggle(window, cx);
+                #[cfg(target_family = "wasm")]
+                let _ = (this, window, cx);
             }))
             .font(ui_font)
             .map(|el| {

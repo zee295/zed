@@ -72,6 +72,7 @@ tree-sitter = { workspace = true, features = ["wasm"] }
 unicase = "2.6"
 util.workspace = true
 watch.workspace = true
+web-time.workspace = true
 zlog.workspace = true
 ztracing.workspace = true
 diffy = "0.4.2"

@@ -1,10 +1,14 @@
 use crate::ResultExt;
 use anyhow::{Result, bail};
-use async_fs as fs;
-use futures_lite::StreamExt;
 use std::path::{Path, PathBuf};
 
+#[cfg(not(target_family = "wasm"))]
+use async_fs as fs;
+#[cfg(not(target_family = "wasm"))]
+use futures_lite::StreamExt;
+
 /// Removes all files and directories matching the given predicate
+#[cfg(not(target_family = "wasm"))]
 pub async fn remove_matching<F>(dir: &Path, predicate: F)
 where
     F: Fn(&Path) -> bool,
@@ -27,6 +31,14 @@ where
     }
 }
 
+#[cfg(target_family = "wasm")]
+pub async fn remove_matching<F>(_dir: &Path, _predicate: F)
+where
+    F: Fn(&Path) -> bool,
+{
+}
+
+#[cfg(not(target_family = "wasm"))]
 pub async fn collect_matching<F>(dir: &Path, predicate: F) -> Vec<PathBuf>
 where
     F: Fn(&Path) -> bool,
@@ -46,6 +58,15 @@ where
     matching
 }
 
+#[cfg(target_family = "wasm")]
+pub async fn collect_matching<F>(_dir: &Path, _predicate: F) -> Vec<PathBuf>
+where
+    F: Fn(&Path) -> bool,
+{
+    Vec::new()
+}
+
+#[cfg(not(target_family = "wasm"))]
 pub async fn find_file_name_in_dir<F>(dir: &Path, predicate: F) -> Option<PathBuf>
 where
     F: Fn(&str) -> bool,
@@ -69,6 +90,15 @@ where
     None
 }
 
+#[cfg(target_family = "wasm")]
+pub async fn find_file_name_in_dir<F>(_dir: &Path, _predicate: F) -> Option<PathBuf>
+where
+    F: Fn(&str) -> bool,
+{
+    None
+}
+
+#[cfg(not(target_family = "wasm"))]
 pub async fn move_folder_files_to_folder<P: AsRef<Path>>(
     source_path: P,
     target_path: P,
@@ -89,6 +119,14 @@ pub async fn move_folder_files_to_folder<P: AsRef<Path>>(
     fs::remove_dir(source_path).await?;
 
     Ok(())
+}
+
+#[cfg(target_family = "wasm")]
+pub async fn move_folder_files_to_folder<P: AsRef<Path>>(
+    _source_path: P,
+    _target_path: P,
+) -> Result<()> {
+    bail!("filesystem operations are not supported in the browser")
 }
 
 #[cfg(unix)]

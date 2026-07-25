@@ -1,6 +1,7 @@
-use async_tungstenite::tungstenite::Message as WebSocketMessage;
 use futures::{SinkExt as _, StreamExt as _};
+use tungstenite::Message as WebSocketMessage;
 
+#[cfg(not(target_family = "wasm"))]
 pub struct Connection {
     pub(crate) tx:
         Box<dyn 'static + Send + Unpin + futures::Sink<WebSocketMessage, Error = anyhow::Error>>,
@@ -8,6 +9,15 @@ pub struct Connection {
         Box<dyn 'static + Send + Unpin + futures::Stream<Item = anyhow::Result<WebSocketMessage>>>,
 }
 
+#[cfg(target_family = "wasm")]
+pub struct Connection {
+    pub(crate) tx:
+        Box<dyn 'static + Unpin + futures::Sink<WebSocketMessage, Error = anyhow::Error>>,
+    pub(crate) rx:
+        Box<dyn 'static + Unpin + futures::Stream<Item = anyhow::Result<WebSocketMessage>>>,
+}
+
+#[cfg(not(target_family = "wasm"))]
 impl Connection {
     pub fn new<S>(stream: S) -> Self
     where
@@ -23,7 +33,26 @@ impl Connection {
             rx: Box::new(rx),
         }
     }
+}
 
+#[cfg(target_family = "wasm")]
+impl Connection {
+    pub fn new<S>(stream: S) -> Self
+    where
+        S: 'static
+            + Unpin
+            + futures::Sink<WebSocketMessage, Error = anyhow::Error>
+            + futures::Stream<Item = anyhow::Result<WebSocketMessage>>,
+    {
+        let (tx, rx) = stream.split();
+        Self {
+            tx: Box::new(tx),
+            rx: Box::new(rx),
+        }
+    }
+}
+
+impl Connection {
     pub async fn send(&mut self, message: WebSocketMessage) -> anyhow::Result<()> {
         self.tx.send(message).await
     }

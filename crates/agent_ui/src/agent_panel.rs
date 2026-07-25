@@ -67,6 +67,7 @@ use client::UserStore;
 use cloud_api_types::Plan;
 use collections::HashMap;
 use editor::{Editor, MultiBuffer};
+#[cfg(not(target_family = "wasm"))]
 use extension_host::ExtensionStore;
 use feature_flags::{CreateThreadToolFeatureFlag, FeatureFlagAppExt as _};
 
@@ -1515,6 +1516,7 @@ impl AgentPanel {
         });
 
         // Subscribe to extension events to sync agent servers when extensions change
+        #[cfg(not(target_family = "wasm"))]
         let extension_subscription = ExtensionStore::try_global(cx).map(|store| {
             cx.subscribe(&store, |this, _source, event, cx| match event {
                 extension_host::Event::ExtensionUninstalled(id) => {
@@ -1523,6 +1525,8 @@ impl AgentPanel {
                 _ => {}
             })
         });
+        #[cfg(target_family = "wasm")]
+        let extension_subscription: Option<Subscription> = None;
 
         let connection_store = cx.new(|cx| AgentConnectionStore::new(project.clone(), cx));
         let _project_subscription =
@@ -4773,6 +4777,15 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
             // created inside the new workspace's agent panel, so it lives
             // alongside any threads the user would create there manually.
             let mut worktree_warning: Option<String> = None;
+            #[cfg(target_family = "wasm")]
+            if request.use_new_worktree {
+                worktree_warning = Some(
+                    "Creating a linked git worktree is not supported in the browser build; \
+                     the thread was created in the current workspace."
+                        .to_string(),
+                );
+            }
+            #[cfg(not(target_family = "wasm"))]
             let target_panel = if request.use_new_worktree {
                 let workspace = panel.read_with(cx, |panel, _cx| panel.workspace.clone())?;
                 let workspace = workspace
@@ -4829,6 +4842,8 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
             } else {
                 panel.clone()
             };
+            #[cfg(target_family = "wasm")]
+            let target_panel = panel.clone();
             // Both the source panel and any newly-opened worktree workspace
             // live in the same OS window (the new workspace is a tab on the
             // existing MultiWorkspace), so the original window handle is

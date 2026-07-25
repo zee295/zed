@@ -2,7 +2,7 @@ use crate::{AgentMessage, AgentMessageContent, UserMessage, UserMessageContent};
 use acp_thread::ClientUserMessageId;
 use agent_client_protocol::schema::v1 as acp;
 use agent_settings::AgentProfileId;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use chrono::{DateTime, Utc};
 use collections::{HashMap, IndexMap};
 use futures::{FutureExt, future::Shared};
@@ -169,15 +169,29 @@ impl SharedThread {
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        const COMPRESSION_LEVEL: i32 = 3;
         let json = serde_json::to_vec(self)?;
-        let compressed = zstd::encode_all(json.as_slice(), COMPRESSION_LEVEL)?;
-        Ok(compressed)
+        #[cfg(not(target_family = "wasm"))]
+        {
+            const COMPRESSION_LEVEL: i32 = 3;
+            let compressed = zstd::encode_all(json.as_slice(), COMPRESSION_LEVEL)?;
+            return Ok(compressed);
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            Ok(json)
+        }
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        let decompressed = zstd::decode_all(data)?;
-        Ok(serde_json::from_slice(&decompressed)?)
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let decompressed = zstd::decode_all(data)?;
+            return Ok(serde_json::from_slice(&decompressed)?);
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            Ok(serde_json::from_slice(data)?)
+        }
     }
 }
 
@@ -431,10 +445,20 @@ impl ThreadsDatabase {
                 test_name.unwrap_or_default()
             )))
         } else {
-            let threads_dir = paths::data_dir().join("threads");
-            std::fs::create_dir_all(&threads_dir)?;
-            let sqlite_path = threads_dir.join("threads.db");
-            Connection::open_file(&sqlite_path.to_string_lossy())
+            #[cfg(target_family = "wasm")]
+            {
+                // No local filesystem on wasm: `Connection::open_file` ignores the
+                // path and routes to the server-side SQLite via the `/sql` shim,
+                // so threads persist server-side alongside the workspace DB.
+                Connection::open_file("threads.db")
+            }
+            #[cfg(not(target_family = "wasm"))]
+            {
+                let threads_dir = paths::data_dir().join("threads");
+                std::fs::create_dir_all(&threads_dir)?;
+                let sqlite_path = threads_dir.join("threads.db");
+                Connection::open_file(&sqlite_path.to_string_lossy())
+            }
         };
 
         connection.exec(indoc! {"
@@ -520,9 +544,13 @@ impl ThreadsDatabase {
 
         let connection = connection.lock();
 
-        let compressed = zstd::encode_all(json_data.as_bytes(), COMPRESSION_LEVEL)?;
-        let data_type = DataType::Zstd;
-        let data = compressed;
+        #[cfg(not(target_family = "wasm"))]
+        let (data_type, data) = {
+            let compressed = zstd::encode_all(json_data.as_bytes(), COMPRESSION_LEVEL)?;
+            (DataType::Zstd, compressed)
+        };
+        #[cfg(target_family = "wasm")]
+        let (data_type, data) = (DataType::Json, json_data.into_bytes());
 
         // Use the thread's updated_at as created_at for new threads.
         // This ensures the creation time reflects when the thread was conceptually
@@ -633,8 +661,16 @@ impl ThreadsDatabase {
     fn deserialize_thread(data_type: DataType, data: Vec<u8>) -> Result<DbThread> {
         let json_data = match data_type {
             DataType::Zstd => {
-                let decompressed = zstd::decode_all(&data[..])?;
-                String::from_utf8(decompressed)?
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    let decompressed = zstd::decode_all(&data[..])?;
+                    String::from_utf8(decompressed)?
+                }
+                #[cfg(target_family = "wasm")]
+                {
+                    // Wasm builds store JSON only; tolerate legacy zstd rows as raw utf8 fail.
+                    String::from_utf8(data).context("zstd thread data not supported on wasm")?
+                }
             }
             DataType::Json => String::from_utf8(data)?,
         };

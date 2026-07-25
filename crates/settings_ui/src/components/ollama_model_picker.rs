@@ -27,7 +27,18 @@ impl OllamaModelPickerDelegate {
         on_model_changed: impl Fn(SharedString, &mut Window, &mut App) + 'static,
         cx: &mut Context<OllamaModelPicker>,
     ) -> Self {
+        #[cfg(not(target_family = "wasm"))]
         let mut models = edit_prediction::ollama::fetch_models(cx);
+        // No local Ollama daemon reachable from the browser; offer only the
+        // currently-configured model so the picker still renders.
+        #[cfg(target_family = "wasm")]
+        let mut models = {
+            let mut m = Vec::new();
+            if !current_model.is_empty() {
+                m.push(current_model.clone());
+            }
+            m
+        };
 
         let current_in_list = models.contains(&current_model);
         if !current_model.is_empty() && !current_in_list {

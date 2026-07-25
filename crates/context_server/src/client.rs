@@ -16,9 +16,10 @@ use std::{
         Arc,
         atomic::{AtomicI32, Ordering::SeqCst},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 use util::{ResultExt, TryFutureExt};
+use web_time::Instant;
 
 use crate::{
     oauth::WwwAuthenticate,

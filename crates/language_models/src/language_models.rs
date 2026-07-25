@@ -16,6 +16,7 @@ pub use crate::extension::init_proxy as init_extension_proxy;
 
 use crate::provider::anthropic::AnthropicLanguageModelProvider;
 use crate::provider::anthropic_compatible::AnthropicCompatibleLanguageModelProvider;
+#[cfg(not(target_family = "wasm"))]
 use crate::provider::bedrock::BedrockLanguageModelProvider;
 use crate::provider::cloud::CloudLanguageModelProvider;
 use crate::provider::copilot_chat::CopilotChatLanguageModelProvider;
@@ -46,7 +47,9 @@ pub fn init(user_store: Entity<UserStore>, client: Arc<Client>, cx: &mut App) {
         );
     });
 
-    // Subscribe to extension store events to track LLM extension installations
+    // Subscribe to extension store events to track LLM extension installations.
+    // extension_host (wasmtime) is native-only; wasm uses host Extensions::* RPC.
+    #[cfg(not(target_family = "wasm"))]
     if let Some(extension_store) = extension_host::ExtensionStore::try_global(cx) {
         cx.subscribe(&extension_store, {
             let registry = registry.downgrade();
@@ -292,6 +295,7 @@ fn register_language_model_providers(
         ),
         cx,
     );
+    #[cfg(not(target_family = "wasm"))]
     registry.register_provider(
         Arc::new(BedrockLanguageModelProvider::new(
             client.http_client(),

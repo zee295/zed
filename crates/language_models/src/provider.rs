@@ -5,7 +5,9 @@ use http_client::http::{HeaderName, HeaderValue};
 pub mod anthropic;
 pub mod anthropic_compatible;
 pub mod api_compatible;
+#[cfg(not(target_family = "wasm"))]
 pub mod bedrock;
+pub mod bedrock_settings;
 pub mod cloud;
 pub mod copilot_chat;
 pub mod deepseek;

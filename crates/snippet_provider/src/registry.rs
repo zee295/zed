@@ -51,6 +51,13 @@ impl SnippetRegistry {
         Ok(())
     }
 
+    pub fn unregister_snippets(&self, file_path: &Path) {
+        let kind = file_path
+            .file_stem()
+            .and_then(|stem| stem.to_str().and_then(file_stem_to_key));
+        self.snippets.write().remove(&kind);
+    }
+
     pub fn get_snippets(&self, kind: &SnippetKind) -> Vec<Arc<Snippet>> {
         self.snippets.read().get(kind).cloned().unwrap_or_default()
     }

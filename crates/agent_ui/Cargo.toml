@@ -51,7 +51,6 @@ db.workspace = true
 editor.workspace = true
 eval_utils = { workspace = true, optional = true }
 extension.workspace = true
-extension_host.workspace = true
 feature_flags.workspace = true
 file_icons.workspace = true
 fs.workspace = true
@@ -60,7 +59,6 @@ git.workspace = true
 git_ui.workspace = true
 fuzzy.workspace = true
 gpui.workspace = true
-gpui_tokio.workspace = true
 html_to_markdown.workspace = true
 http_client.workspace = true
 idna.workspace = true
@@ -114,10 +112,15 @@ url.workspace = true
 util.workspace = true
 uuid.workspace = true
 watch.workspace = true
+web-time.workspace = true
 workspace.workspace = true
 zed_actions.workspace = true
 image.workspace = true
 reqwest_client = { workspace = true, optional = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+extension_host.workspace = true
+gpui_tokio.workspace = true
 
 [dev-dependencies]
 acp_thread = { workspace = true, features = ["test-support"] }

@@ -6,9 +6,10 @@ use anyhow::Result;
 use futures::channel::oneshot;
 use gpui::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DummyKeyboardMapper,
-    ForegroundExecutor, Keymap, Menu, MenuItem, PathPromptOptions, Platform, PlatformDisplay,
-    PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, Task,
-    ThermalState, WindowAppearance, WindowKind, WindowParams, popup::PopupNotSupportedError,
+    ForegroundExecutor, Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions, Platform,
+    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
+    PlatformWindow, Task, ThermalState, WindowAppearance, WindowKind, WindowParams,
+    popup::PopupNotSupportedError,
 };
 use gpui_wgpu::WgpuContext;
 use std::{
@@ -42,6 +43,8 @@ pub struct WebPlatform {
     wgpu_context: Rc<RefCell<Option<WgpuContext>>>,
     cursor_visible: Rc<Cell<bool>>,
     last_cursor_css: Rc<Cell<&'static str>>,
+    /// In-window application menus (no OS menu bar on the web).
+    menus: RefCell<Vec<OwnedMenu>>,
     _cursor_restore_listeners: Vec<EventListenerHandle>,
 }
 
@@ -61,6 +64,7 @@ impl WebPlatform {
     pub fn new(allow_multi_threading: bool) -> Self {
         let browser_window =
             web_sys::window().expect("must be running in a browser window context");
+        gpui::set_operating_system(crate::events::browser_operating_system(&browser_window));
         let dispatcher = Arc::new(WebDispatcher::new(
             browser_window.clone(),
             allow_multi_threading,
@@ -100,6 +104,7 @@ impl WebPlatform {
             wgpu_context: Rc::new(RefCell::new(None)),
             cursor_visible,
             last_cursor_css,
+            menus: RefCell::new(Vec::new()),
             _cursor_restore_listeners: cursor_restore_listeners,
         }
     }
@@ -254,7 +259,18 @@ impl Platform for WebPlatform {
 
     fn on_system_wake(&self, _callback: Box<dyn FnMut()>) {}
 
-    fn set_menus(&self, _menus: Vec<Menu>, _keymap: &Keymap) {}
+    fn set_menus(&self, menus: Vec<Menu>, _keymap: &Keymap) {
+        *self.menus.borrow_mut() = menus.into_iter().map(|m| m.owned()).collect();
+    }
+
+    fn get_menus(&self) -> Option<Vec<OwnedMenu>> {
+        let menus = self.menus.borrow();
+        if menus.is_empty() {
+            None
+        } else {
+            Some(menus.clone())
+        }
+    }
 
     fn set_dock_menu(&self, _menu: Vec<MenuItem>, _keymap: &Keymap) {}
 

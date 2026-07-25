@@ -24,6 +24,8 @@ use regex::Regex;
 pub use rope::*;
 pub use selection::*;
 use smallvec::SmallVec;
+#[cfg(not(target_family = "wasm"))]
+use std::time::Instant;
 use std::{
     borrow::Cow,
     cmp::{self, Ordering, Reverse},
@@ -34,13 +36,15 @@ use std::{
     ops::{self, Deref, Range, Sub},
     str,
     sync::{Arc, LazyLock},
-    time::{Duration, Instant},
+    time::Duration,
 };
 pub use subscription::*;
 pub use sum_tree::Bias;
 use sum_tree::{Dimensions, FilterCursor, SumTree, Summary, TreeMap, TreeSet};
 use undo_map::UndoMap;
 use util::debug_panic;
+#[cfg(target_family = "wasm")]
+use web_time::Instant;
 
 #[cfg(any(test, feature = "test-support"))]
 use util::RandomCharIter;

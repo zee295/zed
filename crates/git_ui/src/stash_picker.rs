@@ -253,7 +253,7 @@ impl StashListDelegate {
         _window: &mut Window,
         cx: &mut Context<StashList>,
     ) -> Self {
-        let timezone = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+        let timezone = crate::local_utc_offset();
 
         Self {
             matches: vec![],
@@ -275,10 +275,10 @@ impl StashListDelegate {
 
     fn format_timestamp(timestamp: i64, timezone: UtcOffset) -> String {
         let timestamp =
-            OffsetDateTime::from_unix_timestamp(timestamp).unwrap_or(OffsetDateTime::now_utc());
+            OffsetDateTime::from_unix_timestamp(timestamp).unwrap_or_else(|_| crate::now_utc());
         time_format::format_localized_timestamp(
             timestamp,
-            OffsetDateTime::now_utc(),
+            crate::now_utc(),
             timezone,
             time_format::TimestampFormat::Relative,
         )
@@ -286,10 +286,10 @@ impl StashListDelegate {
 
     fn format_absolute_timestamp(timestamp: i64, timezone: UtcOffset) -> String {
         let timestamp =
-            OffsetDateTime::from_unix_timestamp(timestamp).unwrap_or(OffsetDateTime::now_utc());
+            OffsetDateTime::from_unix_timestamp(timestamp).unwrap_or_else(|_| crate::now_utc());
         time_format::format_localized_timestamp(
             timestamp,
-            OffsetDateTime::now_utc(),
+            crate::now_utc(),
             timezone,
             time_format::TimestampFormat::EnhancedAbsolute,
         )

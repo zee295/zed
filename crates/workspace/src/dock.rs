@@ -647,6 +647,7 @@ impl Dock {
                         }
                     });
 
+                    #[cfg(not(target_family = "wasm"))]
                     workspace
                         .update(cx, |workspace, cx| {
                             workspace.serialize_workspace(window, cx);
@@ -742,9 +743,9 @@ impl Dock {
             },
         );
 
-        self.restore_state(window, cx);
+        let restored = self.restore_state(window, cx);
 
-        if panel.read(cx).starts_open(window, cx) {
+        if !restored && panel.read(cx).starts_open(window, cx) {
             self.activate_panel(index, window, cx);
             self.set_open(true, window, cx);
         }

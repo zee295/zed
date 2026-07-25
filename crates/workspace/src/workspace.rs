@@ -1350,6 +1350,7 @@ type PromptForNewPath = Box<
 type PromptForOpenPath = Box<
     dyn Fn(
         &mut Workspace,
+        PathPromptOptions,
         DirectoryLister,
         &mut Window,
         &mut Context<Workspace>,
@@ -1428,6 +1429,7 @@ pub struct Workspace {
     open_in_dev_container: bool,
     _dev_container_task: Option<Task<Result<()>>>,
     _panels_task: Option<Task<Result<()>>>,
+    initial_state_loaded: bool,
     sidebar_focus_handle: Option<FocusHandle>,
     multi_workspace: Option<WeakEntity<MultiWorkspace>>,
     /// Shared with the parent `MultiWorkspace` and any sibling workspaces: holds
@@ -1850,6 +1852,7 @@ impl Workspace {
             bottom_dock,
             right_dock,
             _panels_task: None,
+            initial_state_loaded: false,
             project: project.clone(),
             follower_states: Default::default(),
             last_leaders_by_pane: Default::default(),
@@ -2636,6 +2639,10 @@ impl Workspace {
         self._panels_task = Some(task);
     }
 
+    pub fn initial_state_loaded(&self) -> bool {
+        self.initial_state_loaded
+    }
+
     pub fn take_panels_task(&mut self) -> Option<Task<Result<()>>> {
         self._panels_task.take()
     }
@@ -3020,13 +3027,17 @@ impl Workspace {
         // TODO: If `on_prompt_for_open_path` is set, we should always use it
         // rather than gating on `use_system_path_prompts`. This would let tests
         // inject a mock without also having to disable the setting.
-        if !lister.is_local(cx) || !WorkspaceSettings::get_global(cx).use_system_path_prompts {
+        if cfg!(target_family = "wasm")
+            || !lister.is_local(cx)
+            || !WorkspaceSettings::get_global(cx).use_system_path_prompts
+        {
             let prompt = self.on_prompt_for_open_path.take().unwrap();
-            let rx = prompt(self, lister, window, cx);
+            let rx = prompt(self, path_prompt_options, lister, window, cx);
             self.on_prompt_for_open_path = Some(prompt);
             rx
         } else {
             let (tx, rx) = oneshot::channel();
+            let fallback_options = path_prompt_options.clone();
             let abs_path = cx.prompt_for_paths(path_prompt_options);
 
             cx.spawn_in(window, async move |workspace, cx| {
@@ -3043,7 +3054,7 @@ impl Workspace {
                             workspace
                                 .show_error(workspace_error::PortalError::new(err.to_string()), cx);
                             let prompt = workspace.on_prompt_for_open_path.take().unwrap();
-                            let rx = prompt(workspace, lister, window, cx);
+                            let rx = prompt(workspace, fallback_options, lister, window, cx);
                             workspace.on_prompt_for_open_path = Some(prompt);
                             rx
                         })?;
@@ -3067,7 +3078,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> oneshot::Receiver<Option<Vec<PathBuf>>> {
-        if self.project.read(cx).is_via_collab()
+        if cfg!(target_family = "wasm")
+            || self.project.read(cx).is_via_collab()
             || self.project.read(cx).is_via_remote_server()
             || !WorkspaceSettings::get_global(cx).use_system_path_prompts
         {
@@ -7051,6 +7063,9 @@ impl Workspace {
     }
 
     fn serialize_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // On WASM, sqlez talks to server-side SQLite via POST /sql (see
+        // sqlez::remote_sql). Persistence is real and shared under
+        // {project}/.zed/remote.sqlite.
         if self._schedule_serialize_workspace.is_none() {
             self._schedule_serialize_workspace =
                 Some(cx.spawn_in(window, async move |this, cx| {
@@ -7058,8 +7073,21 @@ impl Workspace {
                         .timer(SERIALIZATION_THROTTLE_TIME)
                         .await;
                     this.update_in(cx, |this, window, cx| {
+                        let previous = this._serialize_workspace_task.take();
                         this._serialize_workspace_task =
-                            Some(this.serialize_workspace_internal(window, cx));
+                            Some(cx.spawn_in(window, async move |this, cx| {
+                                if let Some(previous) = previous {
+                                    previous.await;
+                                }
+                                let serialize = this
+                                    .update_in(cx, |this, window, cx| {
+                                        this.serialize_workspace_internal(window, cx)
+                                    })
+                                    .log_err();
+                                if let Some(serialize) = serialize {
+                                    serialize.await;
+                                }
+                            }));
                         this._schedule_serialize_workspace.take();
                     })
                     .log_err();
@@ -8794,6 +8822,11 @@ fn open_items(
         for (ix, path_open_result) in tasks.await.into_iter().flatten() {
             opened_items[ix] = Some(path_open_result);
         }
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.initial_state_loaded = true;
+            cx.notify();
+        })?;
 
         Ok(opened_items)
     })

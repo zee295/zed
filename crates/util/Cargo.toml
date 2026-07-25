@@ -43,9 +43,9 @@ percent-encoding.workspace = true
 util_macros = { workspace = true, optional = true }
 gpui_util.workspace = true
 path = { workspace = true, features = ["serde"] }
+smol.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-smol.workspace = true
 which.workspace = true
 async-fs.workspace = true
 walkdir.workspace = true

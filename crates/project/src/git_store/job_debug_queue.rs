@@ -1,4 +1,8 @@
-use std::{collections::VecDeque, time::Instant};
+use std::collections::VecDeque;
+#[cfg(not(target_family = "wasm"))]
+use std::time::Instant;
+#[cfg(target_family = "wasm")]
+use web_time::Instant;
 
 use gpui::SharedString;
 

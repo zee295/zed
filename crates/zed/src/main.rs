@@ -314,7 +314,7 @@ fn main() {
             app_commit_sha,
             *release_channel::RELEASE_CHANNEL,
             client::telemetry::os_name(),
-            client::telemetry::os_version(),
+            client::telemetry::os_version().unwrap_or_default(),
         );
         println!("Zed System Specs (from CLI):\n{}", system_specs);
         return;

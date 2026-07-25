@@ -619,7 +619,21 @@ impl Asset for ImageAssetLoader {
         let asset_source = cx.asset_source().clone();
         async move {
             let bytes = match source.clone() {
-                Resource::Path(uri) => fs::read(uri.as_ref())?,
+                Resource::Path(uri) => {
+                    #[cfg(target_family = "wasm")]
+                    {
+                        let path = uri.to_string_lossy();
+                        if let Some(data) = asset_source.load(&path).ok().flatten() {
+                            data.into_owned()
+                        } else {
+                            smol::fs::read(uri.as_ref()).await?
+                        }
+                    }
+                    #[cfg(not(target_family = "wasm"))]
+                    {
+                        fs::read(uri.as_ref())?
+                    }
+                }
                 Resource::Uri(uri) => {
                     use anyhow::Context as _;
                     use futures::AsyncReadExt as _;

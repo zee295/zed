@@ -1,4 +1,5 @@
 mod llm_token;
+#[cfg(not(target_family = "wasm"))]
 mod websocket;
 
 use std::sync::Arc;
@@ -8,6 +9,7 @@ use cloud_api_types::websocket_protocol::{PROTOCOL_VERSION, PROTOCOL_VERSION_HEA
 pub use cloud_api_types::*;
 use futures::AsyncReadExt as _;
 use gpui::{App, Task};
+#[cfg(not(target_family = "wasm"))]
 use gpui_tokio::Tokio;
 use http_client::http::request;
 use http_client::{
@@ -16,9 +18,15 @@ use http_client::{
 use parking_lot::RwLock;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
+#[cfg(not(target_family = "wasm"))]
 use yawc::WebSocket;
 
+#[cfg(not(target_family = "wasm"))]
 use crate::websocket::Connection;
+
+#[cfg(target_family = "wasm")]
+#[derive(Debug)]
+pub struct Connection;
 
 pub use llm_token::LlmApiToken;
 
@@ -115,6 +123,7 @@ impl CloudApiClient {
             .await
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub fn connect(&self, cx: &App) -> Result<Task<Result<Connection>>> {
         let mut connect_url = self
             .http_client
@@ -142,6 +151,11 @@ impl CloudApiClient {
 
             Ok(Connection::new(ws))
         }))
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub fn connect(&self, _cx: &App) -> Result<Task<Result<Connection>>> {
+        anyhow::bail!("cloud websocket connect is not supported on wasm")
     }
 
     async fn create_llm_token(

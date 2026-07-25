@@ -13,11 +13,23 @@ anyhow.workspace = true
 collections.workspace = true
 futures.workspace = true
 indoc.workspace = true
-libsqlite3-sys.workspace = true
 log.workspace = true
 parking_lot.workspace = true
 pollster.workspace = true
-sqlformat.workspace = true
 thread_local = "1.1.4"
 util.workspace = true
 uuid.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+libsqlite3-sys.workspace = true
+sqlformat.workspace = true
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid = { workspace = true, features = ["js"] }
+wasm-bindgen = "0.2"
+wasm_rpc.workspace = true
+wasm_thread = { version = "0.3", features = ["es_modules"] }
+web-sys = { version = "0.3", features = ["XmlHttpRequest"] }

@@ -38,13 +38,17 @@ use ui::{
 };
 use ui_input::InputField;
 use util::ResultExt;
+#[cfg(not(target_family = "wasm"))]
+use workspace::with_active_or_new_workspace;
 use workspace::{
     Item, ModalView, SerializableItem, Workspace, notifications::NotifyTaskExt as _,
-    register_serializable_item, with_active_or_new_workspace,
+    register_serializable_item,
 };
 
 pub use ui_components::*;
-use zed_actions::{ChangeKeybinding, OpenKeymap};
+use zed_actions::ChangeKeybinding;
+#[cfg(not(target_family = "wasm"))]
+use zed_actions::OpenKeymap;
 
 use crate::{
     action_completion_provider::ActionCompletionProvider,
@@ -89,46 +93,7 @@ pub fn init(cx: &mut App) {
     let keymap_event_channel = KeymapEventChannel::new();
     cx.set_global(keymap_event_channel);
 
-    fn open_keymap_editor(
-        filter: Option<String>,
-        workspace: &mut Workspace,
-        window: &mut Window,
-        cx: &mut Context<Workspace>,
-    ) {
-        let existing = workspace
-            .active_pane()
-            .read(cx)
-            .items()
-            .find_map(|item| item.downcast::<KeymapEditor>());
-
-        let keymap_editor = if let Some(existing) = existing {
-            workspace.activate_item(&existing, true, true, window, cx);
-            existing
-        } else {
-            let keymap_editor = cx.new(|cx| KeymapEditor::new(workspace.weak_handle(), window, cx));
-            workspace.add_item_to_active_pane(
-                Box::new(keymap_editor.clone()),
-                None,
-                true,
-                window,
-                cx,
-            );
-            keymap_editor
-        };
-
-        if let Some(filter) = filter {
-            keymap_editor.update(cx, |editor, cx| {
-                editor.filter_editor.update(cx, |editor, cx| {
-                    editor.clear(window, cx);
-                    editor.insert(&filter, window, cx);
-                });
-                if !editor.has_binding_for(&filter) {
-                    open_binding_modal_after_loading(cx)
-                }
-            })
-        }
-    }
-
+    #[cfg(not(target_family = "wasm"))]
     cx.on_action(|_: &OpenKeymap, cx| {
         with_active_or_new_workspace(cx, |workspace, window, cx| {
             open_keymap_editor(None, workspace, window, cx);
@@ -143,6 +108,40 @@ pub fn init(cx: &mut App) {
     .detach();
 
     register_serializable_item::<KeymapEditor>(cx);
+}
+
+pub fn open_keymap_editor(
+    filter: Option<String>,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let existing = workspace
+        .active_pane()
+        .read(cx)
+        .items()
+        .find_map(|item| item.downcast::<KeymapEditor>());
+
+    let keymap_editor = if let Some(existing) = existing {
+        workspace.activate_item(&existing, true, true, window, cx);
+        existing
+    } else {
+        let keymap_editor = cx.new(|cx| KeymapEditor::new(workspace.weak_handle(), window, cx));
+        workspace.add_item_to_active_pane(Box::new(keymap_editor.clone()), None, true, window, cx);
+        keymap_editor
+    };
+
+    if let Some(filter) = filter {
+        keymap_editor.update(cx, |editor, cx| {
+            editor.filter_editor.update(cx, |editor, cx| {
+                editor.clear(window, cx);
+                editor.insert(&filter, window, cx);
+            });
+            if !editor.has_binding_for(&filter) {
+                open_binding_modal_after_loading(cx)
+            }
+        })
+    }
 }
 
 fn open_binding_modal_after_loading(cx: &mut Context<KeymapEditor>) {
@@ -3570,7 +3569,16 @@ async fn load_json_language(workspace: WeakEntity<Workspace>, cx: &mut AsyncApp)
                 name: "JSON".into(),
                 ..Default::default()
             },
-            Some(tree_sitter_json::LANGUAGE.into()),
+            {
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    Some(tree_sitter_json::LANGUAGE.into())
+                }
+                #[cfg(target_family = "wasm")]
+                {
+                    None
+                }
+            },
         ))
     })
 }
@@ -3602,7 +3610,16 @@ async fn load_keybind_context_language(
                 name: "Zed Keybind Context".into(),
                 ..Default::default()
             },
-            Some(tree_sitter_rust::LANGUAGE.into()),
+            {
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    Some(tree_sitter_rust::LANGUAGE.into())
+                }
+                #[cfg(target_family = "wasm")]
+                {
+                    None
+                }
+            },
         ))
     })
 }

@@ -14,10 +14,15 @@ path = "src/oauth_callback_server.rs"
 doctest = false
 
 [dependencies]
+web-time.workspace = true
 anyhow.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 futures.workspace = true
 log.workspace = true
 tiny_http.workspace = true
+url.workspace = true
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+futures.workspace = true
 url.workspace = true

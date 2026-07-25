@@ -64,10 +64,11 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use util::{ResultExt, debug_panic, markdown::MarkdownCodeBlock, paths::PathStyle};
 use uuid::Uuid;
+use web_time::Instant;
 
 const TOOL_CANCELED_MESSAGE: &str = "Tool canceled by user";
 pub const MAX_TOOL_NAME_LENGTH: usize = 64;
@@ -1472,11 +1473,21 @@ impl Thread {
             return Ok(temp_dir.clone());
         }
 
-        let temp_dir = tempfile::Builder::new()
-            .prefix("zed-agent-terminal-")
-            .tempdir()
-            .context("failed to create sandboxed terminal temp directory")?;
-        let temp_dir = temp_dir.keep();
+        #[cfg(not(target_family = "wasm"))]
+        let temp_dir = {
+            let temp_dir = tempfile::Builder::new()
+                .prefix("zed-agent-terminal-")
+                .tempdir()
+                .context("failed to create sandboxed terminal temp directory")?;
+            temp_dir.keep()
+        };
+        #[cfg(target_family = "wasm")]
+        let temp_dir = {
+            // Browser: use a virtual path under the remote workspace.
+            let dir = std::path::PathBuf::from("/tmp/zed-agent-terminal-wasm");
+            std::fs::create_dir_all(&dir).ok();
+            dir
+        };
         self.sandboxed_terminal_temp_dir = Some(temp_dir.clone());
         cx.notify();
         Ok(temp_dir)

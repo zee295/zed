@@ -3,6 +3,8 @@ mod conn;
 mod message_stream;
 mod notification;
 mod peer;
+#[cfg(target_family = "wasm")]
+pub mod wasm_conn;
 
 pub use conn::Connection;
 pub use notification::*;

@@ -67,22 +67,26 @@ streaming_diff.workspace = true
 strsim.workspace = true
 task.workspace = true
 telemetry.workspace = true
-tempfile.workspace = true
 text.workspace = true
 thiserror.workspace = true
 ui.workspace = true
 url.workspace = true
 util.workspace = true
 uuid.workspace = true
+web-time.workspace = true
 watch.workspace = true
 web_search.workspace = true
 zed_env_vars.workspace = true
-zstd.workspace = true
 
 # Used only on Windows to resolve the running release channel/version so the WSL
 # sandbox helper can fetch a matching Linux `zed`.
 [target.'cfg(target_os = "windows")'.dependencies]
 release_channel.workspace = true
+
+# Native-only: zstd C lib + tempfile (errno) don't support wasm32-unknown-unknown.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+zstd.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 assets.workspace = true

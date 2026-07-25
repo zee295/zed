@@ -359,6 +359,17 @@ impl LanguageModels {
                                     //
                                     // These fail noisily, so we don't log them.
                                 }
+                                "llama.cpp" => {
+                                    // llama.cpp also probes a local HTTP API to
+                                    // determine if it is "authenticated" (and on
+                                    // wasm it can't reach a local server at all),
+                                    // so its failure is expected — don't log.
+                                }
+                                "openai-subscribed" => {
+                                    // ChatGPT-subscription provider errors with a
+                                    // sign-in hint when the user hasn't signed in;
+                                    // expected, so don't log.
+                                }
                                 "copilot_chat" => {
                                     // Copilot Chat returns an error if Copilot is not enabled, so we don't log those errors.
                                 }

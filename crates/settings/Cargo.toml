@@ -24,7 +24,6 @@ futures.workspace = true
 gpui.workspace = true
 inventory.workspace = true
 log.workspace = true
-migrator.workspace = true
 paths.workspace = true
 release_channel.workspace = true
 rust-embed.workspace = true
@@ -38,6 +37,12 @@ settings_macros.workspace = true
 smallvec.workspace = true
 util.workspace = true
 zlog.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+migrator.workspace = true
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+wasm_remote.workspace = true
 
 [dev-dependencies]
 fs = { workspace = true, features = ["test-support"] }

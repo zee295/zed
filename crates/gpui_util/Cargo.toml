@@ -5,6 +5,7 @@ publish.workspace = true
 edition.workspace = true
 
 [dependencies]
+web-time.workspace = true
 log.workspace = true
 anyhow.workspace = true
 

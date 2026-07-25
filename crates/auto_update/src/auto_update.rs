@@ -469,7 +469,7 @@ impl AutoUpdater {
                     .log_err();
             }
 
-            #[cfg(all(not(target_os = "windows"), not(test)))]
+            #[cfg(all(not(target_os = "windows"), not(test), not(target_family = "wasm")))]
             cx.background_spawn(cleanup_stale_installer_dirs()).detach();
 
             loop {
@@ -1214,7 +1214,10 @@ async fn install_release_macos(
 /// Removes stale installer dirs from the system temp dir. Older Zed versions
 /// leaked one per update by deleting the dir while the downloaded disk image
 /// was still mounted inside it, which made the deletion fail silently.
-#[cfg(any(rust_analyzer, all(not(target_os = "windows"), not(test))))]
+#[cfg(any(
+    rust_analyzer,
+    all(not(target_os = "windows"), not(test), not(target_family = "wasm"))
+))]
 async fn cleanup_stale_installer_dirs() {
     const STALE_INSTALLER_DIR_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 

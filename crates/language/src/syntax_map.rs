@@ -7,6 +7,7 @@ use crate::{
 use collections::HashMap;
 use futures::FutureExt;
 use gpui::SharedString;
+use std::time::Duration;
 use std::{
     borrow::Cow,
     cmp::{self, Ordering, Reverse},
@@ -14,7 +15,6 @@ use std::{
     fmt, iter,
     ops::{ControlFlow, Deref, DerefMut, Range},
     sync::{Arc, LazyLock},
-    time::{Duration, Instant},
 };
 use streaming_iterator::StreamingIterator;
 use sum_tree::{Bias, Dimensions, SeekTarget, SumTree};
@@ -23,7 +23,7 @@ use tree_sitter::{
     Node, Query, QueryCapture, QueryCaptures, QueryCursor, QueryMatch, QueryMatches,
     QueryPredicateArg,
 };
-
+use web_time::Instant;
 pub const MAX_BYTES_TO_QUERY: usize = 16 * 1024;
 
 pub struct SyntaxMap {
@@ -44,28 +44,31 @@ pub struct SyntaxSnapshot {
 // To avoid blocking the main thread, we offload the drop operation to a background thread.
 impl Drop for SyntaxSnapshot {
     fn drop(&mut self) {
-        static DROP_TX: LazyLock<std::sync::mpsc::Sender<SumTree<SyntaxLayerEntry>>> =
-            LazyLock::new(|| {
-                let (tx, rx) = std::sync::mpsc::channel();
-                std::thread::Builder::new()
-                    .name("SyntaxSnapshot::drop".into())
-                    .spawn(move || while let Ok(_) = rx.recv() {})
-                    .expect("failed to spawn drop thread");
-                tx
-            });
-        // This does allocate a new Arc, but it's cheap and avoids blocking the main thread without needing to use an `Option` or `MaybeUninit`.
-        let _ = DROP_TX.send(std::mem::replace(
-            &mut self.layers,
-            SumTree::from_summary(SyntaxLayerSummary {
-                min_depth: Default::default(),
-                max_depth: Default::default(),
-                // Deliberately bogus anchors, doesn't matter in this context
-                range: Anchor::min_min_range_for_buffer(BufferId::new(1).unwrap()),
-                last_layer_range: Anchor::min_min_range_for_buffer(BufferId::new(1).unwrap()),
-                last_layer_language: Default::default(),
-                contains_unknown_injections: Default::default(),
-            }),
-        ));
+        #[cfg(not(target_family = "wasm"))]
+        {
+            static DROP_TX: LazyLock<std::sync::mpsc::Sender<SumTree<SyntaxLayerEntry>>> =
+                LazyLock::new(|| {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::Builder::new()
+                        .name("SyntaxSnapshot::drop".into())
+                        .spawn(move || while let Ok(_) = rx.recv() {})
+                        .expect("failed to spawn drop thread");
+                    tx
+                });
+            // This does allocate a new Arc, but it's cheap and avoids blocking the main thread without needing to use an `Option` or `MaybeUninit`.
+            let _ = DROP_TX.send(std::mem::replace(
+                &mut self.layers,
+                SumTree::from_summary(SyntaxLayerSummary {
+                    min_depth: Default::default(),
+                    max_depth: Default::default(),
+                    // Deliberately bogus anchors, doesn't matter in this context
+                    range: Anchor::min_min_range_for_buffer(BufferId::new(1).unwrap()),
+                    last_layer_range: Anchor::min_min_range_for_buffer(BufferId::new(1).unwrap()),
+                    last_layer_language: Default::default(),
+                    contains_unknown_injections: Default::default(),
+                }),
+            ));
+        }
     }
 }
 

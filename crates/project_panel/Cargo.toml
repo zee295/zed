@@ -17,6 +17,7 @@ path = "src/project_panel.rs"
 doctest = false
 
 [dependencies]
+web-time.workspace = true
 anyhow.workspace = true
 collections.workspace = true
 editor.workspace = true

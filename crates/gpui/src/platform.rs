@@ -68,7 +68,10 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
 };
 use strum::EnumIter;
 use uuid::Uuid;
@@ -76,6 +79,52 @@ use uuid::Uuid;
 pub use app_menu::*;
 pub use keyboard::*;
 pub use keystroke::*;
+
+/// The operating system whose conventions GPUI should use for key bindings and labels.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum OperatingSystem {
+    /// An OS that could not be identified.
+    Unknown = 0,
+    /// macOS or an Apple device using macOS keyboard conventions.
+    Mac = 1,
+    /// Microsoft Windows.
+    Windows = 2,
+    /// Linux or another Unix-like desktop.
+    Linux = 3,
+}
+
+const fn compiled_operating_system() -> u8 {
+    if cfg!(target_os = "macos") {
+        OperatingSystem::Mac as u8
+    } else if cfg!(target_os = "windows") {
+        OperatingSystem::Windows as u8
+    } else if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+        OperatingSystem::Linux as u8
+    } else {
+        OperatingSystem::Unknown as u8
+    }
+}
+
+static OPERATING_SYSTEM: AtomicU8 = AtomicU8::new(compiled_operating_system());
+
+/// Returns the runtime operating system used for keyboard conventions.
+pub fn operating_system() -> OperatingSystem {
+    match OPERATING_SYSTEM.load(Ordering::Relaxed) {
+        1 => OperatingSystem::Mac,
+        2 => OperatingSystem::Windows,
+        3 => OperatingSystem::Linux,
+        _ => OperatingSystem::Unknown,
+    }
+}
+
+/// Overrides the operating system used for keyboard conventions.
+///
+/// Native builds retain their compile-time value. Browser platforms call this
+/// during startup because WASM's target OS is the browser, not the user's OS.
+pub fn set_operating_system(operating_system: OperatingSystem) {
+    OPERATING_SYSTEM.store(operating_system as u8, Ordering::Relaxed);
+}
 
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use test::*;

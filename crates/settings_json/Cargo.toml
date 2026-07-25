@@ -16,13 +16,15 @@ default = []
 
 [dependencies]
 anyhow.workspace = true
-tree-sitter = { workspace = true, features = ["wasm"] }
-tree-sitter-json.workspace = true
-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_json_lenient.workspace = true
 serde_path_to_error.workspace = true
+util.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tree-sitter = { workspace = true, features = ["wasm"] }
+tree-sitter-json.workspace = true
 
 [dev-dependencies]
 unindent.workspace = true

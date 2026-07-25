@@ -18,16 +18,14 @@ required-features = ["test-support"]
 path = "tests/integration/fs_tests.rs"
 
 [dependencies]
+web-time.workspace = true
 anyhow.workspace = true
 async-channel.workspace = true
-async-tar.workspace = true
 async-trait.workspace = true
 collections.workspace = true
 futures.workspace = true
-git.workspace = true
 gpui.workspace = true
 ignore.workspace = true
-libc.workspace = true
 log.workspace = true
 parking_lot.workspace = true
 paths.workspace = true
@@ -37,16 +35,24 @@ thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 slotmap.workspace = true
-smol.workspace = true
 telemetry.workspace = true
-tempfile.workspace = true
 text.workspace = true
 time.workspace = true
 util.workspace = true
 path.workspace = true
+git.workspace = true
+smol.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+async-tar.workspace = true
+git.workspace = true
+libc.workspace = true
+smol.workspace = true
+tempfile.workspace = true
 is_executable = "1.0.5"
 notify = "9.0.0-rc.4"
 trash = { git = "https://github.com/zed-industries/trash-rs", rev = "47761739192828a66b11a94ba5420b82d63c03c5" }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 windows.workspace = true
 dunce.workspace = true

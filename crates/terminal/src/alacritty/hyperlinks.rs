@@ -12,10 +12,12 @@ use log::{info, warn};
 use regex::Regex;
 use std::{
     ops::{Index, Range as StdRange},
-    time::{Duration, Instant},
+    time::Duration,
 };
+// wasm: std::time::Instant panics ("time not implemented on this platform")
 use url::Url;
 use util::paths::{PathStyle, UrlExt};
+use web_time::Instant;
 
 use crate::Range;
 

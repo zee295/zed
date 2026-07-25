@@ -1,17 +1,18 @@
 mod components;
 mod extension_suggest;
 mod extension_version_selector;
+mod store;
 
 use std::sync::OnceLock;
 use std::time::Duration;
 use std::{any::TypeId, ops::Range, sync::Arc};
 
+use crate::store::{ExtensionManifest, ExtensionOperation, ExtensionStore};
 use anyhow::Context as _;
 use cloud_api_types::{ExtensionMetadata, ExtensionProvides};
 use collections::{BTreeMap, BTreeSet};
 use command_palette_hooks::CommandPaletteFilter;
 use editor::{Editor, EditorElement, EditorStyle};
-use extension_host::{ExtensionManifest, ExtensionOperation, ExtensionStore};
 use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
 use gpui::{
     Action, Anchor, App, ClipboardItem, Context, DismissEvent, Entity, EventEmitter, Focusable,
@@ -291,6 +292,16 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
+#[cfg(target_family = "wasm")]
+pub fn init_remote_store(
+    client: wasm_remote::RemoteClient,
+    languages: std::sync::Arc<language::LanguageRegistry>,
+    extension_assets: crate::store::ExtensionAssetMap,
+    cx: &mut App,
+) {
+    ExtensionStore::init_remote(client, languages, extension_assets, cx);
+}
+
 fn extension_provides_label(provides: ExtensionProvides) -> &'static str {
     match provides {
         ExtensionProvides::Themes => "Themes",
@@ -446,10 +457,10 @@ impl ExtensionsPage {
                     &store,
                     window,
                     move |this, _, event, window, cx| match event {
-                        extension_host::Event::ExtensionsUpdated => {
+                        crate::store::Event::ExtensionsUpdated => {
                             this.fetch_extensions_debounced(None, cx)
                         }
-                        extension_host::Event::ExtensionInstalled(extension_id) => this
+                        crate::store::Event::ExtensionInstalled(extension_id) => this
                             .on_extension_installed(
                                 workspace_handle.clone(),
                                 extension_id,
@@ -1125,7 +1136,7 @@ impl ExtensionsPage {
         cx: &mut Context<Self>,
     ) -> ExtensionCardButtons {
         let is_compatible =
-            extension_host::is_version_compatible(ReleaseChannel::global(cx), extension);
+            crate::store::is_version_compatible(ReleaseChannel::global(cx), extension);
 
         if has_dev_extension {
             // If we have a dev extension for the given extension, just treat it as uninstalled.

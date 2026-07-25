@@ -46,6 +46,7 @@ ztracing.workspace = true
 tracing.workspace = true
 util.workspace = true
 unicode-segmentation.workspace = true
+web-time.workspace = true
 
 [dev-dependencies]
 buffer_diff = { workspace = true, features = ["test-support"] }

@@ -16,9 +16,9 @@ doctest = false
 test-support = ["clock/test-support", "collections/test-support", "gpui/test-support", "rpc/test-support"]
 
 [dependencies]
+web-time.workspace = true
 anyhow.workspace = true
 async-channel.workspace = true
-async-tungstenite = { workspace = true, features = ["tokio", "tokio-rustls-manual-roots"] }
 base64.workspace = true
 chrono = { workspace = true, features = ["serde"] }
 clock.workspace = true
@@ -29,39 +29,59 @@ collections.workspace = true
 credentials_provider.workspace = true
 derive_more.workspace = true
 feature_flags.workspace = true
-fs.workspace = true
 futures.workspace = true
 gpui.workspace = true
-gpui_tokio.workspace = true
 http_client.workspace = true
-http_client_tls.workspace = true
-httparse = "1.10"
 log.workspace = true
 parking_lot.workspace = true
-paths.workspace = true
 postage.workspace = true
 rand.workspace = true
 regex.workspace = true
 release_channel.workspace = true
-rpc = { workspace = true, features = ["gpui"] }
 serde.workspace = true
 serde_json.workspace = true
 serde_urlencoded.workspace = true
 settings.workspace = true
 sha2.workspace = true
-smol.workspace = true
 telemetry.workspace = true
 telemetry_events.workspace = true
 text.workspace = true
 thiserror.workspace = true
 time.workspace = true
+url.workspace = true
+util.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+async-tungstenite = { workspace = true, features = ["tokio", "tokio-rustls-manual-roots"] }
+fs.workspace = true
+gpui_tokio.workspace = true
+http_client_tls.workspace = true
+httparse = "1.10"
+paths.workspace = true
 tiny_http.workspace = true
 tokio-socks.workspace = true
 tokio.workspace = true
-url.workspace = true
-util.workspace = true
 worktree.workspace = true
+smol.workspace = true
 zed_credentials_provider.workspace = true
+rpc = { workspace = true, features = ["gpui"] }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+rpc = { path = "../rpc", default-features = false, features = ["gpui"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+semver.workspace = true
+windows.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-foundation.workspace = true
+
+[target.'cfg(all(not(target_family = "wasm"), any(target_os = "windows", target_os = "macos")))'.dependencies]
+tokio-native-tls = "0.3"
+
+[target.'cfg(all(not(target_family = "wasm"), not(any(target_os = "windows", target_os = "macos"))))'.dependencies]
+rustls-pki-types = "1.12"
+tokio-rustls = { version = "0.26", features = ["tls12", "ring"], default-features = false }
 
 [dev-dependencies]
 clock = { workspace = true, features = ["test-support"] }
@@ -72,17 +92,3 @@ http_client = { workspace = true, features = ["test-support"] }
 rpc = { workspace = true, features = ["test-support"] }
 settings = { workspace = true, features = ["test-support"] }
 util = { workspace = true, features = ["test-support"] }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-semver.workspace = true
-windows.workspace = true
-
-[target.'cfg(target_os = "macos")'.dependencies]
-objc2-foundation.workspace = true
-
-[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
-tokio-native-tls = "0.3"
-
-[target.'cfg(not(any(target_os = "windows", target_os = "macos")))'.dependencies]
-rustls-pki-types = "1.12"
-tokio-rustls = { version = "0.26", features = ["tls12", "ring"], default-features = false }

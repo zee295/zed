@@ -1,5 +1,6 @@
+use std::sync::Arc;
 use std::time;
-use std::{sync::Arc, time::Instant};
+use web_time::Instant;
 
 use clock::SystemClock;
 

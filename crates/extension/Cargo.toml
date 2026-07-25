@@ -12,6 +12,7 @@ workspace = true
 path = "src/extension.rs"
 
 [dependencies]
+web-time.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 cloud_api_types.workspace = true

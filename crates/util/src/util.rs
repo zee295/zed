@@ -310,6 +310,7 @@ fn load_shell_from_passwd() -> Result<()> {
 }
 
 /// Returns a shell escaped path for the current zed executable
+#[cfg(not(target_family = "wasm"))]
 pub fn get_shell_safe_zed_path(shell_kind: shell::ShellKind) -> anyhow::Result<String> {
     use anyhow::Context as _;
     use paths::PathExt;
@@ -330,6 +331,12 @@ pub fn get_shell_safe_zed_path(shell_kind: shell::ShellKind) -> anyhow::Result<S
     zed_path
         .try_shell_safe(shell_kind)
         .context("Failed to shell-escape Zed executable path.")
+}
+
+/// Returns a shell escaped path for the current zed executable
+#[cfg(target_family = "wasm")]
+pub fn get_shell_safe_zed_path(_shell_kind: shell::ShellKind) -> anyhow::Result<String> {
+    anyhow::bail!("zed executable path is not available in the browser")
 }
 
 /// Returns a path for the zed cli executable, this function

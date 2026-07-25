@@ -15,6 +15,7 @@ path = "src/context_server.rs"
 test-support = ["gpui/test-support"]
 
 [dependencies]
+web-time.workspace = true
 anyhow.workspace = true
 async-channel.workspace = true
 async-trait.workspace = true

@@ -23,7 +23,6 @@ fs.workspace = true
 futures.workspace = true
 gpui.workspace = true
 handlebars.workspace = true
-heed.workspace = true
 language.workspace = true
 log.workspace = true
 parking_lot.workspace = true
@@ -34,6 +33,10 @@ strum.workspace = true
 text.workspace = true
 util.workspace = true
 uuid.workspace = true
+
+# heed/lmdb has no wasm32-unknown-unknown support; browser uses in-memory prompts.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+heed.workspace = true
 
 [dev-dependencies]
 fs = { workspace = true, features = ["test-support"] }

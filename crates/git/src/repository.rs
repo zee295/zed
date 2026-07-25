@@ -152,6 +152,23 @@ impl CommitDataReader {
             .map_err(|_| anyhow!("commit data reader task dropped response"))?
     }
 
+    pub fn from_async_resolver(
+        executor: BackgroundExecutor,
+        resolve: impl 'static + Send + Sync + Fn(Oid) -> BoxFuture<'static, Result<CommitData>>,
+    ) -> Self {
+        let (request_tx, request_rx) = async_channel::bounded::<CommitDataRequest>(64);
+        let resolve = Arc::new(resolve);
+        let task = executor.spawn(async move {
+            while let Ok(CommitDataRequest { sha, response_tx }) = request_rx.recv().await {
+                response_tx.send(resolve(sha).await).ok();
+            }
+        });
+        Self {
+            request_tx,
+            _task: task,
+        }
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn for_test(
         executor: BackgroundExecutor,
@@ -1386,7 +1403,7 @@ pub struct GitCommitter {
     pub email: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct GitCommitTemplate {
     pub template: String,
 }

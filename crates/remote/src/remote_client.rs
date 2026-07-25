@@ -45,12 +45,13 @@ use std::{
         Arc, Weak,
         atomic::{AtomicU32, AtomicU64, Ordering::SeqCst},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 use util::{
     ResultExt,
     paths::{PathStyle, RemotePathBuf},
 };
+use web_time::Instant;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RemoteOs {

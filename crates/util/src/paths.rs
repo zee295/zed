@@ -32,7 +32,14 @@ pub fn home_dir() -> &'static PathBuf {
                 PathBuf::from("/home/zed")
             }
         } else {
-            dirs::home_dir().expect("failed to determine home directory")
+            #[cfg(target_family = "wasm")]
+            {
+                PathBuf::from("/workspace")
+            }
+            #[cfg(not(target_family = "wasm"))]
+            {
+                dirs::home_dir().expect("failed to determine home directory")
+            }
         }
     })
 }
@@ -94,6 +101,10 @@ pub trait PathExt {
 
     /// Try to make a shell-safe representation of the path.
     #[cfg(not(target_family = "wasm"))]
+    fn try_shell_safe(&self, shell_kind: crate::shell::ShellKind) -> anyhow::Result<String>;
+
+    /// Try to make a shell-safe representation of the path.
+    #[cfg(target_family = "wasm")]
     fn try_shell_safe(&self, shell_kind: crate::shell::ShellKind) -> anyhow::Result<String>;
 }
 
@@ -178,6 +189,20 @@ impl<T: AsRef<Path>> PathExt for T {
     }
 
     #[cfg(not(target_family = "wasm"))]
+    fn try_shell_safe(&self, shell_kind: crate::shell::ShellKind) -> anyhow::Result<String> {
+        use anyhow::Context;
+        let path_str = self
+            .as_ref()
+            .to_str()
+            .with_context(|| "Path contains invalid UTF-8")?;
+        shell_kind
+            .try_quote(path_str)
+            .as_deref()
+            .map(ToOwned::to_owned)
+            .context("Failed to quote path")
+    }
+
+    #[cfg(target_family = "wasm")]
     fn try_shell_safe(&self, shell_kind: crate::shell::ShellKind) -> anyhow::Result<String> {
         use anyhow::Context;
         let path_str = self

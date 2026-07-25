@@ -1,9 +1,5 @@
-use std::{
-    collections::BinaryHeap,
-    sync::Arc,
-    thread,
-    time::{Duration, Instant},
-};
+use std::{collections::BinaryHeap, sync::Arc, thread, time::Duration};
+use web_time::Instant;
 
 use parking_lot::{Condvar, Mutex};
 

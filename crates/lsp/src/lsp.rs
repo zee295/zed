@@ -37,9 +37,10 @@ use std::{
         atomic::{AtomicI32, Ordering::SeqCst},
     },
     task::Poll,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use util::{ConnectionResult, redact};
+use web_time::Instant;
 
 const JSON_RPC_VERSION: &str = "2.0";
 const CONTENT_LEN_HEADER: &str = "Content-Length: ";
@@ -89,11 +90,23 @@ pub enum IoKind {
     StdErr,
 }
 
+fn serialize_arguments<S>(arguments: &Vec<OsString>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let strings: Vec<String> = arguments
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    strings.serialize(serializer)
+}
+
 /// Represents a launchable language server. This can either be a standalone binary or the path
 /// to a runtime with arguments to instruct it to launch the actual language server file.
 #[derive(Clone, Serialize)]
 pub struct LanguageServerBinary {
     pub path: PathBuf,
+    #[serde(serialize_with = "serialize_arguments")]
     pub arguments: Vec<OsString>,
     pub env: Option<HashMap<String, String>>,
 }
@@ -420,6 +433,12 @@ impl LanguageServer {
         workspace_folders: Option<Arc<Mutex<BTreeSet<Uri>>>>,
         cx: &mut AsyncApp,
     ) -> Result<Self> {
+        // On wasm, std `Path::is_dir` issues a raw syscall that always fails
+        // (no local fs), which would wrongly fall back to the parent dir. The
+        // LSP root is the worktree root — always a directory — so use it as-is.
+        #[cfg(target_family = "wasm")]
+        let working_dir = root_path;
+        #[cfg(not(target_family = "wasm"))]
         let working_dir = if root_path.is_dir() {
             root_path
         } else {
@@ -779,7 +798,19 @@ impl LanguageServer {
 
         #[allow(deprecated)]
         InitializeParams {
-            process_id: Some(std::process::id()),
+            // wasm has no real process IDs (`std::process::id` panics with
+            // "no pids on this platform"). LSP servers treat `process_id: None`
+            // as "client is not a process" — fine for browser → remote LSP.
+            process_id: {
+                #[cfg(target_family = "wasm")]
+                {
+                    None
+                }
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    Some(std::process::id())
+                }
+            },
             root_path: Some(
                 self.root_uri
                     .to_file_path()
@@ -1608,7 +1639,7 @@ impl LanguageServer {
             .unwrap()
         }));
 
-        outbound_tx.send_blocking(serializer)?;
+        outbound_tx.try_send(serializer)?;
         Ok(())
     }
 

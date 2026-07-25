@@ -67,6 +67,8 @@ use serde::Deserialize;
 use settings::{Settings, WorktreeId};
 use smallvec::SmallVec;
 use smol::future::yield_now;
+#[cfg(not(target_family = "wasm"))]
+use std::time::Instant;
 use std::{
     cmp::Ordering,
     collections::{BTreeSet, HashSet, VecDeque, hash_map::Entry},
@@ -79,7 +81,7 @@ use std::{
         Arc,
         atomic::{self, AtomicU64},
     },
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
 };
 use sum_tree::{Edit, SumTree, TreeMap};
 use task::Shell;
@@ -90,6 +92,8 @@ use util::{
     post_inc,
     rel_path::RelPath,
 };
+#[cfg(target_family = "wasm")]
+use web_time::Instant;
 use worktree::{
     File, PathChange, PathKey, PathProgress, PathSummary, PathTarget, ProjectEntryId,
     UpdatedGitRepositoriesSet, UpdatedGitRepository, Worktree,

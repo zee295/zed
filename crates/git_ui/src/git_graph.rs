@@ -46,11 +46,12 @@ use std::{
     ops::Range,
     rc::Rc,
     sync::{Arc, OnceLock},
-    time::{Duration, Instant},
+    time::Duration,
 };
+use web_time::Instant;
 
 use theme::AccentColors;
-use time::{OffsetDateTime, UtcOffset, format_description::BorrowedFormatItem};
+use time::{OffsetDateTime, format_description::BorrowedFormatItem};
 use ui::{
     Chip, ColumnWidthConfig, CommonAnimationExt as _, ContextMenu, DiffStat, Divider,
     HeaderResizeInfo, HighlightedLabel, IndentGuideColors, ListItem, ListItemSpacing,
@@ -615,7 +616,7 @@ fn format_timestamp(timestamp: i64) -> String {
         return "Unknown".to_string();
     };
 
-    let local_offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+    let local_offset = crate::local_utc_offset();
     let local_datetime = datetime.to_offset(local_offset);
 
     local_datetime
@@ -2728,7 +2729,7 @@ impl GitGraph {
         let date_string = commit_timestamp
             .and_then(|ts| OffsetDateTime::from_unix_timestamp(ts).ok())
             .map(|datetime| {
-                let local_offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+                let local_offset = crate::local_utc_offset();
                 let local_datetime = datetime.to_offset(local_offset);
                 let format =
                     time::format_description::parse("[month repr:short] [day], [year]").ok();

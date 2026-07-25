@@ -1,8 +1,8 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
+use crate::store::ExtensionStore;
 use cloud_api_types::ExtensionMetadata;
-use extension_host::ExtensionStore;
 use fs::Fs;
 use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
 use gpui::{App, DismissEvent, Entity, EventEmitter, Focusable, Task, WeakEntity, prelude::*};
@@ -178,7 +178,7 @@ impl PickerDelegate for ExtensionVersionSelectorDelegate {
         let candidate_id = self.matches[self.selected_index].candidate_id;
         let extension_version = &self.extension_versions[candidate_id];
 
-        if !extension_host::is_version_compatible(ReleaseChannel::global(cx), extension_version) {
+        if !crate::store::is_version_compatible(ReleaseChannel::global(cx), extension_version) {
             return;
         }
 
@@ -218,7 +218,7 @@ impl PickerDelegate for ExtensionVersionSelectorDelegate {
         let extension_version = &self.extension_versions.get(version_match.candidate_id)?;
 
         let is_version_compatible =
-            extension_host::is_version_compatible(ReleaseChannel::global(cx), extension_version);
+            crate::store::is_version_compatible(ReleaseChannel::global(cx), extension_version);
         let disabled = !is_version_compatible;
 
         Some(

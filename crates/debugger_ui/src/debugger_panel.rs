@@ -31,6 +31,7 @@ use rpc::proto::{self};
 use settings::Settings;
 use std::sync::{Arc, LazyLock};
 use task::{DebugScenario, SharedTaskContext};
+#[cfg(not(target_family = "wasm"))]
 use tree_sitter::{Query, StreamingIterator as _};
 use ui::{
     ButtonLike, ContextMenu, Divider, ElevationIndex, PopoverMenu, PopoverMenuHandle, SplitButton,
@@ -1213,6 +1214,7 @@ impl DebugPanel {
             .unwrap_or_else(|err| Task::ready(Err(err)))
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub fn insert_task_into_editor(
         editor: &mut Editor,
         new_scenario: String,
@@ -1285,6 +1287,43 @@ impl DebugPanel {
         }
         editor.transact(window, cx, |editor, window, cx| {
             editor.edit(edits, cx);
+            let snapshot = editor.buffer().read(cx).read(cx);
+            let point = cursor_position.to_point(&snapshot);
+            drop(snapshot);
+            editor.go_to_singleton_buffer_point(point, window, cx);
+        });
+        Ok(editor.save(SaveOptions::default(), project, window, cx))
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub fn insert_task_into_editor(
+        editor: &mut Editor,
+        new_scenario: String,
+        project: Entity<Project>,
+        window: &mut Window,
+        cx: &mut Context<Editor>,
+    ) -> Result<Task<Result<()>>> {
+        let content = editor.text(cx);
+        let mut scenarios: Vec<serde_json::Value> = if content.trim().is_empty() {
+            Vec::new()
+        } else {
+            serde_json_lenient::from_str(&content).context("could not parse debug.json")?
+        };
+        scenarios.push(
+            serde_json_lenient::from_str(&new_scenario)
+                .context("could not parse generated debug scenario")?,
+        );
+
+        let replacement = serde_json_lenient::to_string_pretty(&scenarios)?;
+        let cursor_position = MultiBufferOffset(replacement.len());
+        editor.transact(window, cx, |editor, window, cx| {
+            editor.edit(
+                [(
+                    MultiBufferOffset(0)..MultiBufferOffset(content.len()),
+                    replacement,
+                )],
+                cx,
+            );
             let snapshot = editor.buffer().read(cx).read(cx);
             let point = cursor_position.to_point(&snapshot);
             drop(snapshot);

@@ -280,7 +280,8 @@ mod tests {
         let fs = FakeFs::new(cx.background_executor.clone());
         cx.update(|cx| {
             SnippetRegistry::init_global(cx);
-            SnippetRegistry::global(cx)
+            let registry = SnippetRegistry::global(cx);
+            registry
                 .register_snippets(
                     "ruby".as_ref(),
                     indoc! {r#"
@@ -297,6 +298,14 @@ mod tests {
             let provider = SnippetProvider::new(fs.clone(), Default::default(), cx);
             cx.update_entity(&provider, |provider, cx| {
                 assert_eq!(1, provider.snippets_for(Some("ruby".to_owned()), cx).len());
+            });
+            registry.unregister_snippets("ruby".as_ref());
+            cx.update_entity(&provider, |provider, cx| {
+                assert!(
+                    provider
+                        .snippets_for(Some("ruby".to_owned()), cx)
+                        .is_empty()
+                );
             });
         });
     }

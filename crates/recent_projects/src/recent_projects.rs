@@ -1,6 +1,8 @@
+#[cfg(not(target_family = "wasm"))]
 mod dev_container_suggest;
 pub mod disconnected_overlay;
 mod remote_connections;
+#[cfg(not(target_family = "wasm"))]
 mod remote_servers;
 pub mod sidebar_recent_projects;
 mod ssh_config;
@@ -34,10 +36,12 @@ use picker::{
 };
 use project::{Worktree, git_store::Repository};
 pub use remote_connections::RemoteSettings;
+#[cfg(not(target_family = "wasm"))]
 pub use remote_servers::RemoteServerProjects;
 use settings::{DefaultOpenBehavior, Settings, WorktreeId};
 use workspace::ProjectGroupKey;
 
+#[cfg(not(target_family = "wasm"))]
 use dev_container::{DevContainerContext, find_devcontainer_configs};
 use ui::{
     ButtonLike, ContextMenu, Divider, HighlightedLabel, KeyBinding, ListItem, ListItemSpacing,
@@ -49,7 +53,9 @@ use workspace::{
     SerializedWorkspaceLocation, Workspace, WorkspaceDb, WorkspaceId,
     notifications::DetachAndPromptErr, with_active_or_new_workspace,
 };
-use zed_actions::{OpenDevContainer, OpenRecent, OpenRemote};
+#[cfg(not(target_family = "wasm"))]
+use zed_actions::OpenDevContainer;
+use zed_actions::{OpenRecent, OpenRemote};
 
 actions!(
     recent_projects,
@@ -483,90 +489,96 @@ pub fn init(cx: &mut App) {
             }
         }
     });
-    cx.on_action(|open_remote: &OpenRemote, cx| {
-        let from_existing_connection = open_remote.from_existing_connection;
-        let create_new_window = open_remote
-            .create_new_window
-            .unwrap_or_else(|| default_open_in_new_window(cx));
-        with_active_or_new_workspace(cx, move |workspace, window, cx| {
-            if from_existing_connection {
-                cx.propagate();
-                return;
-            }
-            let handle = cx.entity().downgrade();
-            let fs = workspace.project().read(cx).fs().clone();
-            workspace.toggle_modal(window, cx, |window, cx| {
-                RemoteServerProjects::new(create_new_window, fs, window, handle, cx)
-            })
-        });
-    });
-
     cx.observe_new(DisconnectedOverlay::register).detach();
 
-    cx.on_action(|_: &OpenDevContainer, cx| {
-        with_active_or_new_workspace(cx, move |workspace, window, cx| {
-            if !workspace.project().read(cx).is_local() {
-                cx.spawn_in(window, async move |_, cx| {
-                    cx.prompt(
-                        gpui::PromptLevel::Critical,
-                        "Cannot open Dev Container from remote project",
-                        None,
-                        &["OK"],
-                    )
-                    .await
-                    .ok();
+    #[cfg(not(target_family = "wasm"))]
+    {
+        cx.on_action(|open_remote: &OpenRemote, cx| {
+            let from_existing_connection = open_remote.from_existing_connection;
+            let create_new_window = open_remote
+                .create_new_window
+                .unwrap_or_else(|| default_open_in_new_window(cx));
+            with_active_or_new_workspace(cx, move |workspace, window, cx| {
+                if from_existing_connection {
+                    cx.propagate();
+                    return;
+                }
+                let handle = cx.entity().downgrade();
+                let fs = workspace.project().read(cx).fs().clone();
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    RemoteServerProjects::new(create_new_window, fs, window, handle, cx)
                 })
-                .detach();
-                return;
-            }
-
-            let fs = workspace.project().read(cx).fs().clone();
-            let configs = find_devcontainer_configs(workspace, cx);
-            let app_state = workspace.app_state().clone();
-            let dev_container_context = DevContainerContext::from_workspace(workspace, cx);
-            let handle = cx.entity().downgrade();
-            workspace.toggle_modal(window, cx, |window, cx| {
-                RemoteServerProjects::new_dev_container(
-                    fs,
-                    configs,
-                    app_state,
-                    dev_container_context,
-                    window,
-                    handle,
-                    cx,
-                )
             });
         });
-    });
 
-    // Subscribe to worktree additions to suggest opening the project in a dev container
-    cx.observe_new(
-        |workspace: &mut Workspace, window: Option<&mut Window>, cx: &mut Context<Workspace>| {
-            let Some(window) = window else {
-                return;
-            };
-            cx.subscribe_in(
-                workspace.project(),
-                window,
-                move |workspace, project, event, window, cx| {
-                    if let project::Event::WorktreeUpdatedEntries(worktree_id, updated_entries) =
-                        event
-                    {
-                        dev_container_suggest::suggest_on_worktree_updated(
-                            workspace,
-                            *worktree_id,
+        cx.on_action(|_: &OpenDevContainer, cx| {
+            with_active_or_new_workspace(cx, move |workspace, window, cx| {
+                if !workspace.project().read(cx).is_local() {
+                    cx.spawn_in(window, async move |_, cx| {
+                        cx.prompt(
+                            gpui::PromptLevel::Critical,
+                            "Cannot open Dev Container from remote project",
+                            None,
+                            &["OK"],
+                        )
+                        .await
+                        .ok();
+                    })
+                    .detach();
+                    return;
+                }
+
+                let fs = workspace.project().read(cx).fs().clone();
+                let configs = find_devcontainer_configs(workspace, cx);
+                let app_state = workspace.app_state().clone();
+                let dev_container_context = DevContainerContext::from_workspace(workspace, cx);
+                let handle = cx.entity().downgrade();
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    RemoteServerProjects::new_dev_container(
+                        fs,
+                        configs,
+                        app_state,
+                        dev_container_context,
+                        window,
+                        handle,
+                        cx,
+                    )
+                });
+            });
+        });
+
+        cx.observe_new(
+            |workspace: &mut Workspace,
+             window: Option<&mut Window>,
+             cx: &mut Context<Workspace>| {
+                let Some(window) = window else {
+                    return;
+                };
+                cx.subscribe_in(
+                    workspace.project(),
+                    window,
+                    move |workspace, project, event, window, cx| {
+                        if let project::Event::WorktreeUpdatedEntries(
+                            worktree_id,
                             updated_entries,
-                            project,
-                            window,
-                            cx,
-                        );
-                    }
-                },
-            )
-            .detach();
-        },
-    )
-    .detach();
+                        ) = event
+                        {
+                            dev_container_suggest::suggest_on_worktree_updated(
+                                workspace,
+                                *worktree_id,
+                                updated_entries,
+                                project,
+                                window,
+                                cx,
+                            );
+                        }
+                    },
+                )
+                .detach();
+            },
+        )
+        .detach();
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -660,6 +672,10 @@ impl RecentProjects {
         let db = WorkspaceDb::global(cx);
         cx.spawn_in(window, async move |this, cx| {
             let Some(fs) = fs else { return };
+            #[cfg(target_family = "wasm")]
+            if let Err(error) = db.prefetch_recent_project_queries().await {
+                log::warn!("failed to prefetch recent projects: {error:#}");
+            }
             let workspaces = db
                 .recent_project_workspaces(fs.as_ref())
                 .await
@@ -1197,6 +1213,45 @@ impl PickerDelegate for RecentProjectsDelegate {
                             {
                                 task.detach_and_log_err(cx);
                             }
+                        }
+                    });
+                } else if let Some(multi_workspace) =
+                    self.workspace.upgrade().and_then(|workspace| {
+                        workspace
+                            .read(cx)
+                            .multi_workspace()
+                            .and_then(|multi_workspace| multi_workspace.upgrade())
+                    })
+                {
+                    window.defer(cx, move |window, cx| {
+                        if let Some(workspace) =
+                            multi_workspace.update(cx, |multi_workspace, cx| {
+                                multi_workspace.last_active_workspace_for_group(&key, cx)
+                            })
+                        {
+                            multi_workspace.update(cx, |multi_workspace, cx| {
+                                multi_workspace.activate(workspace, None, window, cx);
+                            });
+                        } else {
+                            let path_list = key.path_list().clone();
+                            let host = key.host();
+                            let task = multi_workspace.update(cx, |multi_workspace, cx| {
+                                let modal_workspace = multi_workspace.workspace().clone();
+                                multi_workspace.find_or_create_workspace(
+                                    path_list,
+                                    host,
+                                    Some(key),
+                                    move |options, window, cx| {
+                                        connect_with_modal(&modal_workspace, options, window, cx)
+                                    },
+                                    &[],
+                                    None,
+                                    OpenMode::Activate,
+                                    window,
+                                    cx,
+                                )
+                            });
+                            task.detach_and_log_err(cx);
                         }
                     });
                 }
@@ -2086,7 +2141,7 @@ fn open_local_project(
     let paths = workspace.update(cx, |workspace, cx| {
         workspace.prompt_for_open_path(
             PathPromptOptions {
-                files: true,
+                files: false,
                 directories: true,
                 multiple: true,
                 prompt: None,
@@ -2101,6 +2156,10 @@ fn open_local_project(
     });
 
     let multi_workspace_handle = window.window_handle().downcast::<MultiWorkspace>();
+    let embedded_multi_workspace = workspace
+        .read(cx)
+        .multi_workspace()
+        .and_then(|multi_workspace| multi_workspace.upgrade());
     window
         .spawn(cx, async move |cx| {
             let Some(paths) = paths.await.log_err().flatten() else {
@@ -2110,6 +2169,17 @@ fn open_local_project(
                 if let Some(handle) = multi_workspace_handle {
                     if let Some(task) = handle
                         .update(cx, |multi_workspace, window, cx| {
+                            multi_workspace.open_project(paths, OpenMode::Activate, window, cx)
+                        })
+                        .log_err()
+                    {
+                        task.await.log_err();
+                    }
+                    return;
+                }
+                if let Some(multi_workspace) = embedded_multi_workspace {
+                    if let Some(task) = multi_workspace
+                        .update_in(cx, |multi_workspace, window, cx| {
                             multi_workspace.open_project(paths, OpenMode::Activate, window, cx)
                         })
                         .log_err()
@@ -2174,6 +2244,21 @@ impl RecentProjectsDelegate {
                                 {
                                     task.detach_and_log_err(cx);
                                 }
+                            });
+                        } else if let Some(multi_workspace) = workspace
+                            .multi_workspace()
+                            .and_then(|multi_workspace| multi_workspace.upgrade())
+                        {
+                            window.defer(cx, move |window, cx| {
+                                let task = multi_workspace.update(cx, |multi_workspace, cx| {
+                                    multi_workspace.open_project(
+                                        paths,
+                                        OpenMode::Activate,
+                                        window,
+                                        cx,
+                                    )
+                                });
+                                task.detach_and_log_err(cx);
                             });
                         }
                         return;
@@ -2984,7 +3069,7 @@ mod tests {
 
         // Set up the prompt mock to return the new project path.
         workspace.update(cx, |workspace, _cx| {
-            workspace.set_prompt_for_open_path(Box::new(|_, _, _, _| {
+            workspace.set_prompt_for_open_path(Box::new(|_, _, _, _, _| {
                 let (tx, rx) = futures::channel::oneshot::channel();
                 tx.send(Some(vec![PathBuf::from(path!("/new-project"))]))
                     .ok();
@@ -3060,7 +3145,7 @@ mod tests {
 
         // Set up the prompt mock to return the new project path.
         workspace.update(cx, |workspace, _cx| {
-            workspace.set_prompt_for_open_path(Box::new(|_, _, _, _| {
+            workspace.set_prompt_for_open_path(Box::new(|_, _, _, _, _| {
                 let (tx, rx) = futures::channel::oneshot::channel();
                 tx.send(Some(vec![PathBuf::from(path!("/new-project"))]))
                     .ok();

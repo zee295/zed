@@ -19,12 +19,14 @@ use language::language_settings::{AllLanguageSettings, SoftWrap};
 use language::{Bias, Point};
 pub use scroll_amount::ScrollAmount;
 use settings::Settings;
-use std::{
-    cmp::Ordering,
-    time::{Duration, Instant},
-};
+use std::cmp::Ordering;
+use std::time::Duration;
+#[cfg(not(target_family = "wasm"))]
+use std::time::Instant;
 use ui::scrollbars::ScrollbarAutoHide;
 use util::ResultExt;
+#[cfg(target_family = "wasm")]
+use web_time::Instant;
 use workspace::{ItemId, WorkspaceId};
 
 pub const SCROLL_EVENT_SEPARATION: Duration = Duration::from_millis(28);

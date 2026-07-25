@@ -321,9 +321,9 @@ impl log::Log for Logger {
 
 pub struct Timer {
     pub logger: Logger,
-    pub start_time: std::time::Instant,
+    pub start_time: web_time::Instant,
     pub name: &'static str,
-    pub warn_if_longer_than: Option<std::time::Duration>,
+    pub warn_if_longer_than: Option<web_time::Duration>,
     pub done: bool,
 }
 
@@ -339,13 +339,13 @@ impl Timer {
         Self {
             logger,
             name,
-            start_time: std::time::Instant::now(),
+            start_time: web_time::Instant::now(),
             warn_if_longer_than: None,
             done: false,
         }
     }
 
-    pub fn warn_if_gt(mut self, warn_limit: std::time::Duration) -> Self {
+    pub fn warn_if_gt(mut self, warn_limit: web_time::Duration) -> Self {
         self.warn_if_longer_than = Some(warn_limit);
         self
     }

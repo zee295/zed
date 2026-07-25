@@ -6,6 +6,7 @@ use std::{
 use anyhow::{Context as _, Result};
 use askpass::EncryptedPassword;
 use editor::Editor;
+#[cfg(not(target_family = "wasm"))]
 use extension_host::ExtensionStore;
 use futures::{FutureExt as _, channel::oneshot, select};
 use gpui::{AppContext, AsyncApp, PromptLevel, WindowHandle};
@@ -420,22 +421,23 @@ pub async fn open_remote_project(
         break;
     }
 
-    // Register the remote client with extensions. We use `multi_workspace.workspace()` here
-    // (not `initial_workspace`) because `open_remote_project_inner` activated the new remote
-    // workspace, so the active workspace is now the one with the remote project.
-    window
-        .update(cx, |multi_workspace: &mut MultiWorkspace, _, cx| {
-            let workspace = multi_workspace.workspace().clone();
-            workspace.update(cx, |workspace, cx| {
-                if let Some(client) = workspace.project().read(cx).remote_client() {
-                    if let Some(extension_store) = ExtensionStore::try_global(cx) {
-                        extension_store
-                            .update(cx, |store, cx| store.register_remote_client(client, cx));
+    #[cfg(not(target_family = "wasm"))]
+    {
+        // Browser extensions are registered by the server-side extension RPC shim.
+        window
+            .update(cx, |multi_workspace: &mut MultiWorkspace, _, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                workspace.update(cx, |workspace, cx| {
+                    if let Some(client) = workspace.project().read(cx).remote_client() {
+                        if let Some(extension_store) = ExtensionStore::try_global(cx) {
+                            extension_store
+                                .update(cx, |store, cx| store.register_remote_client(client, cx));
+                        }
                     }
-                }
-            });
-        })
-        .ok();
+                });
+            })
+            .ok();
+    }
     Ok(window)
 }
 

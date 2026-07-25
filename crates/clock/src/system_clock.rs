@@ -1,4 +1,4 @@
-use std::time::Instant;
+use web_time::Instant;
 
 pub trait SystemClock: Send + Sync {
     /// Returns the current date and time in UTC.

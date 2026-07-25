@@ -176,12 +176,25 @@ impl ShellBuilder {
     ///
     /// Prefer this over manually constructing a command with the output of `Self::build`,
     /// as this method handles `cmd` weirdness on windows correctly.
+    #[cfg(not(target_family = "wasm"))]
     pub fn build_smol_command(
         self,
         task_command: Option<String>,
         task_args: &[String],
     ) -> smol::process::Command {
         smol::process::Command::from(self.build_std_command(task_command, task_args))
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub fn build_smol_command(
+        self,
+        task_command: Option<String>,
+        task_args: &[String],
+    ) -> smol::process::Command {
+        let (program, args) = self.build(task_command, task_args);
+        let mut command = smol::process::Command::new(program);
+        command.args(args);
+        command
     }
 
     /// Builds a `std::process::Command` with the given task command and arguments.

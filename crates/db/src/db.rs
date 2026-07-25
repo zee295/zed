@@ -75,6 +75,14 @@ impl AppDatabase {
         Self(connection)
     }
 
+    /// Opens a named in-memory database and runs all domain migrations.
+    ///
+    /// Used by the WASM web workspace (no on-disk SQLite, no `block_on`).
+    /// Pair with a locking write queue so `build` completes without parking.
+    pub async fn open_in_memory(name: &str) -> Self {
+        Self(open_in_memory_db::<AppMigrator>(name).await)
+    }
+
     /// Returns the per-App connection if set, otherwise falls back to
     /// the shared LazyLock.
     pub fn global(cx: &App) -> &ThreadSafeConnection {
@@ -88,6 +96,67 @@ impl AppDatabase {
             panic!("database not initialized")
         }
     }
+}
+
+#[cfg(target_family = "wasm")]
+pub async fn prepare_web_database() -> anyhow::Result<()> {
+    let registrations: Vec<&DomainMigration> = inventory::iter::<DomainMigration>().collect();
+    let sorted = topological_sort(&registrations);
+
+    'attempt: for attempt in 0..2 {
+        sqlez::remote_sql::script_async(DB_INITIALIZE_QUERY).await?;
+        for registration in &sorted {
+            let drift = sqlez::remote_sql::migrate_domain_async(
+                registration.name,
+                registration.migrations,
+                &[],
+            )
+            .await
+            .with_context(|| format!("migrating {}", registration.name))?;
+            if drift.is_empty() {
+                continue;
+            }
+
+            let mut allowed_changes = Vec::with_capacity(drift.len());
+            for change in drift {
+                if (registration.should_allow_migration_change)(
+                    change.index,
+                    &change.stored,
+                    &change.proposed,
+                ) {
+                    allowed_changes.push(change.index);
+                } else if attempt == 0 {
+                    log::warn!(
+                        "remote SQLite migration drift for {}; resetting server database",
+                        registration.name
+                    );
+                    sqlez::remote_sql::reset_database_async().await?;
+                    continue 'attempt;
+                } else {
+                    anyhow::bail!(
+                        "Migration changed for {} at step {}\n\nStored migration:\n{}\n\nProposed migration:\n{}",
+                        registration.name,
+                        change.index,
+                        change.stored,
+                        change.proposed
+                    );
+                }
+            }
+            sqlez::remote_sql::migrate_domain_async(
+                registration.name,
+                registration.migrations,
+                &allowed_changes,
+            )
+            .await
+            .with_context(|| format!("migrating {} with allowed changes", registration.name))?;
+        }
+
+        sqlez::remote_sql::prime_common_reads_async().await?;
+        sqlez::remote_sql::mark_database_prepared();
+        return Ok(());
+    }
+
+    anyhow::bail!("database migration retry exhausted")
 }
 
 fn topological_sort<'a>(registrations: &[&'a DomainMigration]) -> Vec<&'a DomainMigration> {
@@ -182,6 +251,10 @@ pub async fn open_db<M: Migrator + 'static>(
     let db_path = db_path(db_dir, scope);
 
     let connection = maybe!(async {
+        // On wasm there is no local fs; `ThreadSafeConnection`/`Connection`
+        // already routes to the server-side SQLite via the `/sql` shim, so skip
+        // the mkdir (which would fail) and open the logical file directly.
+        #[cfg(not(target_family = "wasm"))]
         if let Some(parent) = db_path.parent() {
             create_dir_all(parent)
                 .context("Could not create db directory")
@@ -214,14 +287,35 @@ async fn open_main_db<M: Migrator>(db_path: &Path) -> Option<ThreadSafeConnectio
 
 async fn open_fallback_db<M: Migrator>() -> ThreadSafeConnection {
     log::warn!("Opening fallback in-memory database");
-    ThreadSafeConnection::builder::<M>(FALLBACK_DB_NAME, false)
+    open_in_memory_db::<M>(FALLBACK_DB_NAME).await
+}
+
+/// Open a named in-memory SQLite database and run migrator `M`.
+///
+/// On WASM the default write queue is the locking (synchronous) queue, so this
+/// future resolves without needing a background thread or `block_on`.
+pub async fn open_in_memory_db<M: Migrator + 'static>(name: &str) -> ThreadSafeConnection {
+    use sqlez::thread_safe_connection::locking_queue;
+
+    match ThreadSafeConnection::builder::<M>(name, false)
         .with_db_initialization_query(DB_INITIALIZE_QUERY)
         .with_connection_initialize_query(CONNECTION_INITIALIZE_QUERY)
+        .with_write_queue_constructor(locking_queue())
         .build()
         .await
-        .expect(
-            "Fallback in memory database failed. Likely initialization queries or migrations have fundamental errors",
-        )
+    {
+        Ok(conn) => conn,
+        Err(err) => {
+            // On WASM the "in-memory" handle talks to server-side SQLite. Migration
+            // drift is recovered once via Sql::reset inside migrations_wasm; if
+            // that still fails, surface a clear error without a raw expect panic.
+            panic!(
+                "App database failed to initialize (migrations/sql bridge).\n\
+                 If you see migration drift, delete `.zed/remote.sqlite` on the server and reload.\n\
+                 Underlying error: {err:#}"
+            );
+        }
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]

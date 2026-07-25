@@ -16,7 +16,6 @@ doctest = false
 anyhow.workspace = true
 auto_update.workspace = true
 editor.workspace = true
-extension_host.workspace = true
 fs.workspace = true
 futures.workspace = true
 gpui.workspace = true
@@ -26,7 +25,11 @@ proto.workspace = true
 smallvec.workspace = true
 ui.workspace = true
 util.workspace = true
+web-time.workspace = true
 workspace.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+extension_host.workspace = true
 
 [dev-dependencies]
 editor = { workspace = true, features = ["test-support"] }

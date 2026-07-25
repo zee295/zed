@@ -13,7 +13,7 @@ use project::git_store::Repository;
 use settings::Settings;
 use std::hash::Hash;
 use theme_settings::ThemeSettings;
-use time::{OffsetDateTime, UtcOffset};
+use time::OffsetDateTime;
 use ui::{Avatar, Chip, CopyButton, Divider, Tooltip, prelude::*, tooltip_container};
 use workspace::Workspace;
 
@@ -228,7 +228,7 @@ impl CommitTooltip {
         let commit_time = blame
             .committer_time
             .and_then(|t| OffsetDateTime::from_unix_timestamp(t).ok())
-            .unwrap_or(OffsetDateTime::now_utc());
+            .unwrap_or_else(crate::now_utc);
 
         Self::new(
             CommitDetails {
@@ -292,10 +292,10 @@ impl Render for CommitTooltip {
             .map(|sha| sha.to_string().into())
             .unwrap_or_else(|| self.commit.sha.clone());
         let full_sha = self.commit.sha.to_string();
-        let local_offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+        let local_offset = crate::local_utc_offset();
         let absolute_timestamp = time_format::format_localized_timestamp(
             self.commit.commit_time,
-            OffsetDateTime::now_utc(),
+            crate::now_utc(),
             local_offset,
             time_format::TimestampFormat::MediumAbsolute,
         );
@@ -457,10 +457,10 @@ impl Render for CommitTooltip {
 fn blame_entry_timestamp(blame_entry: &BlameEntry, format: time_format::TimestampFormat) -> String {
     match blame_entry.author_offset_date_time() {
         Ok(timestamp) => {
-            let local_offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+            let local_offset = crate::local_utc_offset();
             time_format::format_localized_timestamp(
                 timestamp,
-                time::OffsetDateTime::now_utc(),
+                crate::now_utc(),
                 local_offset,
                 format,
             )

@@ -12,8 +12,99 @@ mod util;
 pub use listener::*;
 #[cfg(target_os = "windows")]
 pub use socket::*;
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_family = "wasm")))]
 pub use std::os::unix::net::{UnixListener, UnixStream};
+
+#[cfg(target_family = "wasm")]
+pub use wasm::*;
+
+#[cfg(target_family = "wasm")]
+pub mod wasm {
+    use std::io;
+    use std::path::Path;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    fn unsupported() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Unix sockets are not supported on wasm",
+        )
+    }
+
+    #[derive(Debug)]
+    pub struct UnixListener;
+
+    impl UnixListener {
+        pub fn bind<P: AsRef<Path>>(_path: P) -> io::Result<Self> {
+            Err(unsupported())
+        }
+        pub async fn accept(&self) -> io::Result<(UnixStream, ())> {
+            Err(unsupported())
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct UnixStream;
+
+    impl UnixStream {
+        pub fn connect<P: AsRef<Path>>(_path: P) -> io::Result<Self> {
+            Err(unsupported())
+        }
+        pub fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+        pub fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+        pub fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl std::io::Read for UnixStream {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.read(buf)
+        }
+    }
+
+    impl std::io::Write for UnixStream {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.flush()
+        }
+    }
+
+    impl futures::io::AsyncRead for UnixStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(0))
+        }
+    }
+
+    impl futures::io::AsyncWrite for UnixStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(0))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+}
 #[cfg(target_os = "windows")]
 pub use stream::*;
 

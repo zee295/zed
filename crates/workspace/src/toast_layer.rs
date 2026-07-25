@@ -1,7 +1,5 @@
-use std::{
-    rc::Rc,
-    time::{Duration, Instant},
-};
+use std::{rc::Rc, time::Duration};
+use web_time::Instant;
 
 use gpui::{
     AnyView, DismissEvent, Entity, EntityId, FocusHandle, ManagedView, MouseButton, Subscription,
@@ -190,7 +188,7 @@ impl ToastLayer {
     pub fn start_dismiss_timer(&mut self, duration: Duration, cx: &mut Context<Self>) {
         self.clear_dismiss_timer(cx);
 
-        let instant_started = std::time::Instant::now();
+        let instant_started = web_time::Instant::now();
         let task = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(duration).await;
 

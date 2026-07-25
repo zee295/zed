@@ -6,12 +6,14 @@ use editor::{Editor, EditorElement, EditorStyle};
 use fs::Fs;
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, Focusable, KeyContext, ParentElement, Render,
-    RenderOnce, SharedString, Styled, TextStyle, UniformListScrollHandle, Window, point,
+    RenderOnce, SharedString, Styled, TaskExt, TextStyle, UniformListScrollHandle, Window, point,
     uniform_list,
 };
 use project::agent_server_store::{AllAgentServersSettings, CustomAgentServerSettings};
 use project::{AgentRegistryStore, RegistryAgent};
-use settings::{Settings, SettingsStore, update_settings_file};
+use settings::{
+    Settings, SettingsStore, update_settings_file, update_settings_file_with_completion,
+};
 use theme_settings::ThemeSettings;
 use ui::{
     ButtonStyle, ScrollableHandle, ToggleButtonGroup, ToggleButtonGroupSize,
@@ -515,7 +517,7 @@ impl AgentRegistryPage {
                             .color(Color::Muted),
                     )
                     .on_click(move |_, window, cx| {
-                        update_settings_file(fs.clone(), cx, {
+                        let completion = update_settings_file_with_completion(fs.clone(), cx, {
                             let agent_id = agent_id.clone();
                             move |settings, _| {
                                 let agent_servers = settings.agent_servers.get_or_insert_default();
@@ -529,12 +531,19 @@ impl AgentRegistryPage {
                                 });
                             }
                         });
-                        window.dispatch_action(
-                            Box::new(zed_actions::agent::SelectAgent {
-                                agent: agent_id.clone(),
-                            }),
-                            cx,
-                        );
+                        let window = window.window_handle();
+                        let agent_id = agent_id.clone();
+                        cx.spawn(async move |cx| {
+                            completion.await??;
+                            window.update(cx, |_, window, cx| {
+                                window.dispatch_action(
+                                    Box::new(zed_actions::agent::SelectAgent { agent: agent_id }),
+                                    cx,
+                                );
+                            })?;
+                            anyhow::Ok(())
+                        })
+                        .detach_and_log_err(cx);
                     })
             }
             RegistryInstallStatus::InstalledRegistry => {

@@ -81,7 +81,40 @@ pub struct AppCell {
     app: RefCell<App>,
 }
 
+std::thread_local! {
+    /// Weak handle to the process's main [`AppCell`], used by platform dispatchers
+    /// (especially web) to avoid running main-thread tasks while the App is borrowed.
+    static CURRENT_APP_CELL: std::cell::RefCell<Option<std::rc::Weak<AppCell>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install `app` as the process-wide current app cell (called at launch).
+#[doc(hidden)]
+pub fn set_current_app_cell(app: &std::rc::Rc<AppCell>) {
+    CURRENT_APP_CELL.with(|slot| {
+        *slot.borrow_mut() = Some(std::rc::Rc::downgrade(app));
+    });
+}
+
+/// Returns true if the current App cell is borrowed (shared or exclusive).
+/// Platform dispatchers use this to defer main-thread work and avoid re-entrancy.
+pub fn is_app_borrowed() -> bool {
+    CURRENT_APP_CELL.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|weak| weak.upgrade())
+            .map(|cell| cell.is_borrowed())
+            .unwrap_or(false)
+    })
+}
+
 impl AppCell {
+    /// True when the inner [`RefCell`] is already borrowed (immutably or mutably).
+    #[doc(hidden)]
+    pub fn is_borrowed(&self) -> bool {
+        self.app.try_borrow_mut().is_err()
+    }
+
     #[doc(hidden)]
     #[track_caller]
     pub fn borrow(&self) -> AppRef<'_> {
@@ -226,6 +259,7 @@ impl Application {
     where
         F: 'static + FnOnce(&mut App),
     {
+        set_current_app_cell(&self.0);
         let this = self.0.clone();
         let platform = self.0.borrow().platform.clone();
         platform.run(Box::new(move || {
@@ -247,6 +281,7 @@ impl Application {
     where
         F: 'static + FnOnce(&mut App),
     {
+        set_current_app_cell(&self.0);
         let this = self.0.clone();
         let platform = self.0.borrow().platform.clone();
         platform.run(Box::new(move || {
@@ -854,6 +889,9 @@ impl App {
                 _ref_counts,
             }),
         });
+
+        // So platform dispatchers (web) can detect App re-entrancy.
+        set_current_app_cell(&app);
 
         init_app_menus(platform.as_ref(), &app.borrow());
         SystemWindowTabController::init(&mut app.borrow_mut());

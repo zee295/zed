@@ -67,7 +67,8 @@ use std::ops::Range;
 use std::path::Path;
 use std::str::FromStr as _;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 use thiserror::Error;
 use util::ResultExt as _;
@@ -2438,13 +2439,19 @@ async fn send_settled_batches(
 
             let result = async {
                 let body = SubmitEditPredictionSettledBatchBody { predictions: batch };
+                // zstd is native-only; on wasm send the JSON uncompressed (the
+                // Zed cloud prediction endpoint isn't used by the web build anyway).
+                #[cfg(not(target_family = "wasm"))]
                 let compressed = zstd::encode_all(&serde_json::to_vec(&body)?[..], 3)?;
+                #[cfg(target_family = "wasm")]
+                let compressed = serde_json::to_vec(&body)?;
                 EditPredictionStore::send_api_request::<SubmitEditPredictionSettledResponse>(
                     |builder| {
-                        Ok(builder
-                            .uri(url.as_ref())
-                            .header("Content-Encoding", "zstd")
-                            .body(compressed.clone().into())?)
+                        #[cfg(not(target_family = "wasm"))]
+                        let builder = builder.header("Content-Encoding", "zstd");
+                        #[cfg(target_family = "wasm")]
+                        let builder = builder.header("Content-Encoding", "identity");
+                        Ok(builder.uri(url.as_ref()).body(compressed.clone().into())?)
                     },
                     client.clone(),
                     llm_token.clone(),
@@ -2997,13 +3004,19 @@ impl EditPredictionStore {
         let request_id = uuid::Uuid::new_v4().to_string();
 
         let json_bytes = serde_json::to_vec(&request)?;
+        #[cfg(not(target_family = "wasm"))]
         let compressed = zstd::encode_all(&json_bytes[..], 3)?;
+        #[cfg(target_family = "wasm")]
+        let compressed = json_bytes;
 
         Self::send_api_request(
             |builder| {
+                #[cfg(not(target_family = "wasm"))]
+                let builder = builder.header("Content-Encoding", "zstd");
+                #[cfg(target_family = "wasm")]
+                let builder = builder.header("Content-Encoding", "identity");
                 let builder = builder
                     .uri(url.as_ref())
-                    .header("Content-Encoding", "zstd")
                     .header(PREDICT_EDITS_MODE_HEADER_NAME, mode.as_ref())
                     .header(PREDICT_EDITS_REQUEST_ID_HEADER_NAME, request_id.as_str())
                     .header(PREDICT_EDITS_TRIGGER_HEADER_NAME, trigger.as_ref());

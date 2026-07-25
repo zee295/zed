@@ -2,16 +2,21 @@ use anyhow::Context as _;
 use collections::HashMap;
 use futures::{Future, FutureExt, channel::oneshot};
 use parking_lot::{Mutex, RwLock};
+#[cfg(not(target_family = "wasm"))]
+use std::thread;
 use std::{
     marker::PhantomData,
     ops::Deref,
     sync::{Arc, LazyLock},
-    thread,
     time::Duration,
 };
 use thread_local::ThreadLocal;
+#[cfg(target_family = "wasm")]
+use wasm_thread as thread;
 
-use crate::{connection::Connection, domain::Migrator, util::UnboundedSyncSender};
+#[cfg(not(target_family = "wasm"))]
+use crate::util::UnboundedSyncSender;
+use crate::{connection::Connection, domain::Migrator};
 
 const MIGRATION_RETRIES: usize = 10;
 const CONNECTION_INITIALIZE_RETRIES: usize = 50;
@@ -80,6 +85,13 @@ impl<M: Migrator> ThreadSafeConnectionBuilder<M> {
         self.connection
             .initialize_queues(self.write_queue_constructor);
 
+        #[cfg(target_family = "wasm")]
+        if crate::remote_sql::database_prepared() {
+            self.connection
+                .replace_write_queue(wasm_background_thread_queue());
+            return Ok(self.connection);
+        }
+
         let db_initialize_query = self.db_initialize_query;
 
         self.connection
@@ -122,17 +134,32 @@ impl<M: Migrator> ThreadSafeConnectionBuilder<M> {
             })
             .await?;
 
+        #[cfg(target_family = "wasm")]
+        self.connection
+            .replace_write_queue(wasm_background_thread_queue());
+
         Ok(self.connection)
     }
 }
 
 impl ThreadSafeConnection {
+    #[cfg(target_family = "wasm")]
+    fn replace_write_queue(&self, mut write_queue_constructor: WriteQueueConstructor) {
+        QUEUES
+            .write()
+            .insert(self.uri.clone(), write_queue_constructor());
+    }
+
     fn initialize_queues(&self, write_queue_constructor: Option<WriteQueueConstructor>) -> bool {
         if !QUEUES.read().contains_key(&self.uri) {
             let mut queues = QUEUES.write();
             if !queues.contains_key(&self.uri) {
+                #[cfg(not(target_family = "wasm"))]
                 let mut write_queue_constructor =
                     write_queue_constructor.unwrap_or_else(background_thread_queue);
+                #[cfg(target_family = "wasm")]
+                let mut write_queue_constructor =
+                    write_queue_constructor.unwrap_or_else(locking_queue);
                 queues.insert(self.uri.clone(), write_queue_constructor());
                 return true;
             }
@@ -201,37 +228,58 @@ impl ThreadSafeConnection {
         };
 
         if let Some(initialize_query) = connection_initialize_query {
-            let mut last_error = None;
-            let initialized = (0..CONNECTION_INITIALIZE_RETRIES).any(|attempt| {
-                match connection
+            #[cfg(target_family = "wasm")]
+            if crate::remote_sql::database_prepared() {
+                *connection.write.get_mut() = false;
+                return connection;
+            }
+            #[cfg(not(target_family = "wasm"))]
+            {
+                let mut last_error = None;
+                let initialized =
+                    (0..CONNECTION_INITIALIZE_RETRIES).any(|attempt| {
+                        match connection
+                            .exec(initialize_query)
+                            .and_then(|mut statement| statement())
+                        {
+                            Ok(()) => true,
+                            Err(err)
+                                if is_schema_lock_error(&err)
+                                    && attempt + 1 < CONNECTION_INITIALIZE_RETRIES =>
+                            {
+                                last_error = Some(err);
+                                thread::sleep(CONNECTION_INITIALIZE_RETRY_DELAY);
+                                false
+                            }
+                            Err(err) => {
+                                panic!(
+                                    "Initialize query failed to execute: {}\n\nCaused by:\n{err:#}",
+                                    initialize_query
+                                )
+                            }
+                        }
+                    });
+
+                if !initialized {
+                    let err = last_error
+                        .expect("connection initialization retries should record the last error");
+                    panic!(
+                        "Initialize query failed to execute after retries: {}\n\nCaused by:\n{err:#}",
+                        initialize_query
+                    );
+                }
+            }
+            #[cfg(target_family = "wasm")]
+            {
+                if let Err(err) = connection
                     .exec(initialize_query)
                     .and_then(|mut statement| statement())
                 {
-                    Ok(()) => true,
-                    Err(err)
-                        if is_schema_lock_error(&err)
-                            && attempt + 1 < CONNECTION_INITIALIZE_RETRIES =>
-                    {
-                        last_error = Some(err);
-                        thread::sleep(CONNECTION_INITIALIZE_RETRY_DELAY);
-                        false
-                    }
-                    Err(err) => {
-                        panic!(
-                            "Initialize query failed to execute: {}\n\nCaused by:\n{err:#}",
-                            initialize_query
-                        )
-                    }
+                    panic!(
+                        "Initialize query failed to execute: {}\n\nCaused by:\n{err:#}",
+                        initialize_query
+                    )
                 }
-            });
-
-            if !initialized {
-                let err = last_error
-                    .expect("connection initialization retries should record the last error");
-                panic!(
-                    "Initialize query failed to execute after retries: {}\n\nCaused by:\n{err:#}",
-                    initialize_query
-                );
             }
         }
 
@@ -279,6 +327,7 @@ impl Deref for ThreadSafeConnection {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub fn background_thread_queue() -> WriteQueueConstructor {
     use std::sync::mpsc::channel;
 
@@ -309,6 +358,30 @@ pub fn locking_queue() -> WriteQueueConstructor {
         Box::new(move |queued_write| {
             let _lock = write_mutex.lock();
             queued_write();
+        })
+    })
+}
+
+#[cfg(target_family = "wasm")]
+fn wasm_background_thread_queue() -> WriteQueueConstructor {
+    use std::sync::mpsc::channel;
+
+    Box::new(|| {
+        let (sender, receiver) = channel::<QueuedWrite>();
+
+        thread::Builder::new()
+            .name("sqlez-worker".to_string())
+            .spawn(move || {
+                while let Ok(write) = receiver.recv() {
+                    write();
+                }
+            })
+            .expect("failed to spawn sqlez worker");
+
+        Box::new(move |queued_write| {
+            sender
+                .send(queued_write)
+                .expect("could not send write to sqlez worker");
         })
     })
 }

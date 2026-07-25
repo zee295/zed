@@ -1930,6 +1930,33 @@ impl WorkspaceDb {
         .collect())
     }
 
+    /// Seed the synchronous sqlez cache without blocking the browser UI.
+    #[cfg(target_family = "wasm")]
+    pub async fn prefetch_recent_project_queries(&self) -> Result<()> {
+        let remote_connections = sqlez::remote_sql::prefetch_query(
+            sql!(
+                SELECT
+                    id, kind, host, port, user, distro, container_id, name, use_podman, remote_env
+                FROM
+                    remote_connections
+            ),
+            &[],
+        );
+        let recent_workspaces = sqlez::remote_sql::prefetch_query(
+            sql!(
+                SELECT workspace_id, paths, paths_order, identity_paths, identity_paths_order, remote_connection_id, session_id, timestamp
+                FROM workspaces
+                WHERE
+                    paths IS NOT NULL OR
+                    remote_connection_id IS NOT NULL
+                ORDER BY timestamp DESC
+            ),
+            &[],
+        );
+        futures::try_join!(remote_connections, recent_workspaces)?;
+        Ok(())
+    }
+
     pub(crate) fn remote_connection(
         &self,
         id: RemoteConnectionId,

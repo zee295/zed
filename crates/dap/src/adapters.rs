@@ -7,7 +7,9 @@ pub use dap_types::{StartDebuggingRequestArguments, StartDebuggingRequestArgumen
 use fs::Fs;
 use futures::io::BufReader;
 use gpui::{AsyncApp, SharedString};
-pub use http_client::{HttpClient, github::latest_github_release};
+pub use http_client::HttpClient;
+#[cfg(not(target_family = "wasm"))]
+pub use http_client::github::latest_github_release;
 use language::{LanguageName, LanguageToolchainStore};
 use node_runtime::NodeRuntime;
 use schemars::JsonSchema;

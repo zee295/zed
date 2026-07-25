@@ -90,28 +90,53 @@ impl BaseKeymap {
     ];
 
     pub fn asset_path(&self) -> Option<&'static str> {
-        #[cfg(target_os = "macos")]
-        match self {
-            BaseKeymap::JetBrains => Some("keymaps/macos/jetbrains.json"),
-            BaseKeymap::SublimeText => Some("keymaps/macos/sublime_text.json"),
-            BaseKeymap::Atom => Some("keymaps/macos/atom.json"),
-            BaseKeymap::TextMate => Some("keymaps/macos/textmate.json"),
-            BaseKeymap::Emacs => Some("keymaps/macos/emacs.json"),
-            BaseKeymap::Cursor => Some("keymaps/macos/cursor.json"),
-            BaseKeymap::VSCode => None,
-            BaseKeymap::None => None,
-        }
+        #[cfg(target_family = "wasm")]
+        return if gpui::operating_system() == gpui::OperatingSystem::Mac {
+            match self {
+                BaseKeymap::JetBrains => Some("keymaps/macos/jetbrains.json"),
+                BaseKeymap::SublimeText => Some("keymaps/macos/sublime_text.json"),
+                BaseKeymap::Atom => Some("keymaps/macos/atom.json"),
+                BaseKeymap::TextMate => Some("keymaps/macos/textmate.json"),
+                BaseKeymap::Emacs => Some("keymaps/macos/emacs.json"),
+                BaseKeymap::Cursor => Some("keymaps/macos/cursor.json"),
+                BaseKeymap::VSCode | BaseKeymap::None => None,
+            }
+        } else {
+            match self {
+                BaseKeymap::JetBrains => Some("keymaps/linux/jetbrains.json"),
+                BaseKeymap::SublimeText => Some("keymaps/linux/sublime_text.json"),
+                BaseKeymap::Atom => Some("keymaps/linux/atom.json"),
+                BaseKeymap::Emacs => Some("keymaps/linux/emacs.json"),
+                BaseKeymap::Cursor => Some("keymaps/linux/cursor.json"),
+                BaseKeymap::TextMate | BaseKeymap::VSCode | BaseKeymap::None => None,
+            }
+        };
 
-        #[cfg(not(target_os = "macos"))]
-        match self {
-            BaseKeymap::JetBrains => Some("keymaps/linux/jetbrains.json"),
-            BaseKeymap::SublimeText => Some("keymaps/linux/sublime_text.json"),
-            BaseKeymap::Atom => Some("keymaps/linux/atom.json"),
-            BaseKeymap::Emacs => Some("keymaps/linux/emacs.json"),
-            BaseKeymap::Cursor => Some("keymaps/linux/cursor.json"),
-            BaseKeymap::TextMate => None,
-            BaseKeymap::VSCode => None,
-            BaseKeymap::None => None,
+        #[cfg(not(target_family = "wasm"))]
+        {
+            #[cfg(target_os = "macos")]
+            match self {
+                BaseKeymap::JetBrains => Some("keymaps/macos/jetbrains.json"),
+                BaseKeymap::SublimeText => Some("keymaps/macos/sublime_text.json"),
+                BaseKeymap::Atom => Some("keymaps/macos/atom.json"),
+                BaseKeymap::TextMate => Some("keymaps/macos/textmate.json"),
+                BaseKeymap::Emacs => Some("keymaps/macos/emacs.json"),
+                BaseKeymap::Cursor => Some("keymaps/macos/cursor.json"),
+                BaseKeymap::VSCode => None,
+                BaseKeymap::None => None,
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            match self {
+                BaseKeymap::JetBrains => Some("keymaps/linux/jetbrains.json"),
+                BaseKeymap::SublimeText => Some("keymaps/linux/sublime_text.json"),
+                BaseKeymap::Atom => Some("keymaps/linux/atom.json"),
+                BaseKeymap::Emacs => Some("keymaps/linux/emacs.json"),
+                BaseKeymap::Cursor => Some("keymaps/linux/cursor.json"),
+                BaseKeymap::TextMate => None,
+                BaseKeymap::VSCode => None,
+                BaseKeymap::None => None,
+            }
         }
     }
 

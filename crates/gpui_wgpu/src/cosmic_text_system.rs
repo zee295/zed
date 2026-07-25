@@ -122,7 +122,12 @@ impl PlatformTextSystem for CosmicTextSystem {
             font_ids.as_slice()
         } else {
             let font_ids =
-                state.load_family(&font.family, &font.features, font.fallbacks.as_ref())?;
+            state.load_family(
+                &font.family,
+                &font.features,
+                font.fallbacks.as_ref(),
+                false,
+            )?;
             state.font_ids_by_family_cache.insert(key.clone(), font_ids);
             state.font_ids_by_family_cache[&key].as_ref()
         };
@@ -230,6 +235,7 @@ impl CosmicTextSystemState {
         name: &str,
         features: &FontFeatures,
         fallbacks: Option<&FontFallbacks>,
+        allow_symbol_only: bool,
     ) -> Result<SmallVec<[FontId; 4]>> {
         // recurse with `fallbacks = None` so a fallback family cannot pull in
         // another chain. missing fallback families are dropped so a typo in
@@ -246,7 +252,7 @@ impl CosmicTextSystemState {
                     let fb_ids = if let Some(cached) = self.font_ids_by_family_cache.get(&fb_key) {
                         cached.clone()
                     } else {
-                        let loaded = self.load_family(fallback_name, features, None)?;
+                        let loaded = self.load_family(fallback_name, features, None, true)?;
                         self.font_ids_by_family_cache
                             .insert(fb_key.clone(), loaded.clone());
                         loaded
@@ -285,13 +291,15 @@ impl CosmicTextSystemState {
                 .get_font(font_id, cosmic_text::Weight::NORMAL)
                 .context("Could not load font")?;
 
-            // HACK: To let the storybook run and render Windows caption icons. We should actually do better font fallback.
+            // Primary text families must contain ordinary text. Explicit
+            // fallback families may intentionally be symbol-only.
             let allowed_bad_font_names = [
                 "SegoeFluentIcons", // NOTE: Segoe fluent icons postscript name is inconsistent
                 "Segoe Fluent Icons",
             ];
 
             if font.as_swash().charmap().map('m') == 0
+                && !allow_symbol_only
                 && !allowed_bad_font_names.contains(&postscript_name.as_str())
             {
                 self.font_system.db_mut().remove_face(font.id());

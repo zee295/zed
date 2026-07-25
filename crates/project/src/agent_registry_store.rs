@@ -1,6 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(target_family = "wasm"))]
+use std::time::Instant;
+#[cfg(target_family = "wasm")]
+use web_time::Instant;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use collections::HashMap;
@@ -17,7 +21,10 @@ use util::ResultExt;
 
 use crate::{AgentId, DisableAiSettings};
 
+#[cfg(not(target_family = "wasm"))]
 const REGISTRY_URL: &str = "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json";
+#[cfg(target_family = "wasm")]
+const REGISTRY_URL: &str = "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json?zed_web_platform=wasm-host";
 const REFRESH_THROTTLE_DURATION: Duration = Duration::from_secs(60 * 60);
 // Bound the full request lifecycle, including response body reads; the shared
 // HTTP client only has a connect timeout.
@@ -579,6 +586,10 @@ fn resolve_icon_url(entry: &RegistryEntry) -> Option<String> {
 }
 
 fn current_platform_key() -> Option<&'static str> {
+    if cfg!(target_family = "wasm") {
+        return Some("wasm-host");
+    }
+
     let os = if cfg!(target_os = "macos") {
         "darwin"
     } else if cfg!(target_os = "linux") {

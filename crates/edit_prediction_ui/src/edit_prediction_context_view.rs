@@ -1,10 +1,6 @@
-use std::{
-    any::TypeId,
-    collections::VecDeque,
-    ops::Add,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{any::TypeId, collections::VecDeque, ops::Add, sync::Arc, time::Duration};
+
+use web_time::Instant;
 
 use anyhow::Result;
 use client::{Client, UserStore};

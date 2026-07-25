@@ -1,10 +1,15 @@
 use anyhow::Result;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use std::{ops::Range, sync::LazyLock};
+use std::ops::Range;
+#[cfg(not(target_family = "wasm"))]
+use std::sync::LazyLock;
+#[cfg(not(target_family = "wasm"))]
 use tree_sitter::{Query, StreamingIterator as _};
+#[cfg(not(target_family = "wasm"))]
 use util::RangeExt;
 
+#[cfg(not(target_family = "wasm"))]
 pub fn update_value_in_json_text<'a>(
     text: &mut String,
     key_path: &mut Vec<&'a str>,
@@ -65,6 +70,7 @@ pub fn update_value_in_json_text<'a>(
 }
 
 /// * `replace_key` - When an exact key match according to `key_path` is found, replace the key with `replace_key` if `Some`.
+#[cfg(not(target_family = "wasm"))]
 pub fn replace_value_in_json_text<T: AsRef<str>>(
     text: &str,
     key_path: &[T],
@@ -304,6 +310,7 @@ fn parse_index_key(index_key: &str) -> Option<usize> {
     index_key.strip_prefix('#')?.parse().ok()
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn handle_possible_array_value(
     key_node: &tree_sitter::Node,
     value_node: &tree_sitter::Node,
@@ -375,6 +382,7 @@ const TS_DOCUMENT_KIND: &str = "document";
 const TS_ARRAY_KIND: &str = "array";
 const TS_COMMENT_KIND: &str = "comment";
 
+#[cfg(not(target_family = "wasm"))]
 pub fn replace_top_level_array_value_in_json_text(
     text: &str,
     key_path: &[impl AsRef<str>],
@@ -497,6 +505,7 @@ pub fn replace_top_level_array_value_in_json_text(
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub fn append_top_level_array_value_in_json_text(
     text: &str,
     new_value: &Value,
@@ -621,6 +630,8 @@ pub fn append_top_level_array_value_in_json_text(
 
 /// Infers the indentation size used in JSON text by analyzing the tree structure.
 /// Returns the detected indent size, or a default of 2 if no indentation is found.
+#[cfg(not(target_family = "wasm"))]
+#[cfg(not(target_family = "wasm"))]
 pub fn infer_json_indent_size(text: &str) -> usize {
     const MAX_INDENT_SIZE: usize = 64;
 
@@ -743,6 +754,62 @@ pub fn to_pretty_json(
 pub fn parse_json_with_comments<T: DeserializeOwned>(content: &str) -> Result<T> {
     let mut deserializer = serde_json_lenient::Deserializer::from_str(content);
     Ok(serde_path_to_error::deserialize(&mut deserializer)?)
+}
+
+#[cfg(target_family = "wasm")]
+pub fn replace_value_in_json_text<T: AsRef<str>>(
+    text: &str,
+    key_path: &[T],
+    _tab_size: usize,
+    new_value: Option<&Value>,
+    _replace_key: Option<&str>,
+) -> (Range<usize>, String) {
+    let new_text = new_value.map_or_else(String::new, |v| v.to_string());
+    (0..text.len(), new_text)
+}
+
+#[cfg(target_family = "wasm")]
+pub fn replace_top_level_array_value_in_json_text(
+    text: &str,
+    _key_path: &[impl AsRef<str>],
+    new_value: Option<&Value>,
+    _replace_key: Option<&str>,
+    _array_index: usize,
+    _tab_size: usize,
+) -> (Range<usize>, String) {
+    (
+        0..text.len(),
+        new_value.map_or_else(String::new, |v| v.to_string()),
+    )
+}
+
+#[cfg(target_family = "wasm")]
+pub fn append_top_level_array_value_in_json_text(
+    text: &str,
+    new_value: &Value,
+    _tab_size: usize,
+) -> (Range<usize>, String) {
+    (text.len()..text.len(), format!(",{}", new_value))
+}
+
+#[cfg(target_family = "wasm")]
+pub fn infer_json_indent_size(_text: &str) -> usize {
+    2
+}
+
+#[cfg(target_family = "wasm")]
+pub fn update_value_in_json_text(
+    text: &mut String,
+    _key_path: &mut Vec<&str>,
+    _tab_size: usize,
+    _old_value: &Value,
+    new_value: &Value,
+    edits: &mut Vec<(Range<usize>, String)>,
+) {
+    let new_text = new_value.to_string();
+    let range = 0..text.len();
+    text.replace_range(range.clone(), &new_text);
+    edits.push((range, new_text));
 }
 
 #[cfg(test)]

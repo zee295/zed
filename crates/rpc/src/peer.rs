@@ -18,14 +18,15 @@ use serde::{Serialize, ser::SerializeStruct};
 use std::{
     fmt, future,
     future::Future,
+    pin::Pin,
     sync::atomic::Ordering::SeqCst,
     sync::{
         Arc,
         atomic::{self, AtomicU32},
     },
     time::Duration,
-    time::Instant,
 };
+use web_time::Instant;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize)]
 pub struct ConnectionId {
@@ -72,12 +73,7 @@ pub struct ConnectionState {
     #[serde(skip)]
     response_channels: Arc<
         Mutex<
-            Option<
-                HashMap<
-                    u32,
-                    oneshot::Sender<(proto::Envelope, std::time::Instant, oneshot::Sender<()>)>,
-                >,
-            >,
+            Option<HashMap<u32, oneshot::Sender<(proto::Envelope, Instant, oneshot::Sender<()>)>>>,
         >,
     >,
     #[allow(clippy::type_complexity)]
@@ -94,6 +90,21 @@ pub struct ConnectionState {
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const RECEIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(not(target_family = "wasm"))]
+pub trait MaybeSend: Send {}
+#[cfg(not(target_family = "wasm"))]
+impl<T: Send> MaybeSend for T {}
+
+#[cfg(target_family = "wasm")]
+pub trait MaybeSend {}
+#[cfg(target_family = "wasm")]
+impl<T> MaybeSend for T {}
+
+#[cfg(not(target_family = "wasm"))]
+pub type ConnectionFuture = dyn Future<Output = anyhow::Result<()>> + Send;
+#[cfg(target_family = "wasm")]
+pub type ConnectionFuture = dyn Future<Output = anyhow::Result<()>>;
 
 impl Peer {
     pub fn new(epoch: u32) -> Arc<Self> {
@@ -114,13 +125,13 @@ impl Peer {
         create_timer: F,
     ) -> (
         ConnectionId,
-        impl Future<Output = anyhow::Result<()>> + Send + use<F, Fut, Out>,
+        Pin<Box<ConnectionFuture>>,
         BoxStream<'static, Box<dyn AnyTypedEnvelope>>,
     )
     where
-        F: Send + Fn(Duration) -> Fut,
-        Fut: Send + Future<Output = Out>,
-        Out: Send,
+        F: MaybeSend + 'static + Fn(Duration) -> Fut,
+        Fut: MaybeSend + 'static + Future<Output = Out>,
+        Out: MaybeSend + 'static,
     {
         // For outgoing messages, use an unbounded channel so that application code
         // can always send messages without yielding. For incoming messages, use a
@@ -371,17 +382,17 @@ impl Peer {
                 }
             }
         });
-        (connection_id, handle_io, incoming_rx.boxed())
+        (connection_id, Box::pin(handle_io), incoming_rx.boxed())
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(all(any(test, feature = "test-support"), not(target_family = "wasm")))]
     pub fn add_test_connection(
         self: &Arc<Self>,
         connection: Connection,
         executor: gpui::BackgroundExecutor,
     ) -> (
         ConnectionId,
-        impl Future<Output = anyhow::Result<()>> + Send + use<>,
+        Pin<Box<ConnectionFuture>>,
         BoxStream<'static, Box<dyn AnyTypedEnvelope>>,
     ) {
         self.add_connection(connection, move |duration| executor.timer(duration))
@@ -734,8 +745,8 @@ impl Serialize for Peer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_tungstenite::tungstenite::Message as WebSocketMessage;
     use gpui::TestAppContext;
+    use tungstenite::Message as WebSocketMessage;
 
     fn init_logger() {
         zlog::init_test();

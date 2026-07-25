@@ -1170,25 +1170,29 @@ impl ExternalAgentServer for LocalRegistryArchiveAgent {
                 .join(sanitize_path_component(&registry_id));
             fs.create_dir(&dir).await?;
 
-            let os = if cfg!(target_os = "macos") {
-                "darwin"
-            } else if cfg!(target_os = "linux") {
-                "linux"
-            } else if cfg!(target_os = "windows") {
-                "windows"
+            let platform_key = if cfg!(target_family = "wasm") {
+                "wasm-host".to_string()
             } else {
-                anyhow::bail!("unsupported OS");
-            };
+                let os = if cfg!(target_os = "macos") {
+                    "darwin"
+                } else if cfg!(target_os = "linux") {
+                    "linux"
+                } else if cfg!(target_os = "windows") {
+                    "windows"
+                } else {
+                    anyhow::bail!("unsupported OS");
+                };
 
-            let arch = if cfg!(target_arch = "aarch64") {
-                "aarch64"
-            } else if cfg!(target_arch = "x86_64") {
-                "x86_64"
-            } else {
-                anyhow::bail!("unsupported architecture");
-            };
+                let arch = if cfg!(target_arch = "aarch64") {
+                    "aarch64"
+                } else if cfg!(target_arch = "x86_64") {
+                    "x86_64"
+                } else {
+                    anyhow::bail!("unsupported architecture");
+                };
 
-            let platform_key = format!("{}-{}", os, arch);
+                format!("{}-{}", os, arch)
+            };
             let target_config = targets.get(&platform_key).with_context(|| {
                 format!(
                     "no target specified for platform '{}'. Available platforms: {}",

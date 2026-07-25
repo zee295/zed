@@ -14,6 +14,8 @@ members = [
     "crates/anthropic",
     "crates/askpass",
     "crates/assets",
+    "crates/alacritty_terminal",
+    "crates/async_tar_wasm",
     "crates/audio",
     "crates/auto_update",
     "crates/auto_update_helper",
@@ -73,6 +75,7 @@ members = [
     "crates/extension_api",
     "crates/extension_cli",
     "crates/extension_host",
+    "crates/extension_runtime_cli",
     "crates/extensions_ui",
     "crates/feature_flags",
     "crates/feature_flags_macros",
@@ -131,6 +134,7 @@ members = [
     "crates/lmstudio",
     "crates/lsp",
     "crates/lsp_locations",
+    "crates/lsp_types_wasm",
     "crates/markdown",
     "crates/markdown_preview",
     "crates/mermaid_render",
@@ -192,6 +196,7 @@ members = [
     "crates/snippet",
     "crates/snippet_provider",
     "crates/snippets_ui",
+    "crates/smol_wasm",
     "crates/sqlez",
     "crates/sqlez_macros",
     "crates/streaming_diff",
@@ -208,6 +213,7 @@ members = [
     "crates/terminal_view",
     "crates/text",
     "crates/theme",
+    "crates/tree_sitter_wasm",
     "crates/theme_extension",
     "crates/theme_settings",
     "crates/theme_importer",
@@ -224,8 +230,11 @@ members = [
     "crates/vim",
     "crates/vim_mode_setting",
     "crates/watch",
+    "crates/wasm_rpc",
+    "crates/wasm_remote",
     "crates/web_search",
     "crates/web_search_providers",
+    "crates/which_wasm",
     "crates/which_key",
     "crates/workspace",
     "crates/worktree",
@@ -233,6 +242,9 @@ members = [
     "crates/x_ai",
     "crates/zed",
     "crates/zed_actions",
+    "crates/zed_web_poc",
+    "crates/zed_web_workspace",
+    "crates/zed_web_server",
     "crates/windows_resources",
     "crates/zed_credentials_provider",
     "crates/zed_env_vars",
@@ -516,7 +528,7 @@ accesskit_unix = "0.21.0"
 accesskit_windows = "0.33.1"
 agent-client-protocol = { version = "=1.1.0", features = ["unstable"] }
 aho-corasick = "1.1"
-alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "4c129667ce56611becdc82de6e28218c80e2e88f" }
+alacritty_terminal = { path = "crates/alacritty_terminal" }
 any_vec = "0.14"
 anyhow = "1.0.86"
 ashpd = { version = "0.13", default-features = false, features = [
@@ -653,7 +665,7 @@ indoc = "2"
 inventory = "0.3.19"
 itertools = "0.14.0"
 json_dotpath = "1.1"
-jsonschema = "0.37.0"
+jsonschema = { version = "0.37.0", default-features = false }
 jsonwebtoken = "10.0"
 jupyter-protocol = "1.4.0"
 jupyter-websocket-client = "1.1.0"
@@ -877,7 +889,10 @@ wasmtime = { version = "36", default-features = false, features = [
 wasmtime-wasi = "36"
 wax = "0.7"
 which = "6.0.0"
+wasm_rpc = { path = "crates/wasm_rpc" }
+wasm_remote = { path = "crates/wasm_remote" }
 wasm-bindgen = "0.2.120"
+wasm-bindgen-futures = "0.4.50"
 web-time = "1.1.0"
 webrtc-sys = "0.3.23"
 wgpu = "29.0.4"
@@ -949,10 +964,22 @@ features = [
     "Win32_Media",
 ]
 
+[patch."https://github.com/zed-industries/lsp-types"]
+lsp-types = { path = "crates/lsp_types_wasm" }
+
 [patch.crates-io]
+wasm_thread = { path = "crates/wasm_thread_patch" }
 async-process = { git = "https://github.com/zed-industries/async-process.git", rev = "0b6d6713570af61806e1e5cb40e0f757cb93fd9d" }
 async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }
 windows-capture = { git = "https://github.com/zed-industries/windows-capture.git", rev = "f0d6c1b6691db75461b732f6d5ff56eed002eeb9" }
+smol = { path = "crates/smol_wasm" }
+which = { path = "crates/which_wasm" }
+lsp-types = { path = "crates/lsp_types_wasm" }
+url = { path = "crates/url_wasm" }
+tree-sitter = { path = "crates/tree_sitter_wasm" }
+async-tar = { path = "crates/async_tar_wasm" }
+# Browser wasm: no async-process / polling; external agents run on the host.
+agent-client-protocol = { path = "crates/agent_client_protocol_patch" }
 calloop = { git = "https://github.com/zed-industries/calloop" }
 livekit = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev = "d0e27be0cdad89eadab3e36207cda0a2b6e359ee" }
 libwebrtc = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev = "d0e27be0cdad89eadab3e36207cda0a2b6e359ee" }
@@ -1043,6 +1070,14 @@ zed_actions = { codegen-units = 1 }
 [profile.release]
 debug = "limited"
 lto = "thin"
+codegen-units = 1
+
+[profile.web-release]
+inherits = "release"
+debug = false
+strip = "symbols"
+opt-level = "z"
+lto = "fat"
 codegen-units = 1
 
 [profile.release.package]

@@ -890,10 +890,23 @@ impl SystemNodeRuntime {
         })
     }
 
+    #[cfg(not(target_family = "wasm"))]
     async fn detect() -> std::result::Result<Self, DetectError> {
         let node = which::which("node").map_err(DetectError::NotInPath)?;
         let npm = which::which("npm").map_err(DetectError::NotInPath)?;
         Self::new(node, npm).await.map_err(DetectError::Other)
+    }
+
+    /// On wasm there is no local PATH, but node/npm commands run on the host via
+    /// the remote process bridge (smol_wasm). The server resolves the bare
+    /// `node`/`npm` program names against the HOST's PATH (which includes nvm /
+    /// homebrew locations), so detect by running `node --version` through the
+    /// bridge rather than probing absolute paths.
+    #[cfg(target_family = "wasm")]
+    async fn detect() -> std::result::Result<Self, DetectError> {
+        Self::new(PathBuf::from("node"), PathBuf::from("npm"))
+            .await
+            .map_err(DetectError::Other)
     }
 }
 
@@ -1109,10 +1122,17 @@ fn build_npm_command_args(
 
 fn npm_command_env(node_binary: Option<&Path>) -> HashMap<String, String> {
     let mut command_env = HashMap::new();
+    // On wasm there is no local PATH env, and `node_binary` is the bare "node"
+    // (resolved on the host). Prepending it would REPLACE the PATH with an
+    // empty string, hiding npm from the host shell. Skip the override so the
+    // server's own environment (which has node/npm on PATH) applies.
+    #[cfg(not(target_family = "wasm"))]
     if let Some(node_binary) = node_binary {
         let env_path = path_with_node_binary_prepended(node_binary).unwrap_or_default();
         command_env.insert("PATH".into(), env_path.to_string_lossy().into_owned());
     }
+    #[cfg(target_family = "wasm")]
+    let _ = node_binary;
 
     if let Ok(node_ca_certs) = env::var(NODE_CA_CERTS_ENV_VAR) {
         if !node_ca_certs.is_empty() {

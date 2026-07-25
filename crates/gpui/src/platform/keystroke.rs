@@ -141,7 +141,7 @@ impl Keystroke {
                 continue;
             }
             if component.eq_ignore_ascii_case("secondary") {
-                if cfg!(target_os = "macos") {
+                if crate::operating_system() == crate::OperatingSystem::Mac {
                     modifiers.platform = true;
                 } else {
                     modifiers.control = true;
@@ -481,13 +481,9 @@ impl Modifiers {
     /// On macOS, this is the command key.
     /// On Linux and Windows, this is the control key.
     pub fn secondary(&self) -> bool {
-        #[cfg(target_os = "macos")]
-        {
+        if crate::operating_system() == crate::OperatingSystem::Mac {
             self.platform
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        {
+        } else {
             self.control
         }
     }
@@ -516,16 +512,12 @@ impl Modifiers {
 
     /// A Returns [`Modifiers`] with just the secondary key pressed.
     pub fn secondary_key() -> Modifiers {
-        #[cfg(target_os = "macos")]
-        {
+        if crate::operating_system() == crate::OperatingSystem::Mac {
             Modifiers {
                 platform: true,
                 ..Default::default()
             }
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        {
+        } else {
             Modifiers {
                 control: true,
                 ..Default::default()
@@ -681,65 +673,60 @@ impl AsKeystroke for KeybindingKeystroke {
 }
 
 fn display_modifiers(modifiers: &Modifiers, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    let operating_system = crate::operating_system();
+    let is_mac = operating_system == crate::OperatingSystem::Mac;
     if modifiers.control {
-        #[cfg(target_os = "macos")]
-        f.write_char('^')?;
-
-        #[cfg(not(target_os = "macos"))]
-        write!(f, "ctrl-")?;
+        if is_mac {
+            f.write_char('^')?;
+        } else {
+            write!(f, "ctrl-")?;
+        }
     }
     if modifiers.alt {
-        #[cfg(target_os = "macos")]
-        f.write_char('⌥')?;
-
-        #[cfg(not(target_os = "macos"))]
-        write!(f, "alt-")?;
+        if is_mac {
+            f.write_char('⌥')?;
+        } else {
+            write!(f, "alt-")?;
+        }
     }
     if modifiers.platform {
-        #[cfg(target_os = "macos")]
-        f.write_char('⌘')?;
-
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        f.write_char('❖')?;
-
-        #[cfg(target_os = "windows")]
-        f.write_char('⊞')?;
+        match operating_system {
+            crate::OperatingSystem::Mac => f.write_char('⌘')?,
+            crate::OperatingSystem::Windows => f.write_char('⊞')?,
+            crate::OperatingSystem::Linux | crate::OperatingSystem::Unknown => f.write_char('❖')?,
+        }
     }
     if modifiers.shift {
-        #[cfg(target_os = "macos")]
-        f.write_char('⇧')?;
-
-        #[cfg(not(target_os = "macos"))]
-        write!(f, "shift-")?;
+        if is_mac {
+            f.write_char('⇧')?;
+        } else {
+            write!(f, "shift-")?;
+        }
     }
     Ok(())
 }
 
 fn display_key(key: &str, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    let mac_key = match key {
+        "backspace" => Some('⌫'),
+        "up" => Some('↑'),
+        "down" => Some('↓'),
+        "left" => Some('←'),
+        "right" => Some('→'),
+        "tab" => Some('⇥'),
+        "escape" => Some('⎋'),
+        "shift" => Some('⇧'),
+        "control" => Some('⌃'),
+        "alt" => Some('⌥'),
+        "platform" => Some('⌘'),
+        _ => None,
+    };
+    if crate::operating_system() == crate::OperatingSystem::Mac {
+        if let Some(key) = mac_key {
+            return f.write_char(key);
+        }
+    }
     let key = match key {
-        #[cfg(target_os = "macos")]
-        "backspace" => '⌫',
-        #[cfg(target_os = "macos")]
-        "up" => '↑',
-        #[cfg(target_os = "macos")]
-        "down" => '↓',
-        #[cfg(target_os = "macos")]
-        "left" => '←',
-        #[cfg(target_os = "macos")]
-        "right" => '→',
-        #[cfg(target_os = "macos")]
-        "tab" => '⇥',
-        #[cfg(target_os = "macos")]
-        "escape" => '⎋',
-        #[cfg(target_os = "macos")]
-        "shift" => '⇧',
-        #[cfg(target_os = "macos")]
-        "control" => '⌃',
-        #[cfg(target_os = "macos")]
-        "alt" => '⌥',
-        #[cfg(target_os = "macos")]
-        "platform" => '⌘',
-
         key if key.len() == 1 => key.chars().next().unwrap().to_ascii_uppercase(),
         key => return f.write_str(key),
     };
@@ -759,14 +746,13 @@ fn unparse(modifiers: &Modifiers, key: &str) -> String {
         result.push_str("alt-");
     }
     if modifiers.platform {
-        #[cfg(target_os = "macos")]
-        result.push_str("cmd-");
-
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        result.push_str("super-");
-
-        #[cfg(target_os = "windows")]
-        result.push_str("win-");
+        match crate::operating_system() {
+            crate::OperatingSystem::Mac => result.push_str("cmd-"),
+            crate::OperatingSystem::Windows => result.push_str("win-"),
+            crate::OperatingSystem::Linux | crate::OperatingSystem::Unknown => {
+                result.push_str("super-")
+            }
+        }
     }
     if modifiers.shift {
         result.push_str("shift-");

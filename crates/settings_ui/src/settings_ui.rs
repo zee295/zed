@@ -9,10 +9,11 @@ use editor::{Editor, EditorEvent};
 use futures::{StreamExt, channel::mpsc};
 use fuzzy::StringMatchCandidate;
 use gpui::{
-    Action, App, AsyncApp, ClipboardItem, DEFAULT_ADDITIONAL_WINDOW_SIZE, Div, Entity, FocusHandle,
-    Focusable, Global, KeyContext, ListState, ReadGlobal as _, Role, ScrollHandle, Stateful,
-    Subscription, Task, TitlebarOptions, UniformListScrollHandle, WeakEntity, Window, WindowBounds,
-    WindowHandle, WindowOptions, actions, div, list, point, prelude::*, px, uniform_list,
+    Action, App, AsyncApp, ClipboardItem, DEFAULT_ADDITIONAL_WINDOW_SIZE, DismissEvent, Div,
+    Entity, EventEmitter, FocusHandle, Focusable, Global, KeyContext, ListState, ReadGlobal as _,
+    Role, ScrollHandle, Stateful, Subscription, Task, TitlebarOptions, UniformListScrollHandle,
+    WeakEntity, Window, WindowBounds, WindowHandle, WindowOptions, actions, div, list, point,
+    prelude::*, px, uniform_list,
 };
 
 use language::Buffer;
@@ -433,6 +434,10 @@ pub fn init(cx: &mut App) {
     let queue = ProjectSettingsUpdateQueue::new(cx);
     cx.set_global(queue);
 
+    // The global OpenSettings handler opens a separate OS settings window. On
+    // wasm there is only one canvas, so the web shell registers its own popup
+    // handler instead; skip this global one there.
+    #[cfg(not(target_family = "wasm"))]
     cx.on_action(|_: &OpenSettings, cx| {
         open_settings_editor(None, None, None, cx);
     });
@@ -444,6 +449,10 @@ pub fn init(cx: &mut App) {
         open_skill_creator(pages::SkillCreatorOpenMode::Url { initial_url }, None, cx);
     });
 
+    // These workspace actions all open a separate OS settings window. On wasm
+    // the web shell registers its own in-window popup handlers for the same
+    // actions, so skip the OS-window versions there.
+    #[cfg(not(target_family = "wasm"))]
     cx.observe_new(|workspace: &mut workspace::Workspace, _, _| {
         workspace
             .register_action(|_, action: &OpenSettingsAt, window, cx| {
@@ -1749,7 +1758,48 @@ impl SettingsUiFile {
     }
 }
 
+impl Focusable for SettingsWindow {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<DismissEvent> for SettingsWindow {}
+
 impl SettingsWindow {
+    /// Public constructor for hosts (e.g. the web workspace) that present the
+    /// settings GUI inside an existing window (modal / pane) instead of a
+    /// separate OS window.
+    pub fn new_modal(
+        original_window: Option<WindowHandle<MultiWorkspace>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new(original_window, window, cx)
+    }
+
+    pub fn open_page(&mut self, page: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.opening_link = false;
+        self.search_bar.update(cx, |editor, cx| {
+            editor.set_text(String::new(), window, cx);
+        });
+        for page_filter in &mut self.filter_table {
+            page_filter.fill(true);
+        }
+        self.has_query = false;
+        self.filter_matches_to_file();
+
+        let Some(navbar_entry_index) = self
+            .navbar_entries
+            .iter()
+            .position(|entry| entry.is_root && entry.title.eq_ignore_ascii_case(page))
+        else {
+            log::error!("settings page not found: {page}");
+            return;
+        };
+        self.open_and_scroll_to_navbar_entry(navbar_entry_index, None, false, window, cx);
+    }
+
     fn new(
         original_window: Option<WindowHandle<MultiWorkspace>>,
         window: &mut Window,

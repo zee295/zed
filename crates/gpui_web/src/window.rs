@@ -55,7 +55,6 @@ pub(crate) struct WebWindowInner {
     pub(crate) last_physical_size: Cell<(u32, u32)>,
     pub(crate) notify_scale: Cell<bool>,
     pub(crate) is_composing: Cell<bool>,
-    pub(crate) app_claimed_right_click: Cell<bool>,
     mql_handle: RefCell<Option<MqlHandle>>,
     pending_physical_size: Cell<Option<(u32, u32)>>,
 }
@@ -183,7 +182,6 @@ impl WebWindow {
             last_physical_size: Cell::new((0, 0)),
             notify_scale: Cell::new(false),
             is_composing: Cell::new(false),
-            app_claimed_right_click: Cell::new(false),
             mql_handle: RefCell::new(None),
             pending_physical_size: Cell::new(None),
         });
@@ -225,26 +223,17 @@ impl WebWindow {
             let dpr = inner.browser_window.device_pixel_ratio();
             let dpr_f32 = dpr as f32;
 
-            let (physical_width, physical_height, logical_width, logical_height) =
-                if inner.has_device_pixel_support {
-                    let size: web_sys::ResizeObserverSize = entry
-                        .device_pixel_content_box_size()
-                        .get(0)
-                        .unchecked_into();
-                    let pw = size.inline_size() as u32;
-                    let ph = size.block_size() as u32;
-                    let lw = pw as f64 / dpr;
-                    let lh = ph as f64 / dpr;
-                    (pw, ph, lw as f32, lh as f32)
-                } else {
-                    // Safari fallback: use contentRect (always CSS px).
-                    let rect = entry.content_rect();
-                    let lw = rect.width() as f32;
-                    let lh = rect.height() as f32;
-                    let pw = (lw as f64 * dpr).round() as u32;
-                    let ph = (lh as f64 * dpr).round() as u32;
-                    (pw, ph, lw, lh)
-                };
+            // Logical (CSS) size always comes from contentRect — it's the box the
+            // canvas actually occupies in the page. Physical (backing-store) size
+            // is logical * devicePixelRatio. We deliberately do NOT use
+            // device_pixel_content_box_size: some browsers report a canvas backing
+            // store that is 2x the CSS box even when devicePixelRatio == 1 (page
+            // zoom / GPU scaling), which made the UI render at half size.
+            let rect = entry.content_rect();
+            let logical_width = rect.width() as f32;
+            let logical_height = rect.height() as f32;
+            let physical_width = (logical_width as f64 * dpr).round() as u32;
+            let physical_height = (logical_height as f64 * dpr).round() as u32;
 
             let scale_changed = inner.notify_scale.replace(false);
             let prev = inner.last_physical_size.get();
@@ -264,10 +253,13 @@ impl WebWindow {
                 s.scale_factor = dpr_f32;
                 // Still fire the callback so GPUI knows the window is gone.
                 drop(s);
-                let mut cbs = inner.callbacks.borrow_mut();
-                if let Some(ref mut callback) = cbs.resize {
-                    callback(Size::default(), dpr_f32);
+                // Take the callback out so nested platform code cannot re-borrow
+                // `callbacks` while the resize handler runs (common mid-draw).
+                let mut callback = inner.callbacks.borrow_mut().resize.take();
+                if let Some(ref mut cb) = callback {
+                    cb(Size::default(), dpr_f32);
                 }
+                inner.callbacks.borrow_mut().resize = callback;
                 return;
             }
 
@@ -293,10 +285,11 @@ impl WebWindow {
                 height: px(logical_height),
             };
 
-            let mut cbs = inner.callbacks.borrow_mut();
-            if let Some(ref mut callback) = cbs.resize {
-                callback(new_size, dpr_f32);
+            let mut callback = inner.callbacks.borrow_mut().resize.take();
+            if let Some(ref mut cb) = callback {
+                cb(new_size, dpr_f32);
             }
+            inner.callbacks.borrow_mut().resize = callback;
         })
     }
 }
@@ -308,15 +301,17 @@ impl WebWindowInner {
 
         let this = Rc::clone(self);
         let closure = Closure::new(move || {
-            {
-                let mut callbacks = this.callbacks.borrow_mut();
-                if let Some(ref mut callback) = callbacks.request_frame {
-                    callback(RequestFrameOptions {
-                        require_presentation: true,
-                        force_render: false,
-                    });
-                }
+            // Take callback out of the RefCell before invoking: request_frame
+            // runs a full GPUI draw, which can re-enter platform code that
+            // touches `callbacks` (resize, input, etc.).
+            let mut callback = this.callbacks.borrow_mut().request_frame.take();
+            if let Some(ref mut cb) = callback {
+                cb(RequestFrameOptions {
+                    require_presentation: true,
+                    force_render: false,
+                });
             }
+            this.callbacks.borrow_mut().request_frame = callback;
 
             // Re-schedule for the next frame
             if let Some(ref func) = *raf_handle_inner.borrow() {
@@ -397,10 +392,11 @@ impl WebWindowInner {
                 let mut state = this.state.borrow_mut();
                 state.is_active = is_visible;
             }
-            let mut callbacks = this.callbacks.borrow_mut();
-            if let Some(ref mut callback) = callbacks.active_status_change {
-                callback(is_visible);
+            let mut callback = this.callbacks.borrow_mut().active_status_change.take();
+            if let Some(ref mut cb) = callback {
+                cb(is_visible);
             }
+            this.callbacks.borrow_mut().active_status_change = callback;
         });
 
         document
@@ -430,10 +426,11 @@ impl WebWindowInner {
 
         let this = Rc::clone(self);
         let closure = Closure::<dyn FnMut(JsValue)>::new(move |_event: JsValue| {
-            let mut callbacks = this.callbacks.borrow_mut();
-            if let Some(ref mut callback) = callbacks.appearance_changed {
-                callback();
+            let mut callback = this.callbacks.borrow_mut().appearance_changed.take();
+            if let Some(ref mut cb) = callback {
+                cb();
             }
+            this.callbacks.borrow_mut().appearance_changed = callback;
         });
 
         mql.add_event_listener_with_callback("change", closure.as_ref().unchecked_ref())

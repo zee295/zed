@@ -53,7 +53,7 @@ use std::{
     cmp::Ordering,
     path::{self, Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use task::TaskTemplates;
 use url::Url;
@@ -62,6 +62,7 @@ use wasm_host::{
     WasmExtension, WasmHost,
     wit::{is_supported_wasm_api_version, wasm_api_version_range},
 };
+use web_time::Instant;
 
 pub use extension::{
     ExtensionLibraryKind, GrammarManifestEntry, OldExtensionManifest, SchemaVersion,

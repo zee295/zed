@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
+use crate::store::ExtensionStore;
 use db::kvp::KeyValueStore;
 use editor::Editor;
-use extension_host::ExtensionStore;
 use gpui::{AppContext as _, Context, Entity, SharedString, Window};
 use language::Buffer;
 use ui::prelude::*;

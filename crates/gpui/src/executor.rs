@@ -431,6 +431,29 @@ impl<'a> Scope<'a> {
     }
 }
 
+#[cfg(target_family = "wasm")]
+fn block_on_ready<T>(mut future: impl std::future::Future<Output = T>) -> T {
+    use std::future::Future;
+    use std::pin::pin;
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    fn noop_waker() -> Waker {
+        const VTABLE: RawWakerVTable =
+            RawWakerVTable::new(|p| RawWaker::new(p, &VTABLE), |_| {}, |_| {}, |_| {});
+        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    }
+
+    let mut future = pin!(future);
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => return v,
+            Poll::Pending => {}
+        }
+    }
+}
+
 impl Drop for Scope<'_> {
     fn drop(&mut self) {
         self.tx.take().unwrap();
@@ -441,10 +464,15 @@ impl Drop for Scope<'_> {
             self.rx.next().await;
         };
         let mut future = std::pin::pin!(future);
+
+        #[cfg(not(target_family = "wasm"))]
         self.executor
             .inner
             .scheduler()
             .block(None, future.as_mut(), None);
+
+        #[cfg(target_family = "wasm")]
+        block_on_ready(future);
     }
 }
 

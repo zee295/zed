@@ -36,6 +36,11 @@ pub async fn capture(
     return capture_windows(shell_path.as_ref(), args, directory.as_ref()).await;
     #[cfg(unix)]
     return capture_unix(shell_path.as_ref(), args, directory.as_ref()).await;
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = (shell_path, args, directory);
+        Ok(collections::HashMap::default())
+    }
 }
 
 /// Try to parse the environment output before checking the exit status.

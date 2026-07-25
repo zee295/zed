@@ -7,7 +7,6 @@ use parking_lot::Mutex;
 use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
 use semver::Version as SemanticVersion;
 use std::collections::BTreeMap;
-use std::time::Instant;
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -19,6 +18,7 @@ use util::{
     paths::{PathStyle, RemotePathBuf},
     rel_path::RelPath,
 };
+use web_time::Instant;
 
 use futures::channel::mpsc::{Sender, UnboundedReceiver, UnboundedSender};
 use gpui::{App, AppContext, AsyncApp, Task};

@@ -37,6 +37,8 @@ use lsp::LanguageServerId;
 use parking_lot::Mutex;
 use settings::WorktreeId;
 use smallvec::SmallVec;
+#[cfg(not(target_family = "wasm"))]
+use std::time::Instant;
 use std::{
     any::Any,
     borrow::Cow,
@@ -52,7 +54,7 @@ use std::{
     path::PathBuf,
     rc,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
     vec,
 };
 use sum_tree::TreeMap;
@@ -68,6 +70,8 @@ use theme::{ActiveTheme as _, SyntaxTheme};
 #[cfg(any(test, feature = "test-support"))]
 use util::RandomCharIter;
 use util::{RangeExt, debug_panic, maybe, paths::PathStyle, rel_path::RelPath};
+#[cfg(target_family = "wasm")]
+use web_time::Instant;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use {tree_sitter_python, tree_sitter_rust, tree_sitter_typescript};

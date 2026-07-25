@@ -112,6 +112,10 @@ enum AvailableGrammar {
         Vec<oneshot::Sender<Result<tree_sitter::Language, Arc<anyhow::Error>>>>,
     ),
     Unloaded(PathBuf),
+    UnloadedBytes {
+        name: Arc<str>,
+        bytes: Arc<[u8]>,
+    },
     LoadFailed(Arc<anyhow::Error>),
 }
 
@@ -464,6 +468,27 @@ impl LanguageRegistry {
                 .into_iter()
                 .map(|(name, path)| (name, AvailableGrammar::Unloaded(path))),
         );
+        state.version += 1;
+        state.reload_count += 1;
+        *state.subscription.0.borrow_mut() = ();
+    }
+
+    /// Adds in-memory WASM grammars, used by remote extension hosts where the
+    /// grammar file is owned by the server rather than the local filesystem.
+    pub fn register_wasm_grammar_bytes(&self, grammars: Vec<(Arc<str>, Arc<[u8]>)>) {
+        if grammars.is_empty() {
+            return;
+        }
+
+        let mut state = self.state.write();
+        state
+            .grammars
+            .extend(grammars.into_iter().map(|(name, bytes)| {
+                (
+                    name.clone(),
+                    AvailableGrammar::UnloadedBytes { name, bytes },
+                )
+            }));
         state.version += 1;
         state.reload_count += 1;
         *state.subscription.0.borrow_mut() = ();
@@ -1017,6 +1042,43 @@ impl LanguageRegistry {
                             };
 
                             log::trace!("finish loading grammar {name:?}");
+                            let old_value = this.state.write().grammars.insert(name, value);
+                            if let Some(AvailableGrammar::Loading(_, txs)) = old_value {
+                                for tx in txs {
+                                    tx.send(grammar_result.clone()).ok();
+                                }
+                            }
+                        })
+                        .detach();
+                }
+                AvailableGrammar::UnloadedBytes {
+                    name: grammar_name,
+                    bytes,
+                } => {
+                    log::trace!("start loading in-memory grammar {name:?}");
+                    let this = self.clone();
+                    let grammar_name = grammar_name.clone();
+                    let bytes = bytes.clone();
+                    let synthetic_path = PathBuf::from(format!("{grammar_name}.wasm"));
+                    *grammar = AvailableGrammar::Loading(synthetic_path.clone(), vec![tx]);
+                    self.executor
+                        .spawn(async move {
+                            let grammar_result = with_parser(|parser| {
+                                let mut store = parser.take_wasm_store().unwrap();
+                                let grammar =
+                                    store.load_language(grammar_name.as_ref(), bytes.as_ref());
+                                parser.set_wasm_store(store).unwrap();
+                                grammar
+                            })
+                            .map_err(|error| Arc::new(anyhow!(error)));
+
+                            let value = match &grammar_result {
+                                Ok(grammar) => {
+                                    AvailableGrammar::Loaded(synthetic_path, grammar.clone())
+                                }
+                                Err(error) => AvailableGrammar::LoadFailed(error.clone()),
+                            };
+                            log::trace!("finish loading in-memory grammar {name:?}");
                             let old_value = this.state.write().grammars.insert(name, value);
                             if let Some(AvailableGrammar::Loading(_, txs)) = old_value {
                                 for tx in txs {

@@ -66,7 +66,10 @@ use project::{
     },
     project_settings::{GitPathStyle, ProjectSettings},
 };
+#[cfg(not(target_family = "wasm"))]
 use prompt_store::RULES_FILE_NAMES;
+#[cfg(target_family = "wasm")]
+const RULES_FILE_NAMES: &[&str] = &[".git-commit"];
 use proto::RpcError;
 use serde::{Deserialize, Serialize};
 use settings::{
@@ -3231,7 +3234,11 @@ impl GitPanel {
                 }
 
                 let worktree_snapshot = worktree.read(cx).snapshot();
-                for rules_name in RULES_FILE_NAMES {
+                #[cfg(target_family = "wasm")]
+                let rules_names = RULES_FILE_NAMES;
+                #[cfg(not(target_family = "wasm"))]
+                let rules_names = RULES_FILE_NAMES;
+                for rules_name in rules_names {
                     if let Ok(rel_path) = RelPath::from_unix_str(rules_name) {
                         if let Some(entry) = worktree_snapshot.entry_for_path(rel_path) {
                             if entry.is_file() {
@@ -5009,9 +5016,12 @@ impl GitPanel {
                 // Any failure inside `gather` is logged and produces an empty
                 // section; this `.await` itself cannot meaningfully fail and
                 // must never prevent us from showing the queue dump.
+                #[cfg(not(target_family = "wasm"))]
                 let diagnostics = cx
                     .background_spawn(crate::git_runtime_diagnostics::gather())
                     .await;
+                #[cfg(target_family = "wasm")]
+                let diagnostics = serde_json::Value::Object(Default::default());
 
                 let mut combined = queue_value;
                 if let serde_json::Value::Object(ref mut map) = combined
@@ -6417,9 +6427,8 @@ impl GitPanel {
                         let repo_weak = repo_weak;
                         let git_panel = cx.weak_entity();
                         move |range, window, cx| {
-                            let local_offset = time::UtcOffset::current_local_offset()
-                                .unwrap_or(time::UtcOffset::UTC);
-                            let now = time::OffsetDateTime::now_utc();
+                            let local_offset = crate::local_utc_offset();
+                            let now = crate::now_utc();
 
                             let visible_data: Vec<Option<Arc<CommitData>>> = repo_weak
                                 .update(cx, |repository, cx| {
@@ -8664,7 +8673,10 @@ pub(crate) fn open_output(
 ) {
     let operation = operation.into();
 
+    #[cfg(not(target_family = "wasm"))]
     let plain_text = terminal::strip_ansi_text(output.as_bytes());
+    #[cfg(target_family = "wasm")]
+    let plain_text = String::from_utf8_lossy(output.as_bytes()).to_string();
 
     let buffer = cx.new(|cx| Buffer::local(plain_text.as_str(), cx));
     buffer.update(cx, |buffer, cx| {

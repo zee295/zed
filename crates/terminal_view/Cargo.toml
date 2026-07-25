@@ -47,6 +47,8 @@ ui.workspace = true
 util.workspace = true
 workspace.workspace = true
 zed_actions.workspace = true
+# Instant that works on wasm (std::time::Instant panics)
+web-time.workspace = true
 
 [dev-dependencies]
 editor = { workspace = true, features = ["test-support"] }

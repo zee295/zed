@@ -11,7 +11,7 @@ use gpui::{
 use itertools::Itertools;
 use language::CursorShape as EditorCursorShape;
 use settings::Settings;
-use std::time::Instant;
+// wasm: std::time::Instant panics ("time not implemented on this platform")
 use terminal::{
     Cell, Color, Content, CursorShape, IndexedCell, Modes, NamedColor, Point, Range, Terminal,
     TerminalBounds, is_app_chosen_exact_color as terminal_is_app_chosen_exact_color,
@@ -22,6 +22,7 @@ use theme_settings::ThemeSettings;
 use ui::utils::ensure_minimum_contrast;
 use ui::{ParentElement, Tooltip};
 use util::ResultExt;
+use web_time::Instant;
 use workspace::Workspace;
 
 use std::mem;

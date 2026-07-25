@@ -1,5 +1,8 @@
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_family = "wasm")))]
 pub use smol::net::unix::{UnixListener, UnixStream};
+
+#[cfg(target_family = "wasm")]
+pub use crate::wasm::{UnixListener, UnixStream};
 
 #[cfg(target_os = "windows")]
 pub use windows::{UnixListener, UnixStream};

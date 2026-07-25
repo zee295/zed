@@ -21,6 +21,24 @@ use std::{
 use task::Shell;
 use util::get_default_system_shell_preferring_bash;
 
+/// Convert process exit status into ACP terminal exit status.
+/// Avoids portable-pty (not available on browser wasm).
+fn terminal_exit_status_from_process(exit_status: Option<ExitStatus>) -> acp::TerminalExitStatus {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let exit_status = exit_status.map(portable_pty::ExitStatus::from);
+        return acp::TerminalExitStatus::new()
+            .exit_code(exit_status.as_ref().map(|e| e.exit_code()))
+            .signal(exit_status.and_then(|e| e.signal().map(ToOwned::to_owned)));
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        // std::process::ExitStatus on wasm has limited signal support.
+        acp::TerminalExitStatus::new()
+            .exit_code(exit_status.and_then(|e| e.code().map(|c| c as u32)))
+    }
+}
+
 /// Request to run a terminal command inside an OS-level sandbox.
 ///
 /// Passed to [`super::AcpThread::create_terminal`]. The actual sandboxing
@@ -95,6 +113,7 @@ pub enum LinuxWslSandboxError {
     Other(String),
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl From<sandbox::SandboxError> for LinuxWslSandboxError {
     fn from(error: sandbox::SandboxError) -> Self {
         match error {
@@ -167,7 +186,16 @@ impl SandboxWrap {
     /// Linux, so call it off the main thread. On platforms whose sandbox can't
     /// fail to set up this way it always returns `Ok`.
     pub fn can_create_sandbox(&self) -> Result<(), LinuxWslSandboxError> {
-        sandbox::Sandbox::can_create(&self.to_policy()).map_err(LinuxWslSandboxError::from)
+        #[cfg(target_family = "wasm")]
+        {
+            // Browser: OS sandbox lives on the host; local probe is a no-op.
+            let _ = self;
+            return Ok(());
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            sandbox::Sandbox::can_create(&self.to_policy()).map_err(LinuxWslSandboxError::from)
+        }
     }
 
     /// Translate this request into the cross-platform [`sandbox::SandboxPolicy`].
@@ -185,6 +213,7 @@ impl SandboxWrap {
     /// get a grant to a new directory is the `create_directory` tool, which
     /// creates it (pinning the inode) before the grant is recorded. On macOS a
     /// missing leaf still canonicalizes, so such grants are captured directly.
+    #[cfg(not(target_family = "wasm"))]
     fn to_policy(&self) -> sandbox::SandboxPolicy {
         let protected_paths = self
             .protected_paths
@@ -248,7 +277,19 @@ pub enum SandboxNotAppliedReason {
 
 /// The live sandbox kept alive for its per-command resources (the network proxy
 /// and, on macOS, the Seatbelt policy file) until the terminal exits.
+#[cfg(not(target_family = "wasm"))]
 type SandboxConfigHandle = sandbox::Sandbox;
+#[cfg(target_family = "wasm")]
+type SandboxConfigHandle = WasmSandboxStub;
+
+/// Placeholder when OS sandboxing is unavailable (browser wasm).
+#[cfg(target_family = "wasm")]
+pub(crate) struct WasmSandboxStub;
+
+#[cfg(target_family = "wasm")]
+impl WasmSandboxStub {
+    pub(crate) fn drop_on_current_thread(self) {}
+}
 
 /// Upper bound on preparing a WSL-sandboxed command. Deliberately generous:
 /// the first invocation after the WSL utility VM has shut down (or after boot)
@@ -277,31 +318,39 @@ pub(crate) async fn prepare_sandbox_wrap(
     HashMap<String, String>,
     Option<SandboxConfigHandle>,
 )> {
-    let Some(sandbox_wrap) = sandbox_wrap else {
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = (cwd, sandbox_wrap);
         return Ok((program, args, env, None));
-    };
-
-    let mut sandbox =
-        sandbox::Sandbox::new(sandbox_wrap.to_policy()).map_err(anyhow::Error::new)?;
-    // Windows/WSL only: tell the sandbox which Linux `zed` to provision inside
-    // WSL as its `--wsl-sandbox-helper`. A no-op (and a no-op setter) elsewhere.
-    #[cfg(target_os = "windows")]
-    if let Some((channel, version)) = sandbox_wrap.wsl_zed_release.clone() {
-        sandbox.set_wsl_zed_release(channel, version);
     }
-    let command = sandbox::CommandAndArgs {
-        program,
-        args,
-        env: env.into_iter().collect::<StdHashMap<_, _>>(),
-        cwd,
-    };
-    let wrapped = sandbox.wrap(&command).await.map_err(anyhow::Error::new)?;
-    Ok((
-        wrapped.program,
-        wrapped.args,
-        wrapped.env.into_iter().collect(),
-        Some(sandbox),
-    ))
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let Some(sandbox_wrap) = sandbox_wrap else {
+            return Ok((program, args, env, None));
+        };
+
+        let mut sandbox =
+            sandbox::Sandbox::new(sandbox_wrap.to_policy()).map_err(anyhow::Error::new)?;
+        // Windows/WSL only: tell the sandbox which Linux `zed` to provision inside
+        // WSL as its `--wsl-sandbox-helper`. A no-op (and a no-op setter) elsewhere.
+        #[cfg(target_os = "windows")]
+        if let Some((channel, version)) = sandbox_wrap.wsl_zed_release.clone() {
+            sandbox.set_wsl_zed_release(channel, version);
+        }
+        let command = sandbox::CommandAndArgs {
+            program,
+            args,
+            env: env.into_iter().collect::<StdHashMap<_, _>>(),
+            cwd,
+        };
+        let wrapped = sandbox.wrap(&command).await.map_err(anyhow::Error::new)?;
+        Ok((
+            wrapped.program,
+            wrapped.args,
+            wrapped.env.into_iter().collect(),
+            Some(sandbox),
+        ))
+    }
 }
 
 pub struct Terminal {
@@ -403,11 +452,7 @@ impl Terminal {
                     })
                     .ok();
 
-                    let exit_status = exit_status.map(portable_pty::ExitStatus::from);
-
-                    acp::TerminalExitStatus::new()
-                        .exit_code(exit_status.as_ref().map(|e| e.exit_code()))
-                        .signal(exit_status.and_then(|e| e.signal().map(ToOwned::to_owned)))
+                    terminal_exit_status_from_process(exit_status)
                 })
                 .shared(),
         }
@@ -441,17 +486,11 @@ impl Terminal {
 
     pub fn current_output(&self, cx: &App) -> acp::TerminalOutputResponse {
         if let Some(output) = self.output.as_ref() {
-            let exit_status = output.exit_status.map(portable_pty::ExitStatus::from);
-
             acp::TerminalOutputResponse::new(
                 output.content.clone(),
                 output.original_content_len > output.content.len(),
             )
-            .exit_status(
-                acp::TerminalExitStatus::new()
-                    .exit_code(exit_status.as_ref().map(|e| e.exit_code()))
-                    .signal(exit_status.and_then(|e| e.signal().map(ToOwned::to_owned))),
-            )
+            .exit_status(terminal_exit_status_from_process(output.exit_status))
         } else {
             let (current_content, original_len) = self.truncated_output(cx);
             let truncated = current_content.len() < original_len;

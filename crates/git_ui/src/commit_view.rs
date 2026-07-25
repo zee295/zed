@@ -557,11 +557,11 @@ impl CommitView {
         let author_email = commit.author_email.clone();
         let commit_sha = commit.sha.clone();
         let commit_date = time::OffsetDateTime::from_unix_timestamp(commit.commit_timestamp)
-            .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
-        let local_offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+            .unwrap_or_else(|_| crate::now_utc());
+        let local_offset = crate::local_utc_offset();
         let date_string = time_format::format_localized_timestamp(
             commit_date,
-            time::OffsetDateTime::now_utc(),
+            crate::now_utc(),
             local_offset,
             time_format::TimestampFormat::MediumAbsolute,
         );

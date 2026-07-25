@@ -48,6 +48,7 @@ pub mod git_graph;
 pub mod git_panel;
 mod git_panel_settings;
 pub mod git_picker;
+#[cfg(not(target_family = "wasm"))]
 mod git_runtime_diagnostics;
 pub mod multi_diff_view;
 pub mod picker_prompt;
@@ -65,6 +66,31 @@ pub mod worktree_service;
 
 pub use blame_ui::GitBlameStatus;
 pub use conflict_view::MergeConflictIndicator;
+
+pub(crate) fn now_utc() -> time::OffsetDateTime {
+    #[cfg(target_family = "wasm")]
+    {
+        let timestamp_nanos = (js_sys::Date::now() * 1_000_000.0) as i128;
+        time::OffsetDateTime::from_unix_timestamp_nanos(timestamp_nanos)
+            .unwrap_or(time::OffsetDateTime::UNIX_EPOCH)
+    }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        time::OffsetDateTime::now_utc()
+    }
+}
+
+pub(crate) fn local_utc_offset() -> time::UtcOffset {
+    #[cfg(target_family = "wasm")]
+    {
+        let seconds = -(js_sys::Date::new_0().get_timezone_offset() as i32) * 60;
+        time::UtcOffset::from_whole_seconds(seconds).unwrap_or(time::UtcOffset::UTC)
+    }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC)
+    }
+}
 
 pub fn get_provider_icon(name: &str) -> IconName {
     match name {
@@ -100,63 +126,66 @@ pub fn init(cx: &mut App) {
         repository_selector::register(workspace);
         git_picker::register(workspace);
 
-        workspace.register_action(
-            |workspace, action: &zed_actions::CreateWorktree, window, cx| {
-                worktree_service::handle_create_worktree(workspace, action, window, None, cx);
-            },
-        );
-        workspace.register_action(
-            |workspace, action: &zed_actions::SwitchWorktree, window, cx| {
-                worktree_service::handle_switch_worktree(workspace, action, window, None, cx);
-            },
-        );
+        #[cfg(not(target_family = "wasm"))]
+        {
+            workspace.register_action(
+                |workspace, action: &zed_actions::CreateWorktree, window, cx| {
+                    worktree_service::handle_create_worktree(workspace, action, window, None, cx);
+                },
+            );
+            workspace.register_action(
+                |workspace, action: &zed_actions::SwitchWorktree, window, cx| {
+                    worktree_service::handle_switch_worktree(workspace, action, window, None, cx);
+                },
+            );
 
-        workspace.register_action(|workspace, _: &zed_actions::git::Worktree, window, cx| {
-            let focused_dock = workspace.focused_dock_position(window, cx);
-            let project = workspace.project().clone();
-            let workspace_handle = workspace.weak_handle();
-            workspace.toggle_modal(window, cx, |window, cx| {
-                worktree_picker::WorktreePicker::new_modal(
-                    project,
-                    workspace_handle,
-                    focused_dock,
-                    window,
-                    cx,
-                )
+            workspace.register_action(|workspace, _: &zed_actions::git::Worktree, window, cx| {
+                let focused_dock = workspace.focused_dock_position(window, cx);
+                let project = workspace.project().clone();
+                let workspace_handle = workspace.weak_handle();
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    worktree_picker::WorktreePicker::new_modal(
+                        project,
+                        workspace_handle,
+                        focused_dock,
+                        window,
+                        cx,
+                    )
+                });
             });
-        });
 
-        workspace.register_action(
-            |workspace, action: &zed_actions::OpenWorktreeInNewWindow, window, cx| {
-                let path = action.path.clone();
-                let is_remote = !workspace.project().read(cx).is_local();
+            workspace.register_action(
+                |workspace, action: &zed_actions::OpenWorktreeInNewWindow, window, cx| {
+                    let path = action.path.clone();
+                    let is_remote = !workspace.project().read(cx).is_local();
 
-                if is_remote {
-                    let connection_options =
-                        workspace.project().read(cx).remote_connection_options(cx);
-                    let app_state = workspace.app_state().clone();
-                    let workspace_handle = workspace.weak_handle();
-                    cx.spawn_in(window, async move |_, cx| {
-                        if let Some(connection_options) = connection_options {
-                            crate::worktree_picker::open_remote_worktree(
-                                connection_options,
-                                vec![path],
-                                app_state,
-                                workspace_handle,
-                                cx,
-                            )
-                            .await?;
-                        }
-                        anyhow::Ok(())
-                    })
-                    .detach_and_log_err(cx);
-                } else {
-                    workspace
-                        .open_workspace_for_paths(OpenMode::NewWindow, vec![path], window, cx)
+                    if is_remote {
+                        let connection_options =
+                            workspace.project().read(cx).remote_connection_options(cx);
+                        let app_state = workspace.app_state().clone();
+                        let workspace_handle = workspace.weak_handle();
+                        cx.spawn_in(window, async move |_, cx| {
+                            if let Some(connection_options) = connection_options {
+                                crate::worktree_picker::open_remote_worktree(
+                                    connection_options,
+                                    vec![path],
+                                    app_state,
+                                    workspace_handle,
+                                    cx,
+                                )
+                                .await?;
+                            }
+                            anyhow::Ok(())
+                        })
                         .detach_and_log_err(cx);
-                }
-            },
-        );
+                    } else {
+                        workspace
+                            .open_workspace_for_paths(OpenMode::NewWindow, vec![path], window, cx)
+                            .detach_and_log_err(cx);
+                    }
+                },
+            );
+        }
 
         let project = workspace.project().read(cx);
         if project.is_read_only(cx) {
@@ -691,12 +720,11 @@ impl Render for RefPickerModal {
         let has_commit_details = self.commit_details.is_some();
         let commit_preview = self.commit_details.as_ref().map(|details| {
             let commit_time = OffsetDateTime::from_unix_timestamp(details.commit_timestamp)
-                .unwrap_or_else(|_| OffsetDateTime::now_utc());
-            let local_offset =
-                time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+                .unwrap_or_else(|_| crate::now_utc());
+            let local_offset = crate::local_utc_offset();
             let formatted_time = time_format::format_localized_timestamp(
                 commit_time,
-                OffsetDateTime::now_utc(),
+                crate::now_utc(),
                 local_offset,
                 time_format::TimestampFormat::Relative,
             );

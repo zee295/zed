@@ -257,13 +257,13 @@ mod server {
         let (tx, rx) = futures::channel::oneshot::channel();
 
         std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + OAUTH_CALLBACK_TIMEOUT;
+            let deadline = web_time::Instant::now() + OAUTH_CALLBACK_TIMEOUT;
 
             loop {
                 if tx.is_canceled() {
                     return;
                 }
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let remaining = deadline.saturating_duration_since(web_time::Instant::now());
                 if remaining.is_zero() {
                     return;
                 }
@@ -491,3 +491,60 @@ pub use server::{
     OAuthCallbackParams, OAuthCallbackServerConfig, start_oauth_callback_server,
     start_oauth_callback_server_with_config,
 };
+
+#[cfg(target_family = "wasm")]
+mod wasm_stub {
+    use anyhow::{Result, anyhow};
+    use futures::channel::oneshot;
+    use url::Url;
+
+    /// Parsed OAuth callback parameters from the authorization server redirect.
+    pub struct OAuthCallbackParams {
+        pub code: String,
+        pub state: String,
+    }
+
+    impl OAuthCallbackParams {
+        /// Parse the query string from a callback URL like
+        /// `http://127.0.0.1:<port>/callback?code=...&state=...`.
+        pub fn parse_query(query: &str) -> Result<Self> {
+            let url = Url::parse(&format!("http://127.0.0.1/callback?{query}"))?;
+            let mut code = None;
+            let mut state = None;
+            for (key, value) in url.query_pairs() {
+                match key.as_ref() {
+                    "code" => code = Some(value.into_owned()),
+                    "state" => state = Some(value.into_owned()),
+                    _ => {}
+                }
+            }
+            Ok(Self {
+                code: code.ok_or_else(|| anyhow!("missing `code` parameter"))?,
+                state: state.ok_or_else(|| anyhow!("missing `state` parameter"))?,
+            })
+        }
+    }
+
+    /// Configuration for the loopback OAuth callback server.
+    pub struct OAuthCallbackServerConfig;
+
+    /// Start a loopback HTTP server to receive the OAuth authorization callback.
+    pub fn start_oauth_callback_server()
+    -> Result<(String, oneshot::Receiver<Result<OAuthCallbackParams>>)> {
+        Err(anyhow!(
+            "OAuth callback server is not supported in the browser"
+        ))
+    }
+
+    /// Start a loopback HTTP server with custom host/port/path.
+    pub fn start_oauth_callback_server_with_config(
+        _config: OAuthCallbackServerConfig,
+    ) -> Result<(String, oneshot::Receiver<Result<OAuthCallbackParams>>)> {
+        Err(anyhow!(
+            "OAuth callback server is not supported in the browser"
+        ))
+    }
+}
+
+#[cfg(target_family = "wasm")]
+pub use wasm_stub::*;

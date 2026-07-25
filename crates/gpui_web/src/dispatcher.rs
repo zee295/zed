@@ -16,10 +16,21 @@ fn shared_memory_supported() -> bool {
     let has_shared_array_buffer =
         js_sys::Reflect::has(&global, &JsValue::from_str("SharedArrayBuffer")).unwrap_or(false);
     let has_atomics = js_sys::Reflect::has(&global, &JsValue::from_str("Atomics")).unwrap_or(false);
-    let memory = js_sys::WebAssembly::Memory::from(wasm_bindgen::memory());
-    let buffer = memory.buffer();
-    let is_shared_buffer = buffer.is_instance_of::<js_sys::SharedArrayBuffer>();
-    has_shared_array_buffer && has_atomics && is_shared_buffer
+    if !has_shared_array_buffer || !has_atomics {
+        return false;
+    }
+    // Thread build: memory is *imported* into the wasm (not in exports), so
+    // `wasm_bindgen::memory()` is undefined. The glue stashes the real shared
+    // memory on `globalThis.__wbgSharedMemory`; check its buffer directly.
+    if let Ok(stash) = js_sys::Reflect::get(&global, &JsValue::from_str("__wbgSharedMemory")) {
+        if !stash.is_undefined() && !stash.is_null() {
+            if let Ok(buffer) = js_sys::Reflect::get(&stash, &JsValue::from_str("buffer")) {
+                return buffer.is_instance_of::<js_sys::SharedArrayBuffer>();
+            }
+        }
+    }
+    let buffer = js_sys::WebAssembly::Memory::from(wasm_bindgen::memory()).buffer();
+    buffer.is_instance_of::<js_sys::SharedArrayBuffer>()
 }
 
 enum MainThreadItem {
@@ -146,13 +157,18 @@ impl WebDispatcher {
         let main_thread_mailbox = Arc::new(MainThreadMailbox::new());
 
         #[cfg(feature = "multithreaded")]
-        let supports_threads = allow_threads && shared_memory_supported();
+        let has_shared_memory = shared_memory_supported();
+        #[cfg(feature = "multithreaded")]
+        let supports_threads = allow_threads && has_shared_memory;
         #[cfg(not(feature = "multithreaded"))]
         let supports_threads = false;
 
-        if supports_threads {
+        #[cfg(feature = "multithreaded")]
+        if has_shared_memory {
             main_thread_mailbox.run_waker_loop(browser_window.clone());
-        } else {
+        }
+
+        if allow_threads && !supports_threads {
             log::warn!(
                 "SharedArrayBuffer not available; falling back to single-threaded dispatcher"
             );
@@ -243,8 +259,9 @@ impl PlatformDispatcher for WebDispatcher {
     fn dispatch_after(&self, duration: Duration, runnable: RunnableVariant) {
         let millis = duration.as_millis().min(i32::MAX as u128) as i32;
         if self.on_main_thread() {
+            let window = self.browser_window.clone();
             let callback = Closure::once_into_js(move || {
-                runnable.run();
+                run_when_app_free(&window, runnable);
             });
             self.browser_window
                 .set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -260,11 +277,27 @@ impl PlatformDispatcher for WebDispatcher {
 
     fn spawn_realtime(&self, function: Box<dyn FnOnce() + Send>) {
         if self.on_main_thread() {
+            let window = self.browser_window.clone();
             let callback = Closure::once_into_js(move || {
-                function();
+                if gpui::is_app_borrowed() {
+                    let callback = Closure::once_into_js(move || {
+                        function();
+                    });
+                    window
+                        .set_timeout_with_callback_and_timeout_and_arguments_0(
+                            callback.unchecked_ref(),
+                            0,
+                        )
+                        .ok();
+                } else {
+                    function();
+                }
             });
+            // Prefer setTimeout(0) over queueMicrotask so we don't run between
+            // nested microtasks while App is still borrowed.
             self.browser_window
-                .queue_microtask(callback.unchecked_ref());
+                .set_timeout_with_callback_and_timeout_and_arguments_0(callback.unchecked_ref(), 0)
+                .ok();
         } else {
             self.main_thread_mailbox
                 .post(Priority::High, MainThreadItem::RealtimeFunction(function));
@@ -279,11 +312,12 @@ impl PlatformDispatcher for WebDispatcher {
 fn execute_on_main_thread(window: &web_sys::Window, item: MainThreadItem) {
     match item {
         MainThreadItem::Runnable(runnable) => {
-            runnable.run();
+            run_when_app_free(window, runnable);
         }
         MainThreadItem::Delayed { runnable, millis } => {
+            let window_for_cb = window.clone();
             let callback = Closure::once_into_js(move || {
-                runnable.run();
+                run_when_app_free(&window_for_cb, runnable);
             });
             window
                 .set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -293,26 +327,49 @@ fn execute_on_main_thread(window: &web_sys::Window, item: MainThreadItem) {
                 .ok();
         }
         MainThreadItem::RealtimeFunction(function) => {
-            function();
+            // Realtime work must not re-enter App either.
+            if gpui::is_app_borrowed() {
+                let callback = Closure::once_into_js(move || {
+                    function();
+                });
+                window
+                    .set_timeout_with_callback_and_timeout_and_arguments_0(
+                        callback.unchecked_ref(),
+                        0,
+                    )
+                    .ok();
+            } else {
+                function();
+            }
         }
     }
 }
 
-fn schedule_runnable(window: &web_sys::Window, runnable: RunnableVariant, priority: Priority) {
+/// Run a main-thread task only when the GPUI App `RefCell` is free.
+///
+/// On the web, RAF / ResizeObserver / timer completions can interleave. If a
+/// foreground task polls an async future that calls `AsyncApp::update_entity`
+/// while a frame already holds `App`, we panic with "RefCell already borrowed".
+/// Re-queue with `setTimeout(0)` until the outer borrow is released.
+fn run_when_app_free(window: &web_sys::Window, runnable: RunnableVariant) {
+    if gpui::is_app_borrowed() {
+        schedule_runnable(window, runnable, Priority::default());
+        return;
+    }
+    runnable.run();
+}
+
+fn schedule_runnable(window: &web_sys::Window, runnable: RunnableVariant, _priority: Priority) {
+    let window_for_cb = window.clone();
     let callback = Closure::once_into_js(move || {
-        runnable.run();
+        run_when_app_free(&window_for_cb, runnable);
     });
     let callback: &js_sys::Function = callback.unchecked_ref();
 
-    match priority {
-        Priority::RealtimeAudio => {
-            window.queue_microtask(callback);
-        }
-        _ => {
-            // TODO-Wasm: this ought to enqueue so we can dequeue with proper priority
-            window
-                .set_timeout_with_callback_and_timeout_and_arguments_0(callback, 0)
-                .ok();
-        }
-    }
+    // Always use setTimeout(0) (macrotask). queueMicrotask can run between
+    // nested microtasks while App is still borrowed from a parent sync stack.
+    // TODO-Wasm: enqueue so we can dequeue with proper priority
+    window
+        .set_timeout_with_callback_and_timeout_and_arguments_0(callback, 0)
+        .ok();
 }

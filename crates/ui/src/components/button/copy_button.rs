@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, ClipboardItem, Context, ElementId, Entity, IntoElement, ParentElement,

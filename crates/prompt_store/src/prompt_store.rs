@@ -8,6 +8,7 @@ use futures::FutureExt as _;
 use futures::future::Shared;
 
 use gpui::{App, AppContext, Entity, Global, ReadGlobal, SharedString, Task};
+#[cfg(not(target_family = "wasm"))]
 use heed::{
     Database, RoTxn,
     types::{SerdeBincode, SerdeJson, Str},
@@ -19,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::{future::Future, path::PathBuf, sync::Arc};
 use strum::{EnumIter, IntoEnumIterator as _};
 use text::LineEnding;
+#[cfg(not(target_family = "wasm"))]
 use util::ResultExt;
 use uuid::Uuid;
 
@@ -154,10 +156,18 @@ impl std::fmt::Display for PromptId {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub struct PromptStore {
     env: heed::Env,
     metadata_cache: RwLock<MetadataCache>,
     bodies: Database<SerdeJson<PromptId>, Str>,
+}
+
+/// Browser wasm: in-memory prompts only (no LMDB).
+#[cfg(target_family = "wasm")]
+pub struct PromptStore {
+    metadata_cache: RwLock<MetadataCache>,
+    bodies: RwLock<HashMap<PromptId, String>>,
 }
 
 #[derive(Default)]
@@ -167,6 +177,19 @@ struct MetadataCache {
 }
 
 impl MetadataCache {
+    fn with_builtins() -> Self {
+        let mut cache = MetadataCache::default();
+        for builtin in BuiltInPrompt::iter() {
+            let builtin_id = PromptId::BuiltIn(builtin);
+            let metadata = PromptMetadata::builtin(builtin);
+            cache.metadata.push(metadata.clone());
+            cache.metadata_by_id.insert(builtin_id, metadata);
+        }
+        cache.sort();
+        cache
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     fn from_db(
         db: Database<SerdeJson<PromptId>, SerdeJson<PromptMetadata>>,
         txn: &RoTxn,
@@ -214,6 +237,17 @@ impl PromptStore {
         async move { store.await.map_err(|err| anyhow!(err)) }
     }
 
+    #[cfg(target_family = "wasm")]
+    pub fn new(_db_path: PathBuf, cx: &App) -> Task<Result<Self>> {
+        cx.background_spawn(async move {
+            Ok(PromptStore {
+                metadata_cache: RwLock::new(MetadataCache::with_builtins()),
+                bodies: RwLock::new(HashMap::default()),
+            })
+        })
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     pub fn new(db_path: PathBuf, cx: &App) -> Task<Result<Self>> {
         cx.background_spawn(async move {
             std::fs::create_dir_all(&db_path)?;
@@ -244,6 +278,7 @@ impl PromptStore {
         })
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn upgrade_dbs(
         env: &heed::Env,
         metadata_db: heed::Database<SerdeJson<PromptId>, SerdeJson<PromptMetadata>>,
@@ -304,23 +339,44 @@ impl PromptStore {
     }
 
     pub fn load(&self, id: PromptId, cx: &App) -> Task<Result<String>> {
-        let env = self.env.clone();
-        let bodies = self.bodies;
-        cx.background_spawn(async move {
-            let txn = env.read_txn()?;
-            let mut prompt: String = match bodies.get(&txn, &id)? {
-                Some(body) => body.into(),
-                None => {
-                    if let Some(built_in) = id.as_built_in() {
-                        built_in.default_content().into()
-                    } else {
-                        anyhow::bail!("prompt not found")
+        #[cfg(target_family = "wasm")]
+        {
+            let body = self.bodies.read().get(&id).cloned();
+            return cx.background_spawn(async move {
+                let mut prompt: String = match body {
+                    Some(body) => body,
+                    None => {
+                        if let Some(built_in) = id.as_built_in() {
+                            built_in.default_content().into()
+                        } else {
+                            anyhow::bail!("prompt not found")
+                        }
                     }
-                }
-            };
-            LineEnding::normalize(&mut prompt);
-            Ok(prompt)
-        })
+                };
+                LineEnding::normalize(&mut prompt);
+                Ok(prompt)
+            });
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let env = self.env.clone();
+            let bodies = self.bodies;
+            cx.background_spawn(async move {
+                let txn = env.read_txn()?;
+                let mut prompt: String = match bodies.get(&txn, &id)? {
+                    Some(body) => body.into(),
+                    None => {
+                        if let Some(built_in) = id.as_built_in() {
+                            built_in.default_content().into()
+                        } else {
+                            anyhow::bail!("prompt not found")
+                        }
+                    }
+                };
+                LineEnding::normalize(&mut prompt);
+                Ok(prompt)
+            })
+        }
     }
 
     pub fn all_prompt_metadata(&self) -> Vec<PromptMetadata> {

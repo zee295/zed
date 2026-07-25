@@ -753,7 +753,9 @@ async fn do_oauth_flow(
     http_client: Arc<dyn HttpClient>,
     cx: &AsyncApp,
 ) -> Result<CodexCredentials> {
-    // Start the callback server FIRST so the redirect URI is ready
+    // Start the callback server FIRST so the redirect URI is ready.
+    // On wasm the oauth callback server is a stub (no local TCP bind).
+    #[cfg(not(target_family = "wasm"))]
     let (redirect_uri, callback_rx) =
         oauth_callback_server::start_oauth_callback_server_with_config(
             oauth_callback_server::OAuthCallbackServerConfig {
@@ -764,6 +766,12 @@ async fn do_oauth_flow(
             },
         )
         .context("Failed to start OAuth callback server")?;
+    #[cfg(target_family = "wasm")]
+    let (redirect_uri, callback_rx) =
+        oauth_callback_server::start_oauth_callback_server_with_config(
+            oauth_callback_server::OAuthCallbackServerConfig,
+        )
+        .context("OAuth callback server is not available in the browser")?;
 
     // PKCE verifier: 32 random bytes → base64url (no padding)
     let mut verifier_bytes = [0u8; 32];

@@ -3,6 +3,7 @@ mod event_coalescer;
 use crate::TelemetrySettings;
 use anyhow::{Context as _, Result};
 use clock::SystemClock;
+#[cfg(not(target_family = "wasm"))]
 use fs::Fs;
 use futures::channel::mpsc;
 use futures::{Future, StreamExt};
@@ -13,13 +14,18 @@ use regex::Regex;
 use release_channel::ReleaseChannel;
 use settings::{Settings, SettingsStore};
 use sha2::{Digest, Sha256};
+#[cfg(not(target_family = "wasm"))]
 use std::collections::HashSet;
+#[cfg(not(target_family = "wasm"))]
 use std::fs::File;
+#[cfg(not(target_family = "wasm"))]
 use std::io::Write;
+#[cfg(not(target_family = "wasm"))]
+use std::path::PathBuf;
 use std::sync::LazyLock;
-use std::time::Instant;
-use std::{env, mem, path::PathBuf, sync::Arc, time::Duration};
+use std::{env, mem, sync::Arc, time::Duration};
 use telemetry_events::{AssistantEventData, AssistantPhase, Event, EventRequestBody, EventWrapper};
+use web_time::Instant;
 
 pub struct TelemetrySubscription {
     pub historical_events: Result<HistoricalEvents>,
@@ -32,6 +38,7 @@ pub struct HistoricalEvents {
     pub parse_error_count: usize,
 }
 use util::ResultExt as _;
+#[cfg(not(target_family = "wasm"))]
 use worktree::{UpdatedEntriesSet, WorktreeId};
 
 use self::event_coalescer::EventCoalescer;
@@ -54,11 +61,13 @@ struct TelemetryState {
     events_queue: Vec<EventWrapper>,
     flush_events_task: Option<Task<()>>,
 
+    #[cfg(not(target_family = "wasm"))]
     log_file: Option<File>,
     is_staff: Option<bool>,
     first_event_date_time: Option<Instant>,
     event_coalescer: EventCoalescer,
     max_queue_size: usize,
+    #[cfg(not(target_family = "wasm"))]
     worktrees_with_project_type_events_sent: HashSet<WorktreeId>,
 
     os_name: String,
@@ -100,31 +109,21 @@ static DOTNET_PROJECT_FILES_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 pub fn os_name() -> String {
-    #[cfg(target_os = "macos")]
-    {
-        "macOS".to_string()
-    }
-    #[cfg(target_os = "linux")]
-    {
-        format!("Linux {}", gpui::guess_compositor())
-    }
-    #[cfg(target_os = "freebsd")]
-    {
-        format!("FreeBSD {}", gpui::guess_compositor())
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        "Windows".to_string()
+    cfg_select! {
+        target_family = "wasm" => "Web".to_string(),
+        target_os = "macos" => "macOS".to_string(),
+        target_os = "linux" => format!("Linux {}", gpui::guess_compositor()),
+        target_os = "freebsd" => format!("FreeBSD {}", gpui::guess_compositor()),
+        target_os = "windows" => "Windows".to_string(),
     }
 }
 
 /// Note: This might do blocking IO! Only call from background threads
-pub fn os_version() -> String {
+pub fn os_version() -> Option<String> {
     cfg_select! {
        feature = "test-support" => {
            // MacOS branch in particular is quite slow, hence we ought to "avoid" it in tests.
-           "test binary".to_owned()
+           Some("test binary".to_owned())
        }
        target_os = "macos" => {
            static MACOS_VERSION_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -137,9 +136,11 @@ pub fn os_version() -> String {
            let version_string = version_nsstring.to_string().replace("Version ", "");
            // "15.6.1 (Build 24G90)" -> "15.6.1"
            // "26.0.0 (Build 25A5349a)" -> unchanged (Beta or Rapid Security Response; ends with letter)
-           MACOS_VERSION_REGEX
-               .replace_all(&version_string, "")
-               .to_string()
+           Some(
+               MACOS_VERSION_REGEX
+                   .replace_all(&version_string, "")
+                   .to_string(),
+           )
        }
        any(target_os = "linux", target_os = "freebsd") => {
            use std::path::Path;
@@ -156,21 +157,26 @@ pub fn os_version() -> String {
                );
                "".to_string()
            };
-           util::parse_os_release(&content).unwrap_or_else(|| "unknown".to_string())
+           Some(util::parse_os_release(&content).unwrap_or_else(|| "unknown".to_string()))
        }
        target_os = "windows" => {
            let mut info = unsafe { std::mem::zeroed() };
            let status = unsafe { windows::Wdk::System::SystemServices::RtlGetVersion(&mut info) };
            if status.is_ok() {
-               semver::Version::new(
-                   info.dwMajorVersion as _,
-                   info.dwMinorVersion as _,
-                   info.dwBuildNumber as _,
+               Some(
+                   semver::Version::new(
+                       info.dwMajorVersion as _,
+                       info.dwMinorVersion as _,
+                       info.dwBuildNumber as _,
+                   )
+                   .to_string(),
                )
-               .to_string()
            } else {
-               "unknown".to_string()
+               Some("unknown".to_string())
            }
+       }
+       target_family = "wasm" => {
+           None
        }
     }
 }
@@ -191,11 +197,13 @@ impl Telemetry {
             metrics_id: None,
             events_queue: Vec::new(),
             flush_events_task: None,
+            #[cfg(not(target_family = "wasm"))]
             log_file: None,
             is_staff: None,
             first_event_date_time: None,
             event_coalescer: EventCoalescer::new(clock.clone()),
             max_queue_size: MAX_QUEUE_LEN,
+            #[cfg(not(target_family = "wasm"))]
             worktrees_with_project_type_events_sent: HashSet::new(),
 
             os_version: None,
@@ -204,17 +212,25 @@ impl Telemetry {
             subscribers: Vec::new(),
         }));
 
-        cx.background_spawn({
-            let state = state.clone();
-            let os_version = os_version();
-            state.lock().os_version = Some(os_version);
-            async move {
-                if let Some(tempfile) = File::create(Self::log_file_path()).ok() {
-                    state.lock().log_file = Some(tempfile);
+        #[cfg(not(target_family = "wasm"))]
+        {
+            cx.background_spawn({
+                let state = state.clone();
+                let os_version = os_version();
+                state.lock().os_version = os_version;
+                async move {
+                    if let Some(tempfile) = File::create(Self::log_file_path()).ok() {
+                        state.lock().log_file = Some(tempfile);
+                    }
                 }
-            }
-        })
-        .detach();
+            })
+            .detach();
+        }
+
+        #[cfg(target_family = "wasm")]
+        {
+            state.lock().os_version = os_version();
+        }
 
         cx.observe_global::<SettingsStore>({
             let state = state.clone();
@@ -274,10 +290,12 @@ impl Telemetry {
         Task::ready(())
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub fn log_file_path() -> PathBuf {
         paths::logs_dir().join("telemetry.log")
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub async fn subscribe_with_history(
         self: &Arc<Self>,
         fs: Arc<dyn Fs>,
@@ -299,6 +317,7 @@ impl Telemetry {
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
     async fn read_log_file(self: &Arc<Self>, fs: Arc<dyn Fs>) -> anyhow::Result<HistoricalEvents> {
         const MAX_LOG_READ: usize = 5 * 1024 * 1024;
 
@@ -416,7 +435,7 @@ impl Telemetry {
         drop(state);
 
         if let Some(mut last_event) = LAST_EVENT_TIME.try_lock() {
-            let current_time = std::time::Instant::now();
+            let current_time = web_time::Instant::now();
             let last_time = last_event.get_or_insert(current_time);
 
             if current_time.duration_since(*last_time) > Duration::from_secs(60 * 10) {
@@ -441,6 +460,7 @@ impl Telemetry {
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub fn report_discovered_project_type_events(
         self: &Arc<Self>,
         worktree_id: WorktreeId,
@@ -456,6 +476,7 @@ impl Telemetry {
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn detect_project_types(
         self: &Arc<Self>,
         worktree_id: WorktreeId,
@@ -660,8 +681,10 @@ impl Telemetry {
                 return Ok(());
             }
 
+            #[allow(unused_mut)]
             let mut json_bytes = Vec::new();
 
+            #[cfg(not(target_family = "wasm"))]
             if let Some(file) = &mut state.log_file {
                 for event in &events {
                     json_bytes.clear();

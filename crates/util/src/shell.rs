@@ -1,6 +1,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::{borrow::Cow, fmt, path::Path, sync::LazyLock};
+#[cfg(windows)]
+use std::sync::LazyLock;
+use std::{borrow::Cow, fmt, path::Path};
 
 /// Shell configuration to open the terminal with.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema, Hash)]
@@ -84,13 +86,17 @@ pub fn get_default_system_shell() -> String {
 
 /// Get the default system shell, preferring bash on Windows.
 pub fn get_default_system_shell_preferring_bash() -> String {
-    if cfg!(windows) {
+    #[cfg(windows)]
+    {
         get_windows_bash().unwrap_or_else(|| get_windows_system_shell())
-    } else {
+    }
+    #[cfg(not(windows))]
+    {
         "/bin/sh".to_string()
     }
 }
 
+#[cfg(windows)]
 pub fn get_windows_bash() -> Option<String> {
     use std::path::PathBuf;
 

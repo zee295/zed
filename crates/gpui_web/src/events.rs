@@ -126,8 +126,12 @@ impl WebWindowInner {
     }
 
     fn dispatch_input(&self, input: PlatformInput) -> Option<DispatchEventResult> {
-        let mut borrowed = self.callbacks.borrow_mut();
-        borrowed.input.as_mut().map(|callback| callback(input))
+        // Take the handler out so nested platform callbacks (resize/RAF mid
+        // input handling) cannot re-borrow `callbacks` while we run.
+        let mut callback = self.callbacks.borrow_mut().input.take();
+        let result = callback.as_mut().map(|cb| cb(input));
+        self.callbacks.borrow_mut().input = callback;
+        result
     }
 
     fn register_pointer_down(self: &Rc<Self>) -> Closure<dyn FnMut(JsValue)> {
@@ -151,21 +155,13 @@ impl WebWindowInner {
                 current_state.modifiers = modifiers;
             }
 
-            let result = this.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
+            this.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
                 button,
                 position,
                 modifiers,
                 click_count,
                 first_mouse: false,
             }));
-
-            // The browser fires `contextmenu` after this event; remember whether
-            // the app claimed the right-click (e.g. opened its own menu) so the
-            // contextmenu listener cancels the native menu only in that case.
-            if button == MouseButton::Right {
-                let claimed = result.is_some_and(|result| !result.propagate);
-                this.app_claimed_right_click.set(claimed);
-            }
         })
     }
 
@@ -279,12 +275,9 @@ impl WebWindowInner {
     }
 
     fn register_context_menu(self: &Rc<Self>) -> Closure<dyn FnMut(JsValue)> {
-        let this = Rc::clone(self);
         self.listen("contextmenu", move |event: JsValue| {
             let event: web_sys::Event = event.unchecked_into();
-            if this.app_claimed_right_click.replace(false) {
-                event.prevent_default();
-            }
+            event.prevent_default();
         })
     }
 
@@ -368,7 +361,7 @@ impl WebWindowInner {
 
             let keystroke = Keystroke {
                 modifiers,
-                key,
+                key: key.clone(),
                 key_char: key_char.clone(),
             };
 
@@ -388,6 +381,28 @@ impl WebWindowInner {
             if this.is_composing.get() || event.is_composing() {
                 event.prevent_default();
                 return;
+            }
+
+            // Always swallow editor-control keys so the hidden input / browser
+            // chrome cannot steal them when GPUI bindings fail to mark the
+            // event as handled (or when focus is on the shim input).
+            if matches!(
+                key.as_str(),
+                "backspace"
+                    | "delete"
+                    | "left"
+                    | "right"
+                    | "up"
+                    | "down"
+                    | "home"
+                    | "end"
+                    | "pageup"
+                    | "pagedown"
+                    | "tab"
+                    | "enter"
+                    | "escape"
+            ) {
+                event.prevent_default();
             }
 
             if modifiers.is_subset_of(&Modifiers::shift()) {
@@ -513,10 +528,11 @@ impl WebWindowInner {
                 let mut state = this.state.borrow_mut();
                 state.is_active = true;
             }
-            let mut callbacks = this.callbacks.borrow_mut();
-            if let Some(ref mut callback) = callbacks.active_status_change {
-                callback(true);
+            let mut callback = this.callbacks.borrow_mut().active_status_change.take();
+            if let Some(ref mut cb) = callback {
+                cb(true);
             }
+            this.callbacks.borrow_mut().active_status_change = callback;
         })
     }
 
@@ -527,10 +543,11 @@ impl WebWindowInner {
                 let mut state = this.state.borrow_mut();
                 state.is_active = false;
             }
-            let mut callbacks = this.callbacks.borrow_mut();
-            if let Some(ref mut callback) = callbacks.active_status_change {
-                callback(false);
+            let mut callback = this.callbacks.borrow_mut().active_status_change.take();
+            if let Some(ref mut cb) = callback {
+                cb(false);
             }
+            this.callbacks.borrow_mut().active_status_change = callback;
         })
     }
 
@@ -541,10 +558,11 @@ impl WebWindowInner {
                 let mut state = this.state.borrow_mut();
                 state.is_hovered = true;
             }
-            let mut callbacks = this.callbacks.borrow_mut();
-            if let Some(ref mut callback) = callbacks.hover_status_change {
-                callback(true);
+            let mut callback = this.callbacks.borrow_mut().hover_status_change.take();
+            if let Some(ref mut cb) = callback {
+                cb(true);
             }
+            this.callbacks.borrow_mut().hover_status_change = callback;
         })
     }
 
@@ -555,10 +573,11 @@ impl WebWindowInner {
                 let mut state = this.state.borrow_mut();
                 state.is_hovered = false;
             }
-            let mut callbacks = this.callbacks.borrow_mut();
-            if let Some(ref mut callback) = callbacks.hover_status_change {
-                callback(false);
+            let mut callback = this.callbacks.borrow_mut().hover_status_change.take();
+            if let Some(ref mut cb) = callback {
+                cb(false);
             }
+            this.callbacks.borrow_mut().hover_status_change = callback;
         })
     }
 }
@@ -647,22 +666,43 @@ fn capslock_from_keyboard_event(event: &web_sys::KeyboardEvent) -> Capslock {
     }
 }
 
-pub(crate) fn is_mac_platform(browser_window: &web_sys::Window) -> bool {
+pub(crate) fn browser_operating_system(browser_window: &web_sys::Window) -> gpui::OperatingSystem {
     let navigator = browser_window.navigator();
 
     #[allow(deprecated)]
     // navigator.platform() is deprecated but navigator.userAgentData is not widely available yet
     if let Ok(platform) = navigator.platform() {
-        if platform.contains("Mac") {
-            return true;
+        if platform.contains("Mac") || platform.contains("iPhone") || platform.contains("iPad") {
+            return gpui::OperatingSystem::Mac;
+        }
+        if platform.contains("Win") {
+            return gpui::OperatingSystem::Windows;
+        }
+        if platform.contains("Linux") {
+            return gpui::OperatingSystem::Linux;
         }
     }
 
     if let Ok(user_agent) = navigator.user_agent() {
-        return user_agent.contains("Mac");
+        if user_agent.contains("Mac")
+            || user_agent.contains("iPhone")
+            || user_agent.contains("iPad")
+        {
+            return gpui::OperatingSystem::Mac;
+        }
+        if user_agent.contains("Windows") {
+            return gpui::OperatingSystem::Windows;
+        }
+        if user_agent.contains("Linux") || user_agent.contains("X11") {
+            return gpui::OperatingSystem::Linux;
+        }
     }
 
-    false
+    gpui::OperatingSystem::Unknown
+}
+
+pub(crate) fn is_mac_platform(browser_window: &web_sys::Window) -> bool {
+    browser_operating_system(browser_window) == gpui::OperatingSystem::Mac
 }
 
 fn is_modifier_only_key(key: &str) -> bool {

@@ -17,6 +17,7 @@ test-support = ["multi_buffer/test-support", "remote_connection/test-support"]
 call = ["dep:call"]
 
 [dependencies]
+web-time.workspace = true
 agent_settings.workspace = true
 anyhow.workspace = true
 askpass.workspace = true
@@ -47,12 +48,12 @@ notifications.workspace = true
 panel.workspace = true
 picker.workspace = true
 project.workspace = true
-prompt_store.workspace = true
+
 proto.workspace = true
 rand.workspace = true
 release_channel.workspace = true
 remote.workspace = true
-remote_connection.workspace = true
+
 schemars.workspace = true
 search.workspace = true
 serde.workspace = true
@@ -60,10 +61,10 @@ serde_json.workspace = true
 settings.workspace = true
 smallvec.workspace = true
 strum.workspace = true
-sysinfo.workspace = true
+
 task.workspace = true
 telemetry.workspace = true
-terminal.workspace = true
+
 theme.workspace = true
 theme_settings.workspace = true
 time.workspace = true
@@ -76,7 +77,16 @@ watch.workspace = true
 workspace.workspace = true
 zed_actions.workspace = true
 zeroize.workspace = true
+prompt_store.workspace = true
+remote_connection.workspace = true
+terminal.workspace = true
 ztracing.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+sysinfo.workspace = true
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+js-sys = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true

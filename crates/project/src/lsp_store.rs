@@ -115,6 +115,8 @@ use serde_json::Value;
 use settings::{Settings, SettingsLocation, SettingsStore};
 use sha2::{Digest, Sha256};
 use snippet::Snippet;
+#[cfg(not(target_family = "wasm"))]
+use std::time::Instant;
 use std::{
     any::TypeId,
     borrow::Cow,
@@ -132,11 +134,13 @@ use std::{
         Arc,
         atomic::{self, AtomicUsize},
     },
-    time::{Duration, Instant},
+    time::Duration,
     vec,
 };
 use sum_tree::Dimensions;
 use text::{Anchor, BufferId, LineEnding, OffsetRangeExt, ToPoint as _};
+#[cfg(target_family = "wasm")]
+use web_time::Instant;
 
 use util::{
     ConnectionResult, ResultExt as _, debug_panic, defer, maybe, merge_json_value_into,
@@ -1562,7 +1566,17 @@ impl LocalLspStore {
                     .start_transaction()
                     .context("transaction already open")?;
                 buffer.end_transaction(cx);
-                let transaction_id = buffer.push_empty_transaction(cx.background_executor().now());
+                let now = {
+                    #[cfg(target_family = "wasm")]
+                    {
+                        web_time::Instant::now()
+                    }
+                    #[cfg(not(target_family = "wasm"))]
+                    {
+                        cx.background_executor().now()
+                    }
+                };
+                let transaction_id = buffer.push_empty_transaction(now);
                 buffer.finalize_last_transaction();
                 anyhow::Ok(transaction_id)
             })?;
@@ -14840,7 +14854,7 @@ pub struct LanguageServerProgress {
     pub message: Option<String>,
     pub percentage: Option<usize>,
     #[serde(skip_serializing)]
-    pub last_update_at: Instant,
+    pub last_update_at: web_time::Instant,
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Serialize)]

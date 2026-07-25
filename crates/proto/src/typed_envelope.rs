@@ -1,12 +1,13 @@
 use crate::{Envelope, PeerId};
 use anyhow::{Context as _, Result};
 use serde::Serialize;
+use std::marker::PhantomData;
 use std::{
     any::{Any, TypeId},
     cmp,
     fmt::{self, Debug},
 };
-use std::{marker::PhantomData, time::Instant};
+use web_time::Instant;
 
 pub trait EnvelopedMessage: Clone + Debug + Serialize + Sized + Send + Sync + 'static {
     const NAME: &'static str;

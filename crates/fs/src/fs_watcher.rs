@@ -7,9 +7,10 @@ use std::{
     ops::DerefMut,
     path::Path,
     sync::{Arc, LazyLock, OnceLock},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use util::{ResultExt, paths::SanitizedPath};
+use web_time::Instant;
 
 use crate::{PathEvent, PathEventKind, Watcher};
 

@@ -26,7 +26,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tempfile::TempDir;
 use util::command::{Child, Stdio};
@@ -35,6 +35,7 @@ use util::{
     rel_path::RelPath,
     shell::ShellKind,
 };
+use web_time::Instant;
 
 /// How long to wait for SSH to connect when no askpass prompt has opened.
 const SSH_CONNECTION_PROMPT_TIMEOUT: Duration = Duration::from_secs(17);

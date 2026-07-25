@@ -1337,7 +1337,10 @@ impl RunningState {
             None
         };
 
+        #[cfg(not(target_family = "wasm"))]
         let shell = project.read(cx).terminal_settings(&cwd, cx).shell.clone();
+        #[cfg(target_family = "wasm")]
+        let shell = task::Shell::System;
         let title = request
             .title
             .clone()
@@ -1386,10 +1389,13 @@ impl RunningState {
             })?;
 
             terminal.read_with(cx, |terminal, _| {
-                terminal
+                let pid = terminal
                     .pid()
-                    .map(|pid| pid.as_u32())
-                    .context("Terminal was spawned but PID was not available")
+                    .context("Terminal was spawned but PID was not available")?;
+                #[cfg(not(target_family = "wasm"))]
+                return Ok(pid.as_u32());
+                #[cfg(target_family = "wasm")]
+                Ok(pid)
             })
         });
 

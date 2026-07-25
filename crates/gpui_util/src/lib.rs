@@ -9,8 +9,8 @@ use std::{
     pin::Pin,
     sync::OnceLock,
     task::{Context, Poll},
-    time::Instant,
 };
+use web_time::Instant;
 
 pub mod arc_cow;
 

@@ -9,12 +9,24 @@ use std::process::Stdio;
 /// terminates all processes in the job. This also applies when the Zed
 /// process exits for any reason (including crashes), since the OS closes
 /// its handles, so spawned process trees can never outlive Zed.
+#[cfg(not(target_family = "wasm"))]
 pub struct Child {
     process: smol::process::Child,
     #[cfg(windows)]
     job: Option<windows_job::JobObject>,
 }
 
+#[cfg(target_family = "wasm")]
+pub struct Child {
+    pub stdin: Option<smol::process::ChildStdin>,
+    pub stdout: Option<smol::process::ChildStdout>,
+    pub stderr: Option<smol::process::ChildStderr>,
+    /// The remote child handle, kept so `status`/`kill` reach the host process
+    /// (stdio handles are taken out; this owns the process lifecycle).
+    inner: Option<smol::process::Child>,
+}
+
+#[cfg(not(target_family = "wasm"))]
 impl std::ops::Deref for Child {
     type Target = smol::process::Child;
 
@@ -23,6 +35,7 @@ impl std::ops::Deref for Child {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl std::ops::DerefMut for Child {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.process
@@ -30,7 +43,7 @@ impl std::ops::DerefMut for Child {
 }
 
 impl Child {
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_family = "wasm")))]
     pub fn spawn(
         mut command: std::process::Command,
         stdin: Stdio,
@@ -53,7 +66,7 @@ impl Child {
         Ok(Self { process })
     }
 
-    #[cfg(windows)]
+    #[cfg(all(windows, not(target_family = "wasm")))]
     pub fn spawn(
         command: std::process::Command,
         stdin: Stdio,
@@ -101,8 +114,58 @@ impl Child {
         Ok(Self { process, job })
     }
 
+    #[cfg(target_family = "wasm")]
+    pub fn spawn(
+        command: std::process::Command,
+        stdin: Stdio,
+        stdout: Stdio,
+        stderr: Stdio,
+    ) -> Result<Self> {
+        // No local process spawning in the browser. Forward to the remote
+        // process bridge in `smol_wasm`, which spawns the command on the host
+        // server (`Process::spawn` RPC) and streams stdio over the WebSocket —
+        // the same pattern the terminal and LSP use. This is what lets external
+        // ACP agent servers (claude-acp, gemini, codex, …) run server-side while
+        // the UI drives them over ACP.
+        let mut remote = smol::process::Command::new(command.get_program());
+        remote.args(command.get_args());
+        for (key, value) in command.get_envs() {
+            match value {
+                Some(value) => {
+                    remote.env(key, value);
+                }
+                None => {
+                    remote.env_remove(key);
+                }
+            }
+        }
+        if let Some(cwd) = command.get_current_dir() {
+            remote.current_dir(cwd);
+        }
+        // `std::process::Stdio` has no public variant to match on, so forward
+        // the piped flag unconditionally for whichever streams the caller asked
+        // to pipe. The remote bridge only opens the streams that were piped.
+        let _ = (stdin, stdout, stderr);
+        remote.stdin(Stdio::piped());
+        remote.stdout(Stdio::piped());
+        remote.stderr(Stdio::piped());
+        let mut child = remote.spawn().with_context(|| {
+            format!(
+                "failed to spawn remote command {}",
+                crate::redact::redact_command(&format!("{command:?}"))
+            )
+        })?;
+        Ok(Self {
+            stdin: child.stdin(),
+            stdout: child.stdout(),
+            stderr: child.stderr(),
+            inner: Some(child),
+        })
+    }
+
     /// Consumes the child, draining its stdout/stderr and waiting for it to
     /// exit, then returns the collected output.
+    #[cfg(not(target_family = "wasm"))]
     pub async fn output(self) -> Result<std::process::Output> {
         // NOTE: Keep `self` alive across this await, do not destructure it to
         // pull `process` out first. On Windows that drops the job object early,
@@ -111,7 +174,12 @@ impl Child {
         Ok(self.process.output().await?)
     }
 
-    #[cfg(not(windows))]
+    #[cfg(target_family = "wasm")]
+    pub async fn output(self) -> Result<std::process::Output> {
+        anyhow::bail!("process output is not supported in the browser")
+    }
+
+    #[cfg(all(not(windows), not(target_family = "wasm")))]
     pub fn kill(&mut self) -> Result<()> {
         let pid = self.process.id();
         unsafe {
@@ -120,13 +188,51 @@ impl Child {
         Ok(())
     }
 
-    #[cfg(windows)]
+    #[cfg(all(windows, not(target_family = "wasm")))]
     pub fn kill(&mut self) -> Result<()> {
         if let Some(job) = &self.job {
             job.terminate()
         } else {
             self.process.kill()?;
             Ok(())
+        }
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub fn kill(&mut self) -> Result<()> {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.kill()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub fn id(&self) -> u32 {
+        self.inner.as_ref().map(|c| c.id()).unwrap_or(0)
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub fn status(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<std::process::ExitStatus>> + 'static {
+        // Take the inner status future out so the returned future is 'static and
+        // callers can race it without holding `self`. The smol child is dropped
+        // after spawning its status future, but the exit notification is shared
+        // through the process-IO channel, so completion still fires.
+        let fut = self.inner.as_mut().map(|inner| inner.status());
+        async move {
+            match fut {
+                Some(fut) => Ok(fut.await?),
+                None => anyhow::bail!("process already exited"),
+            }
+        }
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub fn try_status(&mut self) -> Result<Option<std::process::ExitStatus>> {
+        match self.inner.as_mut() {
+            Some(inner) => Ok(inner.try_status()?),
+            None => Ok(None),
         }
     }
 }

@@ -1012,7 +1012,7 @@ impl<T: 'static + Send> AdaptiveBatcher<T> {
             let mut items_produced_so_far = 0_u64;
 
             let mut _schedule_flush_after_delay: Option<Task<()>> = None;
-            let _time_elapsed_since_start_of_search = std::time::Instant::now();
+            let _time_elapsed_since_start_of_search = web_time::Instant::now();
             let mut flush = pin!(flush_batch_rx);
             let mut terminating = false;
             loop {

@@ -316,75 +316,89 @@ async fn load_directory_shell_environment(
     load_direnv: DirenvSettings,
     tx: mpsc::UnboundedSender<String>,
 ) -> anyhow::Result<HashMap<String, String>> {
-    if let DirenvSettings::Disabled = load_direnv {
+    // On the browser client there is no local filesystem or login shell.
+    // Project paths live on the server and are accessed via RemoteFs / remote
+    // process RPC. Spawning a shell here would only hit the smol_wasm stubs
+    // (`stat ... fs not supported on WASM`). Return an empty env so LSP /
+    // toolchain setup can continue; real shell env belongs on the server.
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = (shell, abs_path, load_direnv, tx);
         return Ok(HashMap::default());
     }
 
-    let meta = smol::fs::metadata(&abs_path).await.with_context(|| {
-        tx.unbounded_send(format!("Failed to open {}", abs_path.display()))
-            .ok();
-        format!("stat {abs_path:?}")
-    })?;
+    #[cfg(not(target_family = "wasm"))]
+    {
+        if let DirenvSettings::Disabled = load_direnv {
+            return Ok(HashMap::default());
+        }
 
-    let dir = if meta.is_dir() {
-        abs_path.clone()
-    } else {
-        abs_path
-            .parent()
-            .with_context(|| {
-                tx.unbounded_send(format!("Failed to open {}", abs_path.display()))
-                    .ok();
-                format!("getting parent of {abs_path:?}")
-            })?
-            .into()
-    };
-
-    let (shell, args) = shell.program_and_args();
-    let mut envs = util::shell_env::capture(shell.clone(), args, abs_path)
-        .await
-        .with_context(|| {
-            tx.unbounded_send("Failed to load environment variables".into())
+        let meta = smol::fs::metadata(&abs_path).await.with_context(|| {
+            tx.unbounded_send(format!("Failed to open {}", abs_path.display()))
                 .ok();
-            format!("capturing shell environment with {shell:?}")
+            format!("stat {abs_path:?}")
         })?;
 
-    if cfg!(target_os = "windows")
-        && let Some(path) = envs.remove("Path")
-    {
-        // windows env vars are case-insensitive, so normalize the path var
-        // so we can just assume `PATH` in other places
-        envs.insert("PATH".into(), path);
-    }
-    // If the user selects `Direct` for direnv, it would set an environment
-    // variable that later uses to know that it should not run the hook.
-    // We would include in `.envs` call so it is okay to run the hook
-    // even if direnv direct mode is enabled.
-    let direnv_environment = match load_direnv {
-        DirenvSettings::ShellHook => None,
-        DirenvSettings::Disabled => bail!("direnv integration is disabled"),
-        // Note: direnv is not available on Windows, so we skip direnv processing
-        // and just return the shell environment
-        DirenvSettings::Direct if cfg!(target_os = "windows") => None,
-        DirenvSettings::Direct => load_direnv_environment(&envs, &dir)
+        let dir = if meta.is_dir() {
+            abs_path.clone()
+        } else {
+            abs_path
+                .parent()
+                .with_context(|| {
+                    tx.unbounded_send(format!("Failed to open {}", abs_path.display()))
+                        .ok();
+                    format!("getting parent of {abs_path:?}")
+                })?
+                .into()
+        };
+
+        let (shell, args) = shell.program_and_args();
+        let mut envs = util::shell_env::capture(shell.clone(), args, abs_path)
             .await
             .with_context(|| {
-                tx.unbounded_send("Failed to load direnv environment".into())
+                tx.unbounded_send("Failed to load environment variables".into())
                     .ok();
-                "load direnv environment"
-            })
-            .log_err(),
-    };
-    if let Some(direnv_environment) = direnv_environment {
-        for (key, value) in direnv_environment {
-            if let Some(value) = value {
-                envs.insert(key, value);
-            } else {
-                envs.remove(&key);
+                format!("capturing shell environment with {shell:?}")
+            })?;
+
+        if cfg!(target_os = "windows")
+            && let Some(path) = envs.remove("Path")
+        {
+            // windows env vars are case-insensitive, so normalize the path var
+            // so we can just assume `PATH` in other places
+            envs.insert("PATH".into(), path);
+        }
+        // If the user selects `Direct` for direnv, it would set an environment
+        // variable that later uses to know that it should not run the hook.
+        // We would include in `.envs` call so it is okay to run the hook
+        // even if direnv direct mode is enabled.
+        let direnv_environment = match load_direnv {
+            DirenvSettings::ShellHook => None,
+            DirenvSettings::Disabled => bail!("direnv integration is disabled"),
+            // Note: direnv is not available on Windows, so we skip direnv processing
+            // and just return the shell environment
+            DirenvSettings::Direct if cfg!(target_os = "windows") => None,
+            DirenvSettings::Direct => load_direnv_environment(&envs, &dir)
+                .await
+                .with_context(|| {
+                    tx.unbounded_send("Failed to load direnv environment".into())
+                        .ok();
+                    "load direnv environment"
+                })
+                .log_err(),
+        };
+        if let Some(direnv_environment) = direnv_environment {
+            for (key, value) in direnv_environment {
+                if let Some(value) = value {
+                    envs.insert(key, value);
+                } else {
+                    envs.remove(&key);
+                }
             }
         }
-    }
 
-    Ok(envs)
+        Ok(envs)
+    }
 }
 
 async fn load_direnv_environment(

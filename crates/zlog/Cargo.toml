@@ -15,6 +15,7 @@ path = "src/zlog.rs"
 default = []
 
 [dependencies]
+web-time.workspace = true
 collections.workspace = true
 chrono.workspace = true
 log.workspace = true

@@ -71,18 +71,15 @@ use crate::provider::open_ai::{
 use language_model::util::{fix_streamed_json, parse_tool_arguments};
 use open_ai::{ReasoningEffort, RequestError, ResponseStreamEvent};
 
+// Settings types live in bedrock_settings (shared with wasm builds).
+pub use crate::provider::bedrock_settings::{
+    AmazonBedrockSettings, BedrockAuthMethod, RESERVED_HEADER_NAMES,
+};
+
 actions!(bedrock, [Tab, TabPrev]);
 
 const PROVIDER_ID: LanguageModelProviderId = LanguageModelProviderId::new("amazon-bedrock");
 const PROVIDER_NAME: LanguageModelProviderName = LanguageModelProviderName::new("Amazon Bedrock");
-pub(crate) const RESERVED_HEADER_NAMES: &[&str] = &[
-    "host",
-    "x-amz-date",
-    "x-amz-security-token",
-    "x-amz-content-sha256",
-    "amz-sdk-invocation-id",
-    "amz-sdk-request",
-];
 
 /// Credentials stored in the keychain for static authentication.
 /// Region is handled separately since it's orthogonal to auth method.
@@ -128,45 +125,6 @@ impl BedrockCredentials {
             })
         } else {
             None
-        }
-    }
-}
-
-#[derive(Default, Clone, Debug, PartialEq)]
-pub struct AmazonBedrockSettings {
-    pub available_models: Vec<AvailableModel>,
-    pub mantle_available_models: Vec<MantleAvailableModel>,
-    pub custom_headers: CustomHeaders,
-    pub region: Option<String>,
-    pub endpoint: Option<String>,
-    pub profile_name: Option<String>,
-    pub role_arn: Option<String>,
-    pub authentication_method: Option<BedrockAuthMethod>,
-    pub allow_global: Option<bool>,
-    pub guardrail_identifier: Option<String>,
-    pub guardrail_version: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, EnumIter, IntoStaticStr, JsonSchema)]
-pub enum BedrockAuthMethod {
-    #[serde(rename = "named_profile")]
-    NamedProfile,
-    #[serde(rename = "sso")]
-    SingleSignOn,
-    #[serde(rename = "api_key")]
-    ApiKey,
-    /// IMDSv2, PodIdentity, env vars, etc.
-    #[serde(rename = "default")]
-    Automatic,
-}
-
-impl From<settings::BedrockAuthMethodContent> for BedrockAuthMethod {
-    fn from(value: settings::BedrockAuthMethodContent) -> Self {
-        match value {
-            settings::BedrockAuthMethodContent::SingleSignOn => BedrockAuthMethod::SingleSignOn,
-            settings::BedrockAuthMethodContent::Automatic => BedrockAuthMethod::Automatic,
-            settings::BedrockAuthMethodContent::NamedProfile => BedrockAuthMethod::NamedProfile,
-            settings::BedrockAuthMethodContent::ApiKey => BedrockAuthMethod::ApiKey,
         }
     }
 }

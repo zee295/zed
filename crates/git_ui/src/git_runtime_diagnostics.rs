@@ -68,6 +68,7 @@ pub async fn gather() -> Value {
 
 /// Walk the descendant tree of the current process and return a JSON array
 /// describing each descendant. Cross-platform; uses `sysinfo`.
+#[cfg(not(target_family = "wasm"))]
 fn collect_process_tree() -> anyhow::Result<Value> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind};
 
@@ -109,6 +110,11 @@ fn collect_process_tree() -> anyhow::Result<Value> {
         "descendant_count": entries.len(),
         "descendants": entries,
     }))
+}
+
+#[cfg(target_family = "wasm")]
+fn collect_process_tree() -> anyhow::Result<Value> {
+    Ok(Value::Object(Map::new()))
 }
 
 /// Scrub a process's reported argv to avoid leaking environment-variable
@@ -234,6 +240,7 @@ mod tests {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn descendants_of(system: &sysinfo::System, root: sysinfo::Pid) -> Vec<sysinfo::Pid> {
     let mut parent_map: std::collections::HashMap<sysinfo::Pid, Vec<sysinfo::Pid>> =
         std::collections::HashMap::new();

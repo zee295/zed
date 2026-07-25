@@ -66,7 +66,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering::SeqCst},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 use sum_tree::{Bias, Dimensions, Edit, KeyedItem, SeekTarget, SumTree, Summary, TreeMap, TreeSet};
 use text::{LineEnding, Rope};
@@ -75,6 +75,7 @@ use util::{
     paths::{PathMatcher, PathStyle, SanitizedPath, home_dir},
     rel_path::RelPath,
 };
+use web_time::Instant;
 pub use worktree_settings::WorktreeSettings;
 
 use crate::ignore::IgnoreKind;
@@ -92,6 +93,27 @@ pub const FS_WATCH_LATENCY: Duration = Duration::from_millis(100);
 /// * a directory opened in Zed — may be added as a visible entry to the current worktree
 ///
 /// Uses [`Entry`] to track the state of each file/directory, can look up absolute paths for entries.
+
+#[cfg(target_family = "wasm")]
+fn block_on_ready<T>(future: impl std::future::Future<Output = T>) -> T {
+    use std::pin::Pin;
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    fn noop_raw_waker() -> RawWaker {
+        static VTABLE: RawWakerVTable =
+            RawWakerVTable::new(|_| noop_raw_waker(), |_| {}, |_| {}, |_| {});
+        RawWaker::new(std::ptr::null(), &VTABLE)
+    }
+
+    let waker = unsafe { Waker::from_raw(noop_raw_waker()) };
+    let mut cx = Context::from_waker(&waker);
+    let mut future = Box::pin(future);
+    match Pin::as_mut(&mut future).poll(&mut cx) {
+        Poll::Ready(value) => value,
+        Poll::Pending => panic!("block_on_ready: future was not immediately ready"),
+    }
+}
+
 pub enum Worktree {
     Local(LocalWorktree),
     Remote(RemoteWorktree),
@@ -549,8 +571,11 @@ impl Worktree {
                         entry.is_hidden = settings.is_path_hidden(path);
                     }
                 }
+                #[cfg(not(target_family = "wasm"))]
                 cx.foreground_executor()
                     .block_on(snapshot.insert_entry(entry, fs.as_ref()));
+                #[cfg(target_family = "wasm")]
+                block_on_ready(snapshot.insert_entry(entry, fs.as_ref()));
             }
 
             let (scan_requests_tx, scan_requests_rx) = async_channel::unbounded();
@@ -5669,12 +5694,13 @@ impl BackgroundScanner {
         {
             for (parent_abs_path, ignore_stack) in ignores_to_update {
                 ignore_queue_tx
-                    .send_blocking(UpdateIgnoreStatusJob {
+                    .send(UpdateIgnoreStatusJob {
                         abs_path: parent_abs_path,
                         ignore_stack,
                         ignore_queue: ignore_queue_tx.clone(),
                         scan_queue: scan_job_tx.clone(),
                     })
+                    .await
                     .unwrap();
             }
         }
