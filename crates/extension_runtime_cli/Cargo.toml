@@ -1,0 +1,37 @@
+[package]
+name = "extension_runtime_cli"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "zed-extension-runtime"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+collections.workspace = true
+dap.workspace = true
+extension.workspace = true
+extension_host.workspace = true
+fs.workspace = true
+gpui.workspace = true
+gpui_platform = { workspace = true, features = ["runtime_shaders"] }
+gpui_tokio.workspace = true
+http_client.workspace = true
+language.workspace = true
+lsp.workspace = true
+node_runtime.workspace = true
+release_channel.workspace = true
+reqwest_client.workspace = true
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+settings.workspace = true
+smol.workspace = true
+task.workspace = true
+util.workspace = true
+watch.workspace = true
+which.workspace = true

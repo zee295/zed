@@ -1,0 +1,47 @@
+[package]
+name = "agent-client-protocol"
+version = "1.1.0"
+edition = "2024"
+rust-version = "1.88.0"
+authors = ["Zed <hi@zed.dev>"]
+license = "Apache-2.0"
+description = "Core protocol types and traits for the Agent Client Protocol (wasm-patched)"
+repository = "https://github.com/agentclientprotocol/rust-sdk"
+publish = false
+
+[features]
+default = []
+unstable = [
+    "unstable_auth_methods",
+    "unstable_elicitation",
+    "unstable_end_turn_token_usage",
+    "unstable_mcp_over_acp",
+    "unstable_session_fork",
+]
+unstable_auth_methods = ["agent-client-protocol-schema/unstable_auth_methods"]
+unstable_elicitation = ["agent-client-protocol-schema/unstable_elicitation"]
+unstable_end_turn_token_usage = ["agent-client-protocol-schema/unstable_end_turn_token_usage"]
+unstable_mcp_over_acp = ["agent-client-protocol-schema/unstable_mcp_over_acp"]
+unstable_session_fork = ["agent-client-protocol-schema/unstable_session_fork"]
+unstable_protocol_v2 = ["agent-client-protocol-schema/unstable_protocol_v2"]
+
+[dependencies]
+agent-client-protocol-schema = { version = "=1.4.0", features = ["tracing"] }
+agent-client-protocol-derive = "1.1.0"
+futures = "0.3.32"
+futures-concurrency = "7.6.3"
+rustc-hash = "2.1.1"
+schemars = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
+tracing = "0.1"
+uuid = { version = "1.18", features = ["v4"] }
+shell-words = "1.1"
+blocking = "1"
+
+# Subprocess spawn is host-only; browser wasm routes external agents via server RPC.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+async-process = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }

@@ -1,0 +1,37 @@
+[package]
+name = "zed_web_server"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "zed-web-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+clap = { workspace = true, features = ["env"] }
+futures.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["full"] }
+toml.workspace = true
+tracing.workspace = true
+
+axum = { version = "0.6", features = ["headers", "ws"] }
+flate2 = "1"
+fs2 = "0.4"
+hex = "0.4"
+hmac = "0.12"
+mime_guess = "2"
+portable-pty.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
+tar = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+walkdir = "2"

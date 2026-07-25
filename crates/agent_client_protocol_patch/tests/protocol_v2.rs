@@ -1,0 +1,728 @@
+#![cfg(feature = "unstable_protocol_v2")]
+
+use std::path::PathBuf;
+
+use agent_client_protocol::schema::{ProtocolVersion, v1, v2};
+use agent_client_protocol::{
+    Agent, Builder, Client, ConnectTo, Error, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
+    NullHandler, RawJsonRpcMessage, Role, UntypedRole,
+};
+use agent_client_protocol_test::testy::Testy;
+use futures::StreamExt as _;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "initialize", response = ForeignInitializeResponse)]
+struct ForeignInitializeRequest {
+    #[serde(rename = "protocolVersion")]
+    protocol_version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcResponse)]
+struct ForeignInitializeResponse {
+    #[serde(rename = "protocolVersion")]
+    protocol_version: String,
+}
+
+struct ForeignPeer;
+
+impl ConnectTo<UntypedRole> for ForeignPeer {
+    async fn connect_to(self, client: impl ConnectTo<UntypedRole>) -> Result<(), Error> {
+        UntypedRole
+            .builder()
+            .on_receive_request(
+                async |request: ForeignInitializeRequest, responder, _cx| {
+                    assert_eq!(request.protocol_version, "2025-06-18");
+                    responder.respond(ForeignInitializeResponse {
+                        protocol_version: request.protocol_version,
+                    })
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .connect_to(client)
+            .await
+    }
+}
+
+fn cwd() -> Result<PathBuf, Error> {
+    std::env::current_dir().map_err(Error::into_internal_error)
+}
+
+fn v2_implementation() -> v2::Implementation {
+    v2::Implementation::new("agent-client-protocol-test", env!("CARGO_PKG_VERSION"))
+}
+
+fn v1_implementation() -> v1::Implementation {
+    v1::Implementation::new("agent-client-protocol-test", env!("CARGO_PKG_VERSION"))
+}
+
+fn v1_initialize_request(protocol_version: ProtocolVersion) -> v1::InitializeRequest {
+    v1::InitializeRequest::new(protocol_version).client_info(v1_implementation())
+}
+
+fn v2_initialize_request(protocol_version: ProtocolVersion) -> v2::InitializeRequest {
+    v2::InitializeRequest::new(protocol_version, v2_implementation())
+}
+
+fn v2_initialize_response_with_session(
+    protocol_version: ProtocolVersion,
+) -> v2::InitializeResponse {
+    v2::InitializeResponse::new(protocol_version, v2_implementation())
+        .capabilities(v2::AgentCapabilities::new().session(v2::SessionCapabilities::new()))
+}
+
+#[cfg(feature = "unstable_mcp_over_acp")]
+fn json_value(value: impl Serialize) -> Result<Value, Error> {
+    serde_json::to_value(value).map_err(Error::into_internal_error)
+}
+
+async fn assert_malformed_initialize_rejected(params: Map<String, Value>) -> Result<(), Error> {
+    let agent = Agent.v2().on_receive_request(
+        async |_initialize: v2::InitializeRequest, responder, _cx| {
+            responder.respond_with_internal_error("handler should not run")
+        },
+        agent_client_protocol::on_receive_request!(),
+    );
+    let (mut channel, agent_future) = ConnectTo::<Client>::into_channel_and_future(agent);
+    let agent_task = tokio::spawn(agent_future);
+
+    channel
+        .tx
+        .unbounded_send(Ok(RawJsonRpcMessage::request(
+            "initialize".into(),
+            Value::Object(params),
+            v1::RequestId::Number(1),
+        )?))
+        .map_err(Error::into_internal_error)?;
+
+    while let Some(message) = channel.rx.next().await {
+        let message = message?;
+        let RawJsonRpcMessage::Response(response) = message else {
+            continue;
+        };
+        let v1::Response::Error { error, .. } = response else {
+            panic!("malformed initialize should fail");
+        };
+        assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+        let data = error
+            .data
+            .as_ref()
+            .and_then(|data| data.as_str())
+            .unwrap_or_default();
+        assert!(data.contains("protocolVersion"), "{error:?}");
+        agent_task.abort();
+        return Ok(());
+    }
+
+    agent_task.abort();
+    Err(agent_client_protocol::util::internal_error(
+        "agent did not respond to malformed initialize",
+    ))
+}
+
+async fn assert_v2_client_rejected_by_v1_agent(agent: impl ConnectTo<Client>) -> Result<(), Error> {
+    Client
+        .v2()
+        .connect_with(agent, async |cx| {
+            let error = cx
+                .send_request(v2_initialize_request(ProtocolVersion::V2))
+                .block_task()
+                .await
+                .expect_err("v1 agent protocol mode should reject v2 clients");
+            let data = error
+                .data
+                .as_ref()
+                .and_then(|data| data.as_str())
+                .unwrap_or_default();
+            assert!(
+                data.contains("required ACP protocol version 2"),
+                "{error:?}"
+            );
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn non_acp_initialize_is_not_rewritten() -> Result<(), Error> {
+    UntypedRole
+        .builder()
+        .connect_with(ForeignPeer, async |cx| {
+            let response = cx
+                .send_request(ForeignInitializeRequest {
+                    protocol_version: "2025-06-18".into(),
+                })
+                .block_task()
+                .await?;
+
+            assert_eq!(response.protocol_version, "2025-06-18");
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v2_agent_rejects_initialize_without_protocol_version() -> Result<(), Error> {
+    assert_malformed_initialize_rejected(Map::new()).await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v2_agent_rejects_initialize_with_malformed_protocol_version() -> Result<(), Error> {
+    let mut params = Map::new();
+    params.insert("protocolVersion".into(), serde_json::json!(100_000));
+
+    assert_malformed_initialize_rejected(params).await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn role_builder_v1_agent_rejects_v2_client_negotiation() -> Result<(), Error> {
+    let agent = <Agent as Role>::builder(Agent).on_receive_request(
+        async |initialize: v1::InitializeRequest, responder, _cx| {
+            assert_eq!(initialize.protocol_version, ProtocolVersion::V1);
+            responder.respond(v1::InitializeResponse::new(initialize.protocol_version))
+        },
+        agent_client_protocol::on_receive_request!(),
+    );
+
+    Client
+        .v2()
+        .connect_with(agent, async |cx| {
+            let error = cx
+                .send_request(v2_initialize_request(ProtocolVersion::V2))
+                .block_task()
+                .await
+                .expect_err("Role::builder should preserve v1 agent protocol mode");
+            let data = error
+                .data
+                .as_ref()
+                .and_then(|data| data.as_str())
+                .unwrap_or_default();
+            assert!(
+                data.contains("required ACP protocol version 2"),
+                "{error:?}"
+            );
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn builder_new_v1_agent_rejects_v2_client_negotiation() -> Result<(), Error> {
+    let agent = Builder::new(Agent).on_receive_request(
+        async |initialize: v1::InitializeRequest, responder, _cx| {
+            assert_eq!(initialize.protocol_version, ProtocolVersion::V1);
+            responder.respond(v1::InitializeResponse::new(initialize.protocol_version))
+        },
+        agent_client_protocol::on_receive_request!(),
+    );
+
+    assert_v2_client_rejected_by_v1_agent(agent).await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn builder_new_with_v1_agent_rejects_v2_client_negotiation() -> Result<(), Error> {
+    let agent = Builder::new_with(Agent, NullHandler).on_receive_request(
+        async |initialize: v1::InitializeRequest, responder, _cx| {
+            assert_eq!(initialize.protocol_version, ProtocolVersion::V1);
+            responder.respond(v1::InitializeResponse::new(initialize.protocol_version))
+        },
+        agent_client_protocol::on_receive_request!(),
+    );
+
+    assert_v2_client_rejected_by_v1_agent(agent).await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn role_builder_v1_client_downgrades_initialize_for_v2_agent() -> Result<(), Error> {
+    let agent = Agent.v2().on_receive_request(
+        async |initialize: v2::InitializeRequest, responder, _cx| {
+            assert_eq!(initialize.protocol_version, ProtocolVersion::V2);
+            responder.respond(v2_initialize_response_with_session(
+                initialize.protocol_version,
+            ))
+        },
+        agent_client_protocol::on_receive_request!(),
+    );
+
+    <Client as Role>::builder(Client)
+        .connect_with(agent, async |cx| {
+            let initialize = cx
+                .send_request(v1_initialize_request(ProtocolVersion::V2))
+                .block_task()
+                .await?;
+            assert_eq!(initialize.protocol_version, ProtocolVersion::V1);
+            Ok(())
+        })
+        .await
+}
+
+#[test]
+fn v2_extension_enum_parsing_preserves_method_prefix() -> Result<(), Error> {
+    let params = serde_json::json!({ "payload": true });
+
+    let request = v2::ClientRequest::parse_message("_vendor/request", &params)?;
+    assert_eq!(request.method(), "_vendor/request");
+    let untyped_request = request.to_untyped_message()?;
+    assert_eq!(untyped_request.method(), "_vendor/request");
+    assert_eq!(untyped_request.params(), &params);
+
+    let notification = v2::AgentNotification::parse_message("_vendor/notify", &params)?;
+    assert_eq!(notification.method(), "_vendor/notify");
+    let untyped_notification = notification.to_untyped_message()?;
+    assert_eq!(untyped_notification.method(), "_vendor/notify");
+    assert_eq!(untyped_notification.params(), &params);
+
+    Ok(())
+}
+
+#[test]
+fn v2_schema_1_4_method_names_are_jsonrpc_mapped() -> Result<(), Error> {
+    fn assert_request<Req: JsonRpcRequest>() {}
+    fn assert_notification<Notif: agent_client_protocol::JsonRpcNotification>() {}
+
+    assert_request::<v2::LoginAuthRequest>();
+    assert_request::<v2::LogoutAuthRequest>();
+    assert_notification::<v2::CancelRequestNotification>();
+    assert_notification::<v2::CancelSessionNotification>();
+    assert_notification::<v2::UpdateSessionNotification>();
+
+    let login_params = serde_json::json!({ "methodId": "browser" });
+    let login = v2::LoginAuthRequest::parse_message("auth/login", &login_params)?;
+    assert_eq!(login.method(), "auth/login");
+    let client_request = v2::ClientRequest::parse_message("auth/login", &login_params)?;
+    assert!(matches!(
+        client_request,
+        v2::ClientRequest::LoginAuthRequest(_)
+    ));
+    let login_response = v2::AgentResponse::from_value("auth/login", serde_json::json!({}))?;
+    assert!(matches!(
+        login_response,
+        v2::AgentResponse::LoginAuthResponse(_)
+    ));
+
+    let logout = v2::LogoutAuthRequest::parse_message("auth/logout", &serde_json::json!({}))?;
+    assert_eq!(logout.method(), "auth/logout");
+    let client_request = v2::ClientRequest::parse_message("auth/logout", &serde_json::json!({}))?;
+    assert!(matches!(
+        client_request,
+        v2::ClientRequest::LogoutAuthRequest(_)
+    ));
+    let logout_response = v2::AgentResponse::from_value("auth/logout", serde_json::json!({}))?;
+    assert!(matches!(
+        logout_response,
+        v2::AgentResponse::LogoutAuthResponse(_)
+    ));
+
+    let cancel_params = serde_json::json!({ "requestId": "req-1" });
+    let cancel = v2::CancelRequestNotification::parse_message("$/cancel_request", &cancel_params)?;
+    assert_eq!(cancel.method(), "$/cancel_request");
+    let protocol_notification =
+        v2::ProtocolLevelNotification::parse_message("$/cancel_request", &cancel_params)?;
+    assert!(matches!(
+        protocol_notification,
+        v2::ProtocolLevelNotification::CancelRequestNotification(_)
+    ));
+
+    let session_cancel_params = serde_json::json!({ "sessionId": "session-1" });
+    let session_cancel =
+        v2::CancelSessionNotification::parse_message("session/cancel", &session_cancel_params)?;
+    assert_eq!(session_cancel.method(), "session/cancel");
+    let client_notification =
+        v2::ClientNotification::parse_message("session/cancel", &session_cancel_params)?;
+    assert!(matches!(
+        client_notification,
+        v2::ClientNotification::CancelSessionNotification(_)
+    ));
+
+    let update_params = serde_json::json!({
+        "sessionId": "session-1",
+        "update": { "sessionUpdate": "_custom" }
+    });
+    let update = v2::UpdateSessionNotification::parse_message("session/update", &update_params)?;
+    assert_eq!(update.method(), "session/update");
+    let agent_notification =
+        v2::AgentNotification::parse_message("session/update", &update_params)?;
+    assert!(matches!(
+        agent_notification,
+        v2::AgentNotification::UpdateSessionNotification(_)
+    ));
+
+    Ok(())
+}
+
+#[cfg(feature = "unstable_mcp_over_acp")]
+#[test]
+fn mcp_over_acp_variants_are_jsonrpc_mapped() -> Result<(), Error> {
+    fn assert_request<Req: JsonRpcRequest>() {}
+    fn assert_notification<Notif: agent_client_protocol::JsonRpcNotification>() {}
+
+    macro_rules! assert_message_mapping {
+        ($ty:ty, $method:literal, $params:expr, $pattern:pat) => {{
+            let message = <$ty as JsonRpcMessage>::parse_message($method, &$params)?;
+            assert_eq!(message.method(), $method);
+            assert_eq!(message.to_untyped_message()?.method(), $method);
+            assert!(matches!(message, $pattern));
+        }};
+    }
+
+    macro_rules! assert_response_mapping {
+        ($ty:ty, $method:literal, $value:expr, $pattern:pat) => {{
+            let response = <$ty as JsonRpcResponse>::from_value($method, $value)?;
+            assert!(matches!(response, $pattern));
+        }};
+    }
+
+    assert_request::<v2::ConnectMcpRequest>();
+    assert_request::<v2::MessageMcpRequest>();
+    assert_request::<v2::DisconnectMcpRequest>();
+    assert_notification::<v2::MessageMcpNotification>();
+
+    assert_message_mapping!(
+        v1::ClientRequest,
+        "mcp/message",
+        json_value(v1::MessageMcpRequest::new("conn-1", "tools/list"))?,
+        v1::ClientRequest::MessageMcpRequest(_)
+    );
+    assert_response_mapping!(
+        v1::AgentResponse,
+        "mcp/message",
+        serde_json::json!({ "tools": [] }),
+        v1::AgentResponse::MessageMcpResponse(_)
+    );
+    assert_message_mapping!(
+        v1::ClientNotification,
+        "mcp/message",
+        json_value(v1::MessageMcpNotification::new(
+            "conn-1",
+            "notifications/tools/list"
+        ))?,
+        v1::ClientNotification::MessageMcpNotification(_)
+    );
+    assert_message_mapping!(
+        v1::AgentRequest,
+        "mcp/connect",
+        json_value(v1::ConnectMcpRequest::new("server-1"))?,
+        v1::AgentRequest::ConnectMcpRequest(_)
+    );
+    assert_message_mapping!(
+        v1::AgentRequest,
+        "mcp/message",
+        json_value(v1::MessageMcpRequest::new("conn-1", "tools/list"))?,
+        v1::AgentRequest::MessageMcpRequest(_)
+    );
+    assert_message_mapping!(
+        v1::AgentRequest,
+        "mcp/disconnect",
+        json_value(v1::DisconnectMcpRequest::new("conn-1"))?,
+        v1::AgentRequest::DisconnectMcpRequest(_)
+    );
+    assert_response_mapping!(
+        v1::ClientResponse,
+        "mcp/connect",
+        json_value(v1::ConnectMcpResponse::new("conn-1"))?,
+        v1::ClientResponse::ConnectMcpResponse(_)
+    );
+    assert_response_mapping!(
+        v1::ClientResponse,
+        "mcp/message",
+        serde_json::json!({ "tools": [] }),
+        v1::ClientResponse::MessageMcpResponse(_)
+    );
+    assert_response_mapping!(
+        v1::ClientResponse,
+        "mcp/disconnect",
+        serde_json::json!({}),
+        v1::ClientResponse::DisconnectMcpResponse(_)
+    );
+    assert_message_mapping!(
+        v1::AgentNotification,
+        "mcp/message",
+        json_value(v1::MessageMcpNotification::new(
+            "conn-1",
+            "notifications/tools/list"
+        ))?,
+        v1::AgentNotification::MessageMcpNotification(_)
+    );
+
+    assert_message_mapping!(
+        v2::MessageMcpRequest,
+        "mcp/message",
+        json_value(v2::MessageMcpRequest::new("conn-1", "tools/list"))?,
+        v2::MessageMcpRequest { .. }
+    );
+    assert_message_mapping!(
+        v2::MessageMcpNotification,
+        "mcp/message",
+        json_value(v2::MessageMcpNotification::new(
+            "conn-1",
+            "notifications/tools/list"
+        ))?,
+        v2::MessageMcpNotification { .. }
+    );
+    assert_message_mapping!(
+        v2::ConnectMcpRequest,
+        "mcp/connect",
+        json_value(v2::ConnectMcpRequest::new("server-1"))?,
+        v2::ConnectMcpRequest { .. }
+    );
+    assert_message_mapping!(
+        v2::DisconnectMcpRequest,
+        "mcp/disconnect",
+        json_value(v2::DisconnectMcpRequest::new("conn-1"))?,
+        v2::DisconnectMcpRequest { .. }
+    );
+
+    assert_message_mapping!(
+        v2::ClientRequest,
+        "mcp/message",
+        json_value(v2::MessageMcpRequest::new("conn-1", "tools/list"))?,
+        v2::ClientRequest::MessageMcpRequest(_)
+    );
+    assert_response_mapping!(
+        v2::AgentResponse,
+        "mcp/message",
+        serde_json::json!({ "tools": [] }),
+        v2::AgentResponse::MessageMcpResponse(_)
+    );
+    assert_message_mapping!(
+        v2::ClientNotification,
+        "mcp/message",
+        json_value(v2::MessageMcpNotification::new(
+            "conn-1",
+            "notifications/tools/list"
+        ))?,
+        v2::ClientNotification::MessageMcpNotification(_)
+    );
+    assert_message_mapping!(
+        v2::AgentRequest,
+        "mcp/connect",
+        json_value(v2::ConnectMcpRequest::new("server-1"))?,
+        v2::AgentRequest::ConnectMcpRequest(_)
+    );
+    assert_message_mapping!(
+        v2::AgentRequest,
+        "mcp/message",
+        json_value(v2::MessageMcpRequest::new("conn-1", "tools/list"))?,
+        v2::AgentRequest::MessageMcpRequest(_)
+    );
+    assert_message_mapping!(
+        v2::AgentRequest,
+        "mcp/disconnect",
+        json_value(v2::DisconnectMcpRequest::new("conn-1"))?,
+        v2::AgentRequest::DisconnectMcpRequest(_)
+    );
+    assert_response_mapping!(
+        v2::ClientResponse,
+        "mcp/connect",
+        json_value(v2::ConnectMcpResponse::new("conn-1"))?,
+        v2::ClientResponse::ConnectMcpResponse(_)
+    );
+    assert_response_mapping!(
+        v2::ClientResponse,
+        "mcp/message",
+        serde_json::json!({ "tools": [] }),
+        v2::ClientResponse::MessageMcpResponse(_)
+    );
+    assert_response_mapping!(
+        v2::ClientResponse,
+        "mcp/disconnect",
+        serde_json::json!({}),
+        v2::ClientResponse::DisconnectMcpResponse(_)
+    );
+    assert_message_mapping!(
+        v2::AgentNotification,
+        "mcp/message",
+        json_value(v2::MessageMcpNotification::new(
+            "conn-1",
+            "notifications/tools/list"
+        ))?,
+        v2::AgentNotification::MessageMcpNotification(_)
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v2_agent_serves_v1_client_with_v2_handlers() -> Result<(), Error> {
+    let agent = Agent
+        .v2()
+        .on_receive_request(
+            async |initialize: v2::InitializeRequest, responder, _cx| {
+                assert_eq!(initialize.protocol_version, ProtocolVersion::V2);
+                // The compatibility layer should force this back to the negotiated v1 wire version.
+                responder.respond(v2_initialize_response_with_session(ProtocolVersion::V2))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async |request: v2::NewSessionRequest, responder, _cx| {
+                assert!(request.cwd.is_absolute());
+                responder.respond(v2::NewSessionResponse::new(v2::SessionId::new(
+                    "v2-session",
+                )))
+            },
+            agent_client_protocol::on_receive_request!(),
+        );
+
+    Client
+        .builder()
+        .connect_with(agent, async |cx| {
+            let initialize = cx
+                .send_request(v1_initialize_request(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            assert_eq!(initialize.protocol_version, ProtocolVersion::V1);
+
+            let session = cx
+                .send_request(v1::NewSessionRequest::new(cwd()?))
+                .block_task()
+                .await?;
+            assert_eq!(session.session_id.0.as_ref(), "v2-session");
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v2_client_rejects_v1_agent() -> Result<(), Error> {
+    Client
+        .v2()
+        .connect_with(Testy::new(), async |cx| {
+            let error = cx
+                .send_request(v2_initialize_request(ProtocolVersion::V1))
+                .block_task()
+                .await
+                .expect_err("v2 clients require a v2 agent");
+            let data = error
+                .data
+                .as_ref()
+                .and_then(|data| data.as_str())
+                .unwrap_or_default();
+            assert!(
+                data.contains("required ACP protocol version 2"),
+                "{error:?}"
+            );
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v2_client_and_agent_negotiate_v2() -> Result<(), Error> {
+    let agent = Agent
+        .v2()
+        .on_receive_request(
+            async |initialize: v2::InitializeRequest, responder, _cx| {
+                assert_eq!(initialize.protocol_version, ProtocolVersion::V2);
+                responder.respond(v2_initialize_response_with_session(
+                    initialize.protocol_version,
+                ))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async |request: v2::NewSessionRequest, responder, _cx| {
+                assert!(request.cwd.is_absolute());
+                responder.respond(v2::NewSessionResponse::new(v2::SessionId::new(
+                    "v2-native-session",
+                )))
+            },
+            agent_client_protocol::on_receive_request!(),
+        );
+
+    Client
+        .v2()
+        .connect_with(agent, async |cx| {
+            let initialize = cx
+                .send_request(v2_initialize_request(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            assert_eq!(initialize.protocol_version, ProtocolVersion::V2);
+
+            let session = cx
+                .send_request(v2::NewSessionRequest::new(cwd()?))
+                .block_task()
+                .await?;
+            assert_eq!(session.session_id.0.as_ref(), "v2-native-session");
+            Ok(())
+        })
+        .await
+}
+
+/// A v2 agent whose `session/new` handler only responds once the peer cancels
+/// the request via `$/cancel_request`.
+fn v2_agent_with_cancellable_new_session()
+-> Builder<Agent, impl agent_client_protocol::HandleDispatchFrom<Client>> {
+    Agent
+        .v2()
+        .on_receive_request(
+            async |initialize: v2::InitializeRequest, responder, _cx| {
+                responder.respond(v2_initialize_response_with_session(
+                    initialize.protocol_version,
+                ))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async |_request: v2::NewSessionRequest, responder, cx| {
+                let cancellation = responder.cancellation();
+                cx.spawn(async move {
+                    let response = cancellation
+                        .run_until_cancelled(std::future::pending::<
+                            Result<v2::NewSessionResponse, Error>,
+                        >())
+                        .await;
+                    responder.respond_with_result(response)
+                })?;
+                Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v2_client_can_cancel_request_to_v2_agent() -> Result<(), Error> {
+    Client
+        .v2()
+        .connect_with(v2_agent_with_cancellable_new_session(), async |cx| {
+            let initialize = cx
+                .send_request(v2_initialize_request(ProtocolVersion::V2))
+                .block_task()
+                .await?;
+            assert_eq!(initialize.protocol_version, ProtocolVersion::V2);
+
+            let request = cx.send_request(v2::NewSessionRequest::new(cwd()?));
+            request.cancel()?;
+            let error = request
+                .block_task()
+                .await
+                .expect_err("request should be cancelled");
+            assert_eq!(i32::from(error.code), -32800);
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v1_client_can_cancel_request_to_v2_agent() -> Result<(), Error> {
+    Client
+        .builder()
+        .connect_with(v2_agent_with_cancellable_new_session(), async |cx| {
+            let initialize = cx
+                .send_request(v1_initialize_request(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            assert_eq!(initialize.protocol_version, ProtocolVersion::V1);
+
+            let request = cx.send_request(v1::NewSessionRequest::new(cwd()?));
+            request.cancel()?;
+            let error = request
+                .block_task()
+                .await
+                .expect_err("request should be cancelled");
+            assert_eq!(i32::from(error.code), -32800);
+            Ok(())
+        })
+        .await
+}

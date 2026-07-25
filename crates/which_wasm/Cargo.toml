@@ -1,0 +1,9 @@
+[package]
+name = "which"
+version = "6.0.3"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+which-real = { path = "real" }

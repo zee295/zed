@@ -1,0 +1,119 @@
+[package]
+name = "zed_web_workspace"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "zed_web_workspace"
+path = "src/main.rs"
+
+[dependencies]
+# Core app shell
+gpui.workspace = true
+gpui_platform.workspace = true
+gpui_web.workspace = true
+workspace.workspace = true
+client.workspace = true
+project.workspace = true
+language.workspace = true
+lsp.workspace = true
+async-trait.workspace = true
+editor.workspace = true
+multi_buffer.workspace = true
+node_runtime.workspace = true
+session.workspace = true
+settings.workspace = true
+task.workspace = true
+theme.workspace = true
+theme_settings.workspace = true
+clock.workspace = true
+http_client.workspace = true
+db.workspace = true
+dap.workspace = true
+dap_adapters.workspace = true
+sqlez.workspace = true
+fs.workspace = true
+smol.workspace = true
+util.workspace = true
+anyhow.workspace = true
+log.workspace = true
+collections.workspace = true
+release_channel.workspace = true
+feature_flags.workspace = true
+paths.workspace = true
+futures.workspace = true
+semver.workspace = true
+uuid.workspace = true
+menu.workspace = true
+zed_actions.workspace = true
+assets.workspace = true
+
+# Desktop UI crates that compile for wasm
+project_panel.workspace = true
+outline_panel.workspace = true
+git_ui.workspace = true
+command_palette.workspace = true
+file_finder.workspace = true
+search.workspace = true
+outline.workspace = true
+go_to_line.workspace = true
+tab_switcher.workspace = true
+project_symbols.workspace = true
+diagnostics.workspace = true
+debugger_ui.workspace = true
+terminal.workspace = true
+terminal_view.workspace = true
+image_viewer.workspace = true
+markdown_preview.workspace = true
+csv_preview.workspace = true
+svg_preview.workspace = true
+language_selector.workspace = true
+encoding_selector.workspace = true
+line_ending_selector.workspace = true
+toolchain_selector.workspace = true
+theme_selector.workspace = true
+tasks_ui.workspace = true
+snippets_ui.workspace = true
+snippet_provider.workspace = true
+which_key.workspace = true
+breadcrumbs.workspace = true
+ui.workspace = true
+language_model.workspace = true
+platform_title_bar.workspace = true
+agent-client-protocol.workspace = true
+agent_settings.workspace = true
+agent_ui.workspace = true
+language_models.workspace = true
+prompt_store.workspace = true
+settings_ui.workspace = true
+keymap_editor.workspace = true
+extensions_ui.workspace = true
+sidebar.workspace = true
+open_path_prompt.workspace = true
+recent_projects.workspace = true
+watch.workspace = true
+activity_indicator.workspace = true
+language_tools.workspace = true
+edit_prediction.workspace = true
+edit_prediction_ui.workspace = true
+
+# Remote shims
+wasm_remote = { workspace = true }
+wasm_rpc = { workspace = true }
+text.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smallvec.workspace = true
+tar = "0.4"
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["console", "Location", "Window"] }
+# The `instant` crate (via fastrand→futures-lite) exports an undefined `now`
+# symbol on wasm unless its wasm-bindgen feature is on; enable it here so the
+# unified build links.
+instant = { version = "0.1", features = ["wasm-bindgen"] }

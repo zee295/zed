@@ -1,0 +1,37 @@
+[package]
+name = "zed_web_poc"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "zed_web_poc"
+path = "src/main.rs"
+
+[dependencies]
+gpui.workspace = true
+gpui_platform.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+web-time = "1"
+futures.workspace = true
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+fs.workspace = true
+smol.workspace = true
+wasm_remote = { workspace = true }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "console",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "Window",
+    "WebSocket",
+    "MessageEvent",
+    "Event",
+    "DomTokenList",
+]}

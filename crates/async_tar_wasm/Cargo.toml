@@ -1,0 +1,12 @@
+[package]
+name = "async-tar"
+version = "0.6.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+async-tar-real = { path = "real" }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+futures-core = "0.3"
