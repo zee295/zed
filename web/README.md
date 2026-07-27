@@ -17,6 +17,15 @@ ZED_WORKSPACE="$PWD/workspace" docker compose -f web/compose.yml up -d
 Open `http://127.0.0.1:8090`. On first start, the server creates an access token
 at `<workspace>/.zed/web-auth-token`. Use that token on the login page.
 
+The same tested multi-architecture release is mirrored to Docker Hub after each
+successful build. To use that registry instead, set:
+
+```sh
+ZED_WEB_IMAGE=docker.io/<dockerhub-user>/zed-web:latest \
+ZED_WORKSPACE="$PWD/workspace" \
+docker compose -f web/compose.yml up -d
+```
+
 To provide a stable token:
 
 ```sh

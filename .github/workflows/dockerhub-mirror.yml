@@ -1,0 +1,56 @@
+name: Docker Hub Mirror
+
+on:
+  workflow_run:
+    workflows: ["Zed Web"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dockerhub-mirror
+  cancel-in-progress: true
+
+jobs:
+  mirror:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'zed-web')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Install registry copy tool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends skopeo
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Mirror multi-architecture image
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          source_image="docker://ghcr.io/${{ github.repository_owner }}/zed-web:latest"
+          target_image="docker://docker.io/${DOCKERHUB_USERNAME}/zed-web"
+          auth_file="${HOME}/.docker/config.json"
+
+          skopeo copy --all \
+            --src-no-creds \
+            --dest-authfile "${auth_file}" \
+            "${source_image}" \
+            "${target_image}:latest"
+
+          if [[ -n "${RELEASE_SHA}" ]]; then
+            skopeo copy --all \
+              --src-no-creds \
+              --dest-authfile "${auth_file}" \
+              "${source_image}" \
+              "${target_image}:zed-web-${RELEASE_SHA}"
+          fi
