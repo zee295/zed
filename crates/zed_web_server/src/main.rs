@@ -547,7 +547,6 @@ fn canonical_workspace_location(uri: &axum::http::Uri, root: &Path) -> Option<St
                     .as_deref()
                     .filter(|path| *path == "/workspace" || path.starts_with("/workspace/"))
             {
-                changed = true;
                 let relative = path
                     .strip_prefix("/workspace")
                     .unwrap_or_default()
@@ -557,6 +556,7 @@ fn canonical_workspace_location(uri: &axum::http::Uri, root: &Path) -> Option<St
                 } else {
                     root.join(relative)
                 };
+                changed |= canonical != Path::new(path);
                 format!("path={}", urlencoding::encode(&canonical.to_string_lossy()))
             } else {
                 parameter.to_string()
@@ -720,6 +720,16 @@ mod tests {
         assert_eq!(
             canonical_workspace_location(&uri, Path::new("/srv/project")),
             Some("/?path=%2Fsrv%2Fproject".to_string())
+        );
+    }
+
+    #[test]
+    fn leaves_workspace_root_unchanged_when_it_is_the_real_root() {
+        let uri = "/?path=%2Fworkspace".parse::<axum::http::Uri>().unwrap();
+
+        assert_eq!(
+            canonical_workspace_location(&uri, Path::new("/workspace")),
+            None
         );
     }
 }

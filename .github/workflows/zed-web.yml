@@ -89,7 +89,7 @@ jobs:
             WEB_REVISION=${{ github.sha }}
             UPSTREAM_REVISION=${{ steps.revisions.outputs.upstream }}
           cache-from: type=gha,scope=zed-web-${{ matrix.architecture }}
-          cache-to: type=gha,mode=max,scope=zed-web-${{ matrix.architecture }}
+          cache-to: type=gha,mode=max,ignore-error=true,scope=zed-web-${{ matrix.architecture }}
 
   manifest:
     if: github.event_name != 'pull_request'
