@@ -203,6 +203,7 @@ pub struct RpcClient {
     outgoing: mpsc::UnboundedSender<String>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
     notifications: Arc<Mutex<HashMap<String, Box<dyn Fn(Value) + Send>>>>,
+    reconnect_subscribers: Arc<Mutex<Vec<mpsc::UnboundedSender<u64>>>>,
     next_id: Arc<AtomicU64>,
     /// `true` once the browser WebSocket reaches the OPEN state.
     is_open: Arc<AtomicBool>,
@@ -221,7 +222,11 @@ impl RpcClient {
             Arc::new(Mutex::new(HashMap::new()));
         let notifications: Arc<Mutex<HashMap<String, Box<dyn Fn(Value) + Send>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let reconnect_subscribers: Arc<Mutex<Vec<mpsc::UnboundedSender<u64>>>> =
+            Arc::new(Mutex::new(Vec::new()));
         let is_open = Arc::new(AtomicBool::new(false));
+        let has_opened = Arc::new(AtomicBool::new(false));
+        let reconnect_generation = Arc::new(AtomicU64::new(0));
 
         // Gate the outgoing pump on the open event so we never drop messages
         // that race the CONNECTING → OPEN transition.
@@ -236,8 +241,16 @@ impl RpcClient {
             let is_open = is_open.clone();
             let open_tx = open_tx.clone();
             let gate_tx = gate_tx.clone();
+            let has_opened = has_opened.clone();
+            let reconnect_generation = reconnect_generation.clone();
+            let reconnect_subscribers = reconnect_subscribers.clone();
             move || {
                 is_open.store(true, Ordering::SeqCst);
+                if has_opened.swap(true, Ordering::SeqCst) {
+                    let generation = reconnect_generation.fetch_add(1, Ordering::SeqCst) + 1;
+                    lock_shared(&reconnect_subscribers)
+                        .retain(|subscriber| subscriber.unbounded_send(generation).is_ok());
+                }
                 if let Some(sender) = lock_shared(&open_tx).take() {
                     let _ = sender.send(());
                 }
@@ -372,6 +385,7 @@ impl RpcClient {
             outgoing: outgoing_tx,
             pending,
             notifications,
+            reconnect_subscribers,
             next_id: Arc::new(AtomicU64::new(1)),
             is_open,
             open: Arc::new(Mutex::new(Some(open_rx))),
@@ -438,5 +452,15 @@ impl RpcClient {
 
     pub fn on_notification<F: Fn(Value) + Send + 'static>(&self, method: &str, handler: F) {
         lock_shared(&self.notifications).insert(method.to_string(), Box::new(handler));
+    }
+
+    /// Subscribe to successful WebSocket reconnections after the initial connection.
+    ///
+    /// Stateful RPC consumers use this to reattach server-owned resources and
+    /// refresh UI state that may have changed while the browser was offline.
+    pub fn subscribe_reconnect(&self) -> mpsc::UnboundedReceiver<u64> {
+        let (sender, receiver) = mpsc::unbounded();
+        lock_shared(&self.reconnect_subscribers).push(sender);
+        receiver
     }
 }

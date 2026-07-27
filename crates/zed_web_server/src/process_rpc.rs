@@ -30,6 +30,7 @@ pub fn handles_streaming(method: &str) -> bool {
             | "Process::write_stdin"
             | "Process::close_stdin"
             | "Process::kill"
+            | "Process::attach"
             | "Process::running_sessions"
     )
 }
@@ -138,12 +139,12 @@ impl ProcessManager {
         params: &Value,
         owner_generation: u64,
     ) -> Result<Value> {
-        self.reap_disconnected();
         match method {
             "Process::spawn" => self.spawn(params, owner_generation).await,
             "Process::write_stdin" => self.write_stdin(params).await,
             "Process::close_stdin" => self.close_stdin(params).await,
             "Process::kill" => self.kill(params),
+            "Process::attach" => self.attach(params, owner_generation),
             "Process::running_sessions" => self.running_sessions(),
             _ => bail!("unknown streaming process method: {method}"),
         }
@@ -288,21 +289,25 @@ impl ProcessManager {
                 entry.disconnected = true;
             }
         }
-        self.reap_disconnected();
     }
 
-    fn reap_disconnected(&mut self) {
-        self.processes.retain(|_, entry| {
-            let has_running_prompt = entry
-                .acp_activity
-                .lock()
-                .is_ok_and(|activity| !activity.prompts.is_empty());
-            let retain = !entry.disconnected || has_running_prompt;
-            if !retain {
-                entry.task.abort();
+    fn attach(&mut self, params: &Value, owner_generation: u64) -> Result<Value> {
+        let proc_ids = params
+            .get("proc_ids")
+            .and_then(Value::as_array)
+            .context("missing process ids")?;
+        let mut attached = Vec::new();
+        let mut missing = Vec::new();
+        for proc_id in proc_ids.iter().filter_map(Value::as_u64) {
+            if let Some(entry) = self.processes.get_mut(&proc_id) {
+                entry.owner_generation = owner_generation;
+                entry.disconnected = false;
+                attached.push(proc_id);
+            } else {
+                missing.push(proc_id);
             }
-            retain
-        });
+        }
+        Ok(json!({"attached": attached, "missing": missing}))
     }
 
     async fn write_stdin(&self, params: &Value) -> Result<Value> {
@@ -740,7 +745,14 @@ fn sanitize_lldb_frame(frame: Vec<u8>) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AcpActivity, FrameRewriter, sanitize_lldb_frame};
+    use std::sync::Arc;
+
+    use axum::extract::ws::Message;
+    use serde_json::json;
+    use tokio::sync::mpsc;
+
+    use super::{AcpActivity, FrameRewriter, ProcessManager, sanitize_lldb_frame};
+    use crate::fs_rpc::FsRpc;
 
     #[test]
     fn tracks_acp_prompt_until_response() {
@@ -757,6 +769,53 @@ mod tests {
         activity.feed_output(br#"{"jsonrpc":"2.0","id":17,"result":{"stopReason":"end_turn"}}"#);
         activity.feed_output(b"\n");
         assert!(activity.prompts.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconnect_reattaches_streaming_process_without_stopping_it() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let fs = Arc::new(FsRpc::new(root.path().to_path_buf(), false)?);
+        let (outgoing, _notifications) = mpsc::unbounded_channel::<Message>();
+        let mut processes = ProcessManager::new(fs, outgoing);
+        let proc_id = 41;
+
+        processes
+            .dispatch(
+                "Process::spawn",
+                &json!({
+                    "proc_id": proc_id,
+                    "program": "/bin/cat",
+                    "stdin_pipe": true,
+                    "stdout_pipe": true,
+                    "stderr_pipe": true,
+                }),
+                1,
+            )
+            .await?;
+        processes.detach_generation(1);
+        let detached = processes.processes.get(&proc_id).unwrap();
+        assert!(detached.disconnected);
+        assert!(!detached.task.is_finished());
+
+        let attached = processes
+            .dispatch(
+                "Process::attach",
+                &json!({"proc_ids": [proc_id, proc_id + 1]}),
+                2,
+            )
+            .await?;
+        assert_eq!(attached["attached"], json!([proc_id]));
+        assert_eq!(attached["missing"], json!([proc_id + 1]));
+        let reattached = processes.processes.get(&proc_id).unwrap();
+        assert!(!reattached.disconnected);
+        assert_eq!(reattached.owner_generation, 2);
+        assert!(!reattached.task.is_finished());
+
+        processes
+            .dispatch("Process::kill", &json!({"proc_id": proc_id}), 2)
+            .await?;
+        Ok(())
     }
 
     #[test]

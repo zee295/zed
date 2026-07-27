@@ -67,6 +67,7 @@ impl TerminalManager {
             "Terminal::write" => self.write(params),
             "Terminal::resize" => self.resize(params),
             "Terminal::bind" => self.bind(params),
+            "Terminal::attach" => self.attach(params),
             "Terminal::close" => self.close(params),
             _ => bail!("unknown terminal method: {method}"),
         }
@@ -336,6 +337,24 @@ impl TerminalManager {
         }
         self.terminals_by_resume_key.insert(resume_key, term_id);
         Ok(Value::Null)
+    }
+
+    fn attach(&mut self, params: &Value) -> Result<Value> {
+        let term_id = terminal_id(params)?;
+        let Some(terminal) = self.terminals.get_mut(&term_id) else {
+            return Ok(json!({"attached": false}));
+        };
+        let (data_method, exit_method) = notification_methods(params, term_id);
+        let exit_status = {
+            let mut output = terminal
+                .output
+                .lock()
+                .map_err(|_| anyhow!("terminal output lock poisoned"))?;
+            output.data_method = data_method;
+            output.exit_method = exit_method;
+            output.exit_status
+        };
+        Ok(json!({"attached": true, "exit_status": exit_status}))
     }
 
     fn close(&mut self, params: &Value) -> Result<Value> {
@@ -674,6 +693,37 @@ mod tests {
         assert_eq!(resumed["resumed"], true);
         let history = BASE64.decode(resumed["history"].as_str().unwrap())?;
         assert!(history.windows(marker.len()).any(|window| window == marker));
+
+        let attached = terminals.dispatch(
+            "Terminal::attach",
+            &json!({
+                "term_id": term_id,
+                "notification_id": "reconnected-workspace:1:terminal:9"
+            }),
+        )?;
+        assert_eq!(attached["attached"], true);
+        let output = terminals
+            .terminals
+            .get(&term_id)
+            .unwrap()
+            .output
+            .lock()
+            .unwrap();
+        assert_eq!(
+            output.data_method,
+            "Terminal::data:reconnected-workspace:1:terminal:9"
+        );
+        assert_eq!(
+            output.exit_method,
+            "Terminal::exit:reconnected-workspace:1:terminal:9"
+        );
+        drop(output);
+
+        let missing = terminals.dispatch(
+            "Terminal::attach",
+            &json!({"term_id": term_id + 1, "notification_id": "missing"}),
+        )?;
+        assert_eq!(missing["attached"], false);
         terminals.dispatch("Terminal::close", &json!({"term_id": term_id}))?;
         Ok(())
     }

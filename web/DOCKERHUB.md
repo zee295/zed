@@ -50,6 +50,15 @@ The image includes Node.js 22 with npm/npx for extensions and ACP agents.
 Provider credentials such as `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` remain on
 the server when passed as container environment variables.
 
+## Large Repositories
+
+An `ENOSPC` error from `fs.watch` means the Docker host's shared Linux inotify
+quota is exhausted, not that the disk is full. For large repositories, set
+`fs.inotify.max_user_instances=1024`,
+`fs.inotify.max_user_watches=524288`, and
+`fs.inotify.max_queued_events=65536` on the host, then restart affected agents
+or the container.
+
 ## Reverse Proxy
 
 Preserve WebSocket upgrades and these response headers:

@@ -1579,23 +1579,13 @@ fn codex_remote_auth_methods(
                 return method;
             }
 
-            let Some(script_index) = command.args.iter().position(|arg| {
-                std::path::Path::new(arg)
-                    .file_name()
-                    .is_some_and(|name| name == "codex-acp")
-            }) else {
+            let Some((auth_command, auth_args)) = codex_device_auth_command(command) else {
                 return method;
             };
-            let codex_script = std::path::Path::new(&command.args[script_index])
-                .with_file_name("codex")
-                .to_string_lossy()
-                .into_owned();
-            let mut args = command.args[..script_index].to_vec();
-            args.extend([codex_script, "login".into(), "--device-auth".into()]);
             let value = serde_json::json!({
                 "label": "Codex Login",
-                "command": command.path.to_string_lossy(),
-                "args": args,
+                "command": auth_command,
+                "args": auth_args,
                 "env": command.env.clone().unwrap_or_default(),
             });
             let meta = acp::Meta::from_iter([("terminal-auth".to_string(), value)]);
@@ -1606,6 +1596,43 @@ fn codex_remote_auth_methods(
             )
         })
         .collect()
+}
+
+fn codex_device_auth_command(command: &AgentServerCommand) -> Option<(String, Vec<String>)> {
+    const CODEX_ACP_PACKAGE: &str = "@agentclientprotocol/codex-acp";
+
+    if let Some(package_index) = command
+        .args
+        .iter()
+        .position(|arg| arg.starts_with(CODEX_ACP_PACKAGE))
+    {
+        let package = command.args[package_index].clone();
+        let mut args = command.args[..package_index].to_vec();
+        if args.last().is_some_and(|arg| arg == "--") {
+            args.pop();
+        }
+        args.extend([
+            format!("--package={package}"),
+            "--".into(),
+            "codex".into(),
+            "login".into(),
+            "--device-auth".into(),
+        ]);
+        return Some((command.path.to_string_lossy().into_owned(), args));
+    }
+
+    let script_index = command.args.iter().position(|arg| {
+        std::path::Path::new(arg)
+            .file_name()
+            .is_some_and(|name| name == "codex-acp")
+    })?;
+    let codex_script = std::path::Path::new(&command.args[script_index])
+        .with_file_name("codex")
+        .to_string_lossy()
+        .into_owned();
+    let mut args = command.args[..script_index].to_vec();
+    args.extend([codex_script, "login".into(), "--device-auth".into()]);
+    Some((command.path.to_string_lossy().into_owned(), args))
 }
 
 impl AgentConnection for AcpConnection {
@@ -3147,6 +3174,46 @@ mod tests {
         assert_eq!(
             task.env,
             HashMap::from_iter([("CODEX_HOME".into(), "/data/codex".into())])
+        );
+    }
+
+    #[test]
+    fn codex_remote_auth_uses_codex_binary_through_npm_exec() {
+        let command = AgentServerCommand {
+            path: "npm".into(),
+            args: vec![
+                "--prefix".into(),
+                "/workspace/.config/zed/external_agents/registry/npx/codex-acp".into(),
+                "exec".into(),
+                "--yes".into(),
+                "--".into(),
+                "@agentclientprotocol/codex-acp@0.0.0 - 1.1.7".into(),
+            ],
+            env: None,
+        };
+        let methods = codex_remote_auth_methods(
+            &command,
+            vec![acp::AuthMethod::Agent(acp::AuthMethodAgent::new(
+                "chat-gpt", "ChatGPT",
+            ))],
+        );
+        let task = meta_terminal_auth_task(&AgentId::new(CODEX_ID), methods[0].id(), &methods[0])
+            .expect("ChatGPT auth should become a terminal task");
+
+        assert_eq!(task.command.as_deref(), Some("npm"));
+        assert_eq!(
+            task.args,
+            vec![
+                "--prefix",
+                "/workspace/.config/zed/external_agents/registry/npx/codex-acp",
+                "exec",
+                "--yes",
+                "--package=@agentclientprotocol/codex-acp@0.0.0 - 1.1.7",
+                "--",
+                "codex",
+                "login",
+                "--device-auth",
+            ]
         );
     }
 

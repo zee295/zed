@@ -159,9 +159,59 @@ pub fn set_remote_client(client: RpcClient) {
         }
     });
 
+    let mut reconnects = client.subscribe_reconnect();
+    let reconnect_client = client.clone();
+    let reconnect_router = router.clone();
+    wasm_bindgen_futures::spawn_local(async move {
+        while reconnects.next().await.is_some() {
+            let proc_ids = reconnect_router
+                .lock()
+                .unwrap()
+                .by_id
+                .keys()
+                .copied()
+                .collect::<Vec<_>>();
+            if proc_ids.is_empty() {
+                continue;
+            }
+            let response = reconnect_client
+                .call::<_, AttachProcessesResponse>(
+                    "Process::attach",
+                    &AttachProcessesRequest { proc_ids },
+                )
+                .await;
+            let Ok(response) = response else {
+                continue;
+            };
+            for proc_id in response.missing {
+                if let Some(io) = reconnect_router.lock().unwrap().by_id.get(&proc_id) {
+                    mark_process_exited(&mut io.lock().unwrap());
+                }
+            }
+        }
+    });
+
     REMOTE.with(|remote| {
         *remote.borrow_mut() = Some(RemoteState { client, router });
     });
+}
+
+#[cfg(target_family = "wasm")]
+fn mark_process_exited(io: &mut ProcessIo) {
+    let status = ExitStatus::default();
+    io.exit_status = Some(status);
+    if let Some(tx) = io.exit_tx.take() {
+        tx.send(status).ok();
+    }
+    if let Some(waker) = io.exit_waker.take() {
+        waker.wake();
+    }
+    if let Some(waker) = io.stdout_waker.take() {
+        waker.wake();
+    }
+    if let Some(waker) = io.stderr_waker.take() {
+        waker.wake();
+    }
 }
 
 #[cfg(target_family = "wasm")]
@@ -728,6 +778,18 @@ struct SpawnRequest {
     stdin_pipe: bool,
     stdout_pipe: bool,
     stderr_pipe: bool,
+}
+
+#[cfg(target_family = "wasm")]
+#[derive(Serialize)]
+struct AttachProcessesRequest {
+    proc_ids: Vec<u64>,
+}
+
+#[cfg(target_family = "wasm")]
+#[derive(Deserialize)]
+struct AttachProcessesResponse {
+    missing: Vec<u64>,
 }
 
 #[cfg(target_family = "wasm")]

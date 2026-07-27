@@ -77,6 +77,30 @@ impl RemoteFs {
             }
         });
 
+        let mut reconnects = client.subscribe_reconnect();
+        let reconnect_client = client.clone();
+        let reconnect_subscriptions = subscriptions.clone();
+        executor
+            .spawn(async move {
+                while reconnects.next().await.is_some() {
+                    let subscription_ids = lock_shared(&reconnect_subscriptions)
+                        .keys()
+                        .copied()
+                        .collect::<Vec<_>>();
+                    if subscription_ids.is_empty() {
+                        continue;
+                    }
+                    reconnect_client
+                        .call_void(
+                            "Fs::attach_watches",
+                            &json!({ "subscription_ids": subscription_ids }),
+                        )
+                        .await
+                        .ok();
+                }
+            })
+            .detach();
+
         Self {
             client,
             executor,

@@ -3,6 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
+    sync::Mutex as StdMutex,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, UNIX_EPOCH},
 };
@@ -105,6 +106,7 @@ struct RpcSession {
     terminals: crate::terminal_rpc::TerminalManager,
     agents: crate::agent_rpc::AgentManager,
     watches: HashMap<u64, WatchHandle>,
+    watch_groups: HashMap<WatchKey, WatchGroup>,
     next_subscription_id: u64,
     notifications: mpsc::UnboundedSender<Message>,
     notification_target: Arc<Mutex<NotificationTarget>>,
@@ -114,6 +116,17 @@ struct RpcSession {
 
 struct WatchHandle {
     owner_generation: u64,
+    key: WatchKey,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct WatchKey {
+    path: PathBuf,
+    latency: Duration,
+}
+
+struct WatchGroup {
+    subscription_ids: Arc<StdMutex<HashSet<u64>>>,
     task: JoinHandle<()>,
 }
 
@@ -166,6 +179,7 @@ impl RpcSession {
                 notifications.clone(),
             ),
             watches: HashMap::new(),
+            watch_groups: HashMap::new(),
             next_subscription_id: 1,
             notifications,
             notification_target,
@@ -177,12 +191,42 @@ impl RpcSession {
     async fn shutdown(&mut self) {
         self.agents.shutdown().await;
     }
+
+    fn remove_watch(&mut self, subscription_id: u64) {
+        let Some(watch) = self.watches.remove(&subscription_id) else {
+            return;
+        };
+        let remove_group = self.watch_groups.get(&watch.key).is_some_and(|group| {
+            let mut subscription_ids = group
+                .subscription_ids
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            subscription_ids.remove(&subscription_id);
+            subscription_ids.is_empty()
+        });
+        if remove_group && let Some(group) = self.watch_groups.remove(&watch.key) {
+            group.task.abort();
+        }
+    }
+
+    fn remove_watches_for_generation(&mut self, generation: u64) {
+        let subscription_ids = self
+            .watches
+            .iter()
+            .filter_map(|(subscription_id, watch)| {
+                (watch.owner_generation == generation).then_some(*subscription_id)
+            })
+            .collect::<Vec<_>>();
+        for subscription_id in subscription_ids {
+            self.remove_watch(subscription_id);
+        }
+    }
 }
 
 impl Drop for RpcSession {
     fn drop(&mut self) {
-        for (_, watch) in self.watches.drain() {
-            watch.task.abort();
+        for (_, group) in self.watch_groups.drain() {
+            group.task.abort();
         }
         for client_id in self.sql_clients.drain() {
             self.sql.release_client(&client_id);
@@ -348,34 +392,67 @@ pub async fn serve(socket: WebSocket, state: AppState) {
         } else if method == "Fs::watch" {
             let subscription_id = session.next_subscription_id;
             session.next_subscription_id += 1;
-            let watch = start_watch(
-                session.fs.clone(),
-                &params,
-                subscription_id,
-                session.notifications.clone(),
-            );
-            match watch {
-                Ok(watch) => {
+            match watch_key(&session.fs, &params) {
+                Ok(key) => {
+                    if let Some(group) = session.watch_groups.get(&key) {
+                        group
+                            .subscription_ids
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .insert(subscription_id);
+                    } else {
+                        let subscription_ids =
+                            Arc::new(StdMutex::new(HashSet::from([subscription_id])));
+                        let task = start_watch(
+                            session.fs.clone(),
+                            key.clone(),
+                            subscription_ids.clone(),
+                            session.notifications.clone(),
+                        );
+                        session.watch_groups.insert(
+                            key.clone(),
+                            WatchGroup {
+                                subscription_ids,
+                                task,
+                            },
+                        );
+                    }
                     session.watches.insert(
                         subscription_id,
                         WatchHandle {
                             owner_generation: generation,
-                            task: watch,
+                            key,
                         },
                     );
                     Ok(json!({"subscription_id": subscription_id}))
                 }
                 Err(error) => Err(error),
             }
+        } else if method == "Fs::attach_watches" {
+            let subscription_ids = params
+                .get("subscription_ids")
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow::anyhow!("missing filesystem watch subscription ids"));
+            subscription_ids.map(|subscription_ids| {
+                let mut attached = Vec::new();
+                let mut missing = Vec::new();
+                for subscription_id in subscription_ids.iter().filter_map(Value::as_u64) {
+                    if let Some(watch) = session.watches.get_mut(&subscription_id) {
+                        watch.owner_generation = generation;
+                        attached.push(subscription_id);
+                    } else {
+                        missing.push(subscription_id);
+                    }
+                }
+                json!({"attached": attached, "missing": missing})
+            })
         } else if method == "Fs::unwatch" {
             let subscription_id = params
                 .get("subscription_id")
                 .and_then(Value::as_u64)
                 .ok_or_else(|| anyhow::anyhow!("missing watch subscription id"));
             subscription_id.map(|subscription_id| {
-                if let Some(watch) = session.watches.remove(&subscription_id) {
-                    watch.task.abort();
-                }
+                session.remove_watch(subscription_id);
                 Value::Null
             })
         } else {
@@ -421,17 +498,18 @@ pub async fn serve(socket: WebSocket, state: AppState) {
         }
     }
     if let Some((_, session, generation)) = bound_session {
-        let mut session = session.lock().await;
-        let notification_target = session.notification_target.clone();
-        notification_target.lock().await.detach(generation);
-        session.processes.detach_generation(generation);
-        session.watches.retain(|_, watch| {
-            if watch.owner_generation == generation {
-                watch.task.abort();
-                false
-            } else {
-                true
-            }
+        {
+            let mut session = session.lock().await;
+            let notification_target = session.notification_target.clone();
+            notification_target.lock().await.detach(generation);
+            session.processes.detach_generation(generation);
+        }
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            session
+                .lock()
+                .await
+                .remove_watches_for_generation(generation);
         });
     }
     drop(outgoing);
@@ -479,20 +557,28 @@ async fn dispatch(
     bail!("unknown method: {method}")
 }
 
-fn start_watch(
-    fs_rpc: Arc<FsRpc>,
-    params: &Value,
-    subscription_id: u64,
-    outgoing: mpsc::UnboundedSender<Message>,
-) -> Result<JoinHandle<()>> {
+fn watch_key(fs_rpc: &FsRpc, params: &Value) -> Result<WatchKey> {
     let path = fs_rpc.path(params.get("path").and_then(Value::as_str).unwrap_or("."))?;
     let latency = params
         .get("latency")
         .and_then(Value::as_f64)
         .unwrap_or(1.0)
         .clamp(0.05, 30.0);
-    Ok(tokio::spawn(async move {
-        let mut known: HashMap<PathBuf, (u64, u128)> = HashMap::new();
+    Ok(WatchKey {
+        path,
+        latency: Duration::from_secs_f64(latency),
+    })
+}
+
+fn start_watch(
+    fs_rpc: Arc<FsRpc>,
+    key: WatchKey,
+    subscription_ids: Arc<StdMutex<HashSet<u64>>>,
+    outgoing: mpsc::UnboundedSender<Message>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let path = key.path;
+        let mut known: Option<HashMap<PathBuf, (u64, u128)>> = None;
         loop {
             let snapshot_path = path.clone();
             let current = match tokio::task::spawn_blocking(move || watch_snapshot(&snapshot_path))
@@ -501,7 +587,7 @@ fn start_watch(
                 Ok(Ok(snapshot)) => snapshot,
                 Ok(Err(error)) => {
                     tracing::warn!(?error, path = %path.display(), "filesystem watch scan failed");
-                    tokio::time::sleep(Duration::from_secs_f64(latency)).await;
+                    tokio::time::sleep(key.latency).await;
                     continue;
                 }
                 Err(error) => {
@@ -509,9 +595,14 @@ fn start_watch(
                     break;
                 }
             };
+            let Some(previous) = known.as_ref() else {
+                known = Some(current);
+                tokio::time::sleep(key.latency).await;
+                continue;
+            };
             let mut events = Vec::new();
             for (path, stamp) in &current {
-                let kind = match known.get(path) {
+                let kind = match previous.get(path) {
                     None => Some("created"),
                     Some(old) if old != stamp => Some("changed"),
                     Some(_) => None,
@@ -520,31 +611,40 @@ fn start_watch(
                     events.push(json!({"path": fs_rpc.virtualize(path), "kind": kind}));
                 }
             }
-            for path in known.keys() {
+            for path in previous.keys() {
                 if !current.contains_key(path) {
                     events.push(json!({"path": fs_rpc.virtualize(path), "kind": "removed"}));
                 }
             }
-            if !events.is_empty()
-                && outgoing
-                    .send(Message::Text(
-                        json!({
-                            "method": "Fs::watch_event",
-                            "params": {
-                                "subscription_id": subscription_id,
-                                "events": events
-                            }
-                        })
-                        .to_string(),
-                    ))
-                    .is_err()
-            {
-                break;
+            if !events.is_empty() {
+                let subscription_ids = subscription_ids
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>();
+                for subscription_id in subscription_ids {
+                    if outgoing
+                        .send(Message::Text(
+                            json!({
+                                "method": "Fs::watch_event",
+                                "params": {
+                                    "subscription_id": subscription_id,
+                                    "events": &events
+                                }
+                            })
+                            .to_string(),
+                        ))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
             }
-            known = current;
-            tokio::time::sleep(Duration::from_secs_f64(latency)).await;
+            known = Some(current);
+            tokio::time::sleep(key.latency).await;
         }
-    }))
+    })
 }
 
 fn watch_snapshot(root: &Path) -> Result<HashMap<PathBuf, (u64, u128)>> {
@@ -627,5 +727,45 @@ mod tests {
             second_receiver.recv().await,
             Some(Message::Text("shared".into()))
         );
+    }
+
+    #[tokio::test]
+    async fn filesystem_watch_uses_existing_files_as_a_silent_baseline() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::write(root.path().join("existing.txt"), "existing")?;
+        let fs_rpc = Arc::new(FsRpc::new(root.path().to_path_buf(), false)?);
+        let key = watch_key(&fs_rpc, &json!({"path": "/workspace", "latency": 0.05}))?;
+        let subscription_ids = Arc::new(StdMutex::new(HashSet::from([7])));
+        let (outgoing, mut notifications) = mpsc::unbounded_channel();
+        let task = start_watch(fs_rpc, key, subscription_ids, outgoing);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), notifications.recv())
+                .await
+                .is_err(),
+            "the initial snapshot must not report every existing file as created"
+        );
+
+        fs::write(root.path().join("created.txt"), "created")?;
+        let message = tokio::time::timeout(Duration::from_secs(1), notifications.recv())
+            .await?
+            .context("filesystem watch notification channel closed")?;
+        let Message::Text(message) = message else {
+            panic!("expected a text notification");
+        };
+        let message: Value = serde_json::from_str(&message)?;
+        assert_eq!(message["params"]["subscription_id"], 7);
+        assert!(
+            message["params"]["events"]
+                .as_array()
+                .is_some_and(|events| events.iter().any(|event| {
+                    event["kind"] == "created"
+                        && event["path"]
+                            .as_str()
+                            .is_some_and(|path| path.ends_with("/created.txt"))
+                }))
+        );
+        task.abort();
+        Ok(())
     }
 }

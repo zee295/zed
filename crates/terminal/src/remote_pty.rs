@@ -9,9 +9,11 @@ use collections::HashMap;
 use std::borrow::Cow;
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, Result};
 use base64::Engine as _;
+use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedSender;
 use serde::Deserialize;
 use serde_json::json;
@@ -27,6 +29,7 @@ pub struct RemotePty {
     term_id: u64,
     client: RpcClient,
     events_tx: UnboundedSender<PtyEvent>,
+    notification_id: Arc<Mutex<String>>,
 }
 
 #[derive(Deserialize)]
@@ -51,6 +54,13 @@ struct ExitNotification {
     term_id: u64,
     #[allow(dead_code)]
     status: Option<i32>,
+}
+
+#[derive(Deserialize)]
+struct AttachResponse {
+    attached: bool,
+    #[serde(default)]
+    exit_status: Option<i32>,
 }
 
 impl RemotePty {
@@ -103,15 +113,52 @@ impl RemotePty {
             forward_exit(&events_tx);
         }
 
+        let notification_id = Arc::new(Mutex::new(notification_id));
+        let mut reconnects = client.subscribe_reconnect();
+        let reconnect_client = client.clone();
+        let reconnect_notification_id = Arc::downgrade(&notification_id);
+        let reconnect_events_tx = events_tx.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            while reconnects.next().await.is_some() {
+                let Some(notification_id) = reconnect_notification_id.upgrade() else {
+                    break;
+                };
+                let notification_id = notification_id
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone();
+                let response = reconnect_client
+                    .call::<_, AttachResponse>(
+                        "Terminal::attach",
+                        &json!({
+                            "term_id": term_id,
+                            "notification_id": notification_id,
+                        }),
+                    )
+                    .await;
+                if response
+                    .is_ok_and(|response| !response.attached || response.exit_status.is_some())
+                {
+                    forward_exit(&reconnect_events_tx);
+                    break;
+                }
+            }
+        });
+
         Ok(Self {
             term_id,
             client,
             events_tx,
+            notification_id,
         })
     }
 
     pub fn bind_persistence_key(&self, resume_key: String) {
         let notification_id = persistent_notification_id(&resume_key);
+        *self
+            .notification_id
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = notification_id.clone();
         register_notification_handlers(&self.client, &notification_id, &self.events_tx);
         let term_id = self.term_id;
         let client = self.client.clone();

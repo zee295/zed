@@ -113,6 +113,25 @@ The workspace is the only required volume. Persistent editor SQL, access token,
 extension packages, terminals, agent state, and project data remain under that
 mounted server filesystem.
 
+## Large Repositories And File Watchers
+
+Linux inotify limits are shared by every process running as the same host user.
+Large repositories, language servers, build tools, and ACP agents can exhaust
+the default limit and report `ENOSPC` even when disk space and file descriptor
+limits are available. Raise the limits on the Docker host, not only inside the
+container:
+
+```sh
+sudo tee /etc/sysctl.d/99-zed-web-inotify.conf >/dev/null <<'EOF'
+fs.inotify.max_user_instances=1024
+fs.inotify.max_user_watches=524288
+fs.inotify.max_queued_events=65536
+EOF
+sudo sysctl --system
+```
+
+Restart affected ACP agents or the container after changing the limits.
+
 ## Reverse Proxy
 
 WebAssembly threads require these response headers:
