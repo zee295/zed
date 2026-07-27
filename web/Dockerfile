@@ -3,6 +3,7 @@
 ARG RUST_VERSION=1.95.0
 ARG NODE_VERSION=22.23.1
 ARG NPM_VERSION=12.0.1
+ARG DEBIAN_RUNTIME_SUITE=trixie
 FROM rust:${RUST_VERSION}-bookworm AS builder
 
 ARG RUST_VERSION
@@ -31,12 +32,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     RUST_STABLE_TOOLCHAIN="${RUST_VERSION}" \
     ./web/build.sh
 
-FROM node:${NODE_VERSION}-bookworm-slim AS node-runtime
+FROM node:${NODE_VERSION}-${DEBIAN_RUNTIME_SUITE}-slim AS node-runtime
 ARG NPM_VERSION
 RUN npm install --global "npm@${NPM_VERSION}" \
     && npm cache clean --force
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:${DEBIAN_RUNTIME_SUITE}-slim AS runtime
 
 RUN apt-get update \
     && apt-get upgrade -y --no-install-recommends \
