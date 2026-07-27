@@ -132,7 +132,32 @@ fn open_connection(path: &Path) -> Result<Connection> {
     connection.execute_batch(
         "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
     )?;
+    repair_orphaned_editor_items(&connection)?;
     Ok(connection)
+}
+
+fn repair_orphaned_editor_items(connection: &Connection) -> Result<()> {
+    let has_required_tables = connection.query_row(
+        "SELECT COUNT(*) = 2
+         FROM sqlite_master
+         WHERE type = 'table' AND name IN ('items', 'editors')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if has_required_tables {
+        connection.execute(
+            "DELETE FROM items
+             WHERE kind = 'Editor'
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM editors
+                   WHERE editors.item_id = items.item_id
+                     AND editors.workspace_id = items.workspace_id
+               )",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 fn query(state: &mut SqlState, params: &Value) -> Result<Value> {
@@ -569,6 +594,42 @@ mod tests {
             }),
         )?;
         assert_eq!(table["rows"], json!([["nested_records"]]));
+        Ok(())
+    }
+
+    #[test]
+    fn startup_repairs_orphaned_editor_items() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let database_dir = root.path().join(".zed");
+        std::fs::create_dir_all(&database_dir)?;
+        let path = database_dir.join("remote.sqlite");
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "CREATE TABLE items (
+                item_id INTEGER NOT NULL,
+                workspace_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                PRIMARY KEY (item_id, workspace_id)
+            );
+            CREATE TABLE editors (
+                item_id INTEGER NOT NULL,
+                workspace_id INTEGER NOT NULL,
+                PRIMARY KEY (item_id, workspace_id)
+            );
+            INSERT INTO items VALUES (1, 1, 'Editor');
+            INSERT INTO items VALUES (2, 1, 'Editor');
+            INSERT INTO items VALUES (3, 1, 'Terminal');
+            INSERT INTO editors VALUES (2, 1);",
+        )?;
+        drop(connection);
+
+        let _sql = SqlRpc::new(root.path())?;
+        let connection = Connection::open(path)?;
+        let remaining = connection
+            .prepare("SELECT item_id FROM items ORDER BY item_id")?
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(remaining, vec![2, 3]);
         Ok(())
     }
 }

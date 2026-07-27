@@ -59,13 +59,14 @@ impl Session {
         &self.session_id
     }
 
-    /// Creates a new session with no prior state. Intended for use in the
-    /// browser, where persistence is not yet implemented.
+    /// Uses one stable logical window session for the browser UI. Multiple
+    /// pages intentionally share this single-user workspace state.
     #[cfg(target_family = "wasm")]
     pub fn for_web() -> Self {
+        let session_id = "zed-web-single-window-v1".to_string();
         Self {
-            session_id: uuid::Uuid::new_v4().to_string(),
-            old_session_id: None,
+            old_session_id: Some(session_id.clone()),
+            session_id,
             old_window_ids: None,
         }
     }

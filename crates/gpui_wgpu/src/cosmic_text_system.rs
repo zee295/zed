@@ -122,12 +122,7 @@ impl PlatformTextSystem for CosmicTextSystem {
             font_ids.as_slice()
         } else {
             let font_ids =
-            state.load_family(
-                &font.family,
-                &font.features,
-                font.fallbacks.as_ref(),
-                false,
-            )?;
+                state.load_family(&font.family, &font.features, font.fallbacks.as_ref(), false)?;
             state.font_ids_by_family_cache.insert(key.clone(), font_ids);
             state.font_ids_by_family_cache[&key].as_ref()
         };

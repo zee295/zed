@@ -2154,6 +2154,13 @@ impl Terminal {
         }
     }
 
+    #[cfg(target_family = "wasm")]
+    pub fn bind_remote_persistence_key(&self, resume_key: String) {
+        if let TerminalType::Pty { pty_tx, .. } = &self.terminal_type {
+            pty_tx.bind_persistence_key(resume_key);
+        }
+    }
+
     pub fn input(&mut self, input: impl Into<Cow<'static, [u8]>>) {
         self.keyboard_input_sent = true;
         self.complete_init_command_startup_handshake();

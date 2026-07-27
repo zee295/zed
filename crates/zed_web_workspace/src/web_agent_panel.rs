@@ -142,6 +142,24 @@ struct ChatResponse {
     has_key: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Default)]
+struct RunningChatInfo {
+    #[serde(default)]
+    chat_id: String,
+    #[serde(default)]
+    thread_id: String,
+    #[serde(default)]
+    agent_id: String,
+    #[serde(default)]
+    output: String,
+}
+
+#[derive(Deserialize, Default)]
+struct RunningChatResponse {
+    #[serde(default)]
+    running: Option<RunningChatInfo>,
+}
+
 // --- UI state -------------------------------------------------------------
 
 #[derive(Clone, Debug)]
@@ -258,6 +276,68 @@ impl WebAgentPanel {
                 {
                     let _ = this.update(cx, |this, cx| {
                         this.load_thread(th);
+                        cx.notify();
+                    });
+                }
+            }
+            let running = client
+                .call::<_, RunningChatResponse>("Agent::running", &json!({ "thread_id": tid }))
+                .await
+                .ok()
+                .and_then(|response| response.running);
+            if let Some(running) = running {
+                let assistant_index = this
+                    .update(cx, |this, cx| {
+                        this.active_chat_id = Some(running.chat_id.clone());
+                        this.active_thread_id = running.thread_id.clone();
+                        this.selected_agent_id = running.agent_id.clone();
+                        this.busy = true;
+                        this.status = "Streaming…".into();
+                        this.messages.push(ChatMessage {
+                            role: MessageRole::Assistant,
+                            text: running.output.clone().into(),
+                        });
+                        cx.notify();
+                        this.messages.len() - 1
+                    })
+                    .ok();
+                let Some(assistant_index) = assistant_index else {
+                    return;
+                };
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(100))
+                        .await;
+                    let current = client
+                        .call::<_, RunningChatResponse>(
+                            "Agent::running",
+                            &json!({ "thread_id": running.thread_id }),
+                        )
+                        .await
+                        .ok()
+                        .and_then(|response| response.running);
+                    let Some(current) = current else {
+                        if let Ok(thread) = client
+                            .call::<_, ThreadInfo>(
+                                "Agent::open_thread",
+                                &json!({ "thread_id": running.thread_id }),
+                            )
+                            .await
+                        {
+                            let _ = this.update(cx, |this, cx| {
+                                this.load_thread(thread);
+                                this.active_chat_id = None;
+                                this.busy = false;
+                                this.status = "Ready".into();
+                                cx.notify();
+                            });
+                        }
+                        break;
+                    };
+                    let _ = this.update(cx, |this, cx| {
+                        if let Some(message) = this.messages.get_mut(assistant_index) {
+                            message.text = current.output.into();
+                        }
                         cx.notify();
                     });
                 }

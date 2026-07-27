@@ -4,18 +4,52 @@ use futures::channel::{mpsc, oneshot};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+#[cfg(target_family = "wasm")]
+use std::sync::TryLockError;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+fn lock_shared<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    #[cfg(target_family = "wasm")]
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return guard,
+            Err(TryLockError::Poisoned(error)) => return error.into_inner(),
+            Err(TryLockError::WouldBlock) => std::hint::spin_loop(),
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    {
+        mutex.lock().unwrap_or_else(|error| error.into_inner())
+    }
+}
 
 #[cfg(target_family = "wasm")]
 #[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
 export function zedRpcCreate(url, onOpen, onMessage, onClose, onError) {
+    let workspaceKey;
+    try {
+        const pageUrl = new URL(self.location.href);
+        const paths = pageUrl.searchParams.getAll("path");
+        workspaceKey = JSON.stringify(paths.length ? paths : [pageUrl.pathname]);
+    } catch (_) {
+        workspaceKey = self.location?.pathname ?? "/workspace";
+    }
+    const sessionId = `workspace:${self.location?.origin ?? "local"}:${workspaceKey}`;
     const state = {
         active: true,
         attempt: 0,
         queue: [],
         reconnectTimer: 0,
+        sessionId,
         socket: null,
+    };
+
+    const identify = message => {
+        const envelope = JSON.parse(message);
+        envelope.session_id = state.sessionId;
+        return JSON.stringify(envelope);
     };
 
     const scheduleReconnect = () => {
@@ -85,6 +119,7 @@ export function zedRpcCreate(url, onOpen, onMessage, onClose, onError) {
 
     return {
         send(message) {
+            message = identify(message);
             const socket = state.socket;
             if (socket?.readyState === WebSocket.OPEN) {
                 socket.send(message);
@@ -203,10 +238,10 @@ impl RpcClient {
             let gate_tx = gate_tx.clone();
             move || {
                 is_open.store(true, Ordering::SeqCst);
-                if let Some(sender) = open_tx.lock().unwrap().take() {
+                if let Some(sender) = lock_shared(&open_tx).take() {
                     let _ = sender.send(());
                 }
-                if let Some(sender) = gate_tx.lock().unwrap().take() {
+                if let Some(sender) = lock_shared(&gate_tx).take() {
                     let _ = sender.send(());
                 }
             }
@@ -257,7 +292,7 @@ impl RpcClient {
                 if let Ok(notification) =
                     serde_json::from_value::<NotificationEnvelope>(parsed.clone())
                 {
-                    let handlers = notifications_for_messages.lock().unwrap();
+                    let handlers = lock_shared(&notifications_for_messages);
                     if let Some(handler) = handlers.get(&notification.method) {
                         handler(notification.params);
                     } else {
@@ -275,7 +310,7 @@ impl RpcClient {
 
             if has_id {
                 if let Ok(response) = serde_json::from_value::<ResponseEnvelope>(parsed) {
-                    let mut pending = pending_for_messages.lock().unwrap();
+                    let mut pending = lock_shared(&pending_for_messages);
                     if let Some(sender) = pending.remove(&response.id) {
                         let result = if let Some(err) = response.error {
                             Err(err)
@@ -295,7 +330,7 @@ impl RpcClient {
         let is_open_for_close = is_open.clone();
         let onclose = Closure::<dyn FnMut(u16, String)>::new(move |code, reason| {
             is_open_for_close.store(false, Ordering::SeqCst);
-            let mut pending = pending_for_close.lock().unwrap();
+            let mut pending = lock_shared(&pending_for_close);
             for (_, sender) in pending.drain() {
                 sender
                     .send(Err(format!(
@@ -350,7 +385,7 @@ impl RpcClient {
 
     async fn wait_until_open(&self) {
         let receiver = {
-            let mut guard = self.open.lock().unwrap();
+            let mut guard = lock_shared(&self.open);
             guard.take()
         };
         if let Some(receiver) = receiver {
@@ -376,7 +411,7 @@ impl RpcClient {
 
         let (tx, rx) = oneshot::channel();
         {
-            self.pending.lock().unwrap().insert(id, tx);
+            lock_shared(&self.pending).insert(id, tx);
         }
 
         self.outgoing
@@ -402,9 +437,6 @@ impl RpcClient {
     }
 
     pub fn on_notification<F: Fn(Value) + Send + 'static>(&self, method: &str, handler: F) {
-        self.notifications
-            .lock()
-            .unwrap()
-            .insert(method.to_string(), Box::new(handler));
+        lock_shared(&self.notifications).insert(method.to_string(), Box::new(handler));
     }
 }

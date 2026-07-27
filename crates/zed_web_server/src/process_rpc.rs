@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
 };
 
 use anyhow::{Context as _, Result, bail};
@@ -24,7 +24,11 @@ pub fn handles(method: &str) -> bool {
 pub fn handles_streaming(method: &str) -> bool {
     matches!(
         method,
-        "Process::spawn" | "Process::write_stdin" | "Process::close_stdin" | "Process::kill"
+        "Process::spawn"
+            | "Process::write_stdin"
+            | "Process::close_stdin"
+            | "Process::kill"
+            | "Process::running_sessions"
     )
 }
 
@@ -35,10 +39,78 @@ pub struct ProcessManager {
 }
 
 struct ProcessEntry {
+    owner_generation: u64,
+    disconnected: bool,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     stdin_rewriter: Mutex<FrameRewriter>,
+    acp_activity: Arc<StdMutex<AcpActivity>>,
     sanitize_lldb: bool,
     task: JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct AcpActivity {
+    input: Vec<u8>,
+    output: Vec<u8>,
+    prompts: HashMap<String, String>,
+}
+
+impl AcpActivity {
+    fn feed_input(&mut self, bytes: &[u8]) {
+        self.input.extend_from_slice(bytes);
+        for line in take_lines(&mut self.input) {
+            let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+                continue;
+            };
+            let method = value
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if method != "session/prompt" && method != "session.prompt" {
+                continue;
+            }
+            let Some(id) = value.get("id").map(Value::to_string) else {
+                continue;
+            };
+            let session_id = value
+                .pointer("/params/sessionId")
+                .or_else(|| value.pointer("/params/session_id"))
+                .and_then(Value::as_str);
+            if let Some(session_id) = session_id {
+                self.prompts.insert(id, session_id.to_string());
+            }
+        }
+    }
+
+    fn feed_output(&mut self, bytes: &[u8]) {
+        self.output.extend_from_slice(bytes);
+        for line in take_lines(&mut self.output) {
+            let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+                continue;
+            };
+            if value.get("result").is_none() && value.get("error").is_none() {
+                continue;
+            }
+            if let Some(id) = value.get("id").map(Value::to_string) {
+                self.prompts.remove(&id);
+            }
+        }
+    }
+}
+
+fn take_lines(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for (index, byte) in buffer.iter().enumerate() {
+        if *byte == b'\n' {
+            lines.push(buffer[start..index].to_vec());
+            start = index + 1;
+        }
+    }
+    if start > 0 {
+        buffer.drain(..start);
+    }
+    lines
 }
 
 impl ProcessManager {
@@ -50,17 +122,24 @@ impl ProcessManager {
         }
     }
 
-    pub async fn dispatch(&mut self, method: &str, params: &Value) -> Result<Value> {
+    pub async fn dispatch(
+        &mut self,
+        method: &str,
+        params: &Value,
+        owner_generation: u64,
+    ) -> Result<Value> {
+        self.reap_disconnected();
         match method {
-            "Process::spawn" => self.spawn(params).await,
+            "Process::spawn" => self.spawn(params, owner_generation).await,
             "Process::write_stdin" => self.write_stdin(params).await,
             "Process::close_stdin" => self.close_stdin(params).await,
             "Process::kill" => self.kill(params),
+            "Process::running_sessions" => self.running_sessions(),
             _ => bail!("unknown streaming process method: {method}"),
         }
     }
 
-    async fn spawn(&mut self, params: &Value) -> Result<Value> {
+    async fn spawn(&mut self, params: &Value, owner_generation: u64) -> Result<Value> {
         let proc_id = params
             .get("proc_id")
             .and_then(Value::as_u64)
@@ -123,6 +202,7 @@ impl ProcessManager {
         let stdin = Arc::new(Mutex::new(child.stdin.take()));
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
+        let acp_activity = Arc::new(StdMutex::new(AcpActivity::default()));
         let outgoing = self.outgoing.clone();
         let stdout_task = stdout.map(|stdout| {
             tokio::spawn(pump_output(
@@ -131,6 +211,7 @@ impl ProcessManager {
                 "Process::stdout",
                 outgoing.clone(),
                 Some((root_text.clone().into_bytes(), b"/workspace".to_vec())),
+                Some(acp_activity.clone()),
             ))
         });
         let stderr_task = stderr.map(|stderr| {
@@ -140,8 +221,10 @@ impl ProcessManager {
                 "Process::stderr",
                 outgoing.clone(),
                 None,
+                None,
             ))
         });
+        let completed_activity = acp_activity.clone();
         let task = tokio::spawn(async move {
             let status = child
                 .wait()
@@ -155,6 +238,9 @@ impl ProcessManager {
             if let Some(task) = stderr_task {
                 task.await.ok();
             }
+            if let Ok(mut activity) = completed_activity.lock() {
+                activity.prompts.clear();
+            }
             notify(
                 &outgoing,
                 "Process::exit",
@@ -164,11 +250,14 @@ impl ProcessManager {
         if let Some(previous) = self.processes.insert(
             proc_id,
             ProcessEntry {
+                owner_generation,
+                disconnected: false,
                 stdin,
                 stdin_rewriter: Mutex::new(FrameRewriter::new(
                     b"/workspace".to_vec(),
                     root_text.as_bytes().to_vec(),
                 )),
+                acp_activity,
                 sanitize_lldb,
                 task,
             },
@@ -176,6 +265,29 @@ impl ProcessManager {
             previous.task.abort();
         }
         Ok(json!({"proc_id": proc_id}))
+    }
+
+    pub fn detach_generation(&mut self, generation: u64) {
+        for entry in self.processes.values_mut() {
+            if entry.owner_generation == generation {
+                entry.disconnected = true;
+            }
+        }
+        self.reap_disconnected();
+    }
+
+    fn reap_disconnected(&mut self) {
+        self.processes.retain(|_, entry| {
+            let has_running_prompt = entry
+                .acp_activity
+                .lock()
+                .is_ok_and(|activity| !activity.prompts.is_empty());
+            let retain = !entry.disconnected || has_running_prompt;
+            if !retain {
+                entry.task.abort();
+            }
+            retain
+        });
     }
 
     async fn write_stdin(&self, params: &Value) -> Result<Value> {
@@ -190,6 +302,9 @@ impl ProcessManager {
                 .and_then(Value::as_str)
                 .unwrap_or_default(),
         )?;
+        if let Ok(mut activity) = entry.acp_activity.lock() {
+            activity.feed_input(&data);
+        }
         let mut rewriter = entry.stdin_rewriter.lock().await;
         let chunks = rewriter.feed(&data);
         let mut stdin = entry.stdin.lock().await;
@@ -203,6 +318,18 @@ impl ProcessManager {
             stdin.write_all(&chunk).await?;
         }
         Ok(Value::Null)
+    }
+
+    fn running_sessions(&self) -> Result<Value> {
+        let mut sessions = self
+            .processes
+            .values()
+            .filter_map(|entry| entry.acp_activity.lock().ok())
+            .flat_map(|activity| activity.prompts.values().cloned().collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        sessions.sort();
+        sessions.dedup();
+        Ok(json!({ "sessions": sessions }))
     }
 
     async fn close_stdin(&self, params: &Value) -> Result<Value> {
@@ -334,6 +461,7 @@ async fn pump_output(
     method: &'static str,
     outgoing: mpsc::UnboundedSender<Message>,
     rewrite: Option<(Vec<u8>, Vec<u8>)>,
+    acp_activity: Option<Arc<StdMutex<AcpActivity>>>,
 ) {
     let mut buffer = [0_u8; 4096];
     let mut rewriter = rewrite.map(|(source, target)| FrameRewriter::new(source, target));
@@ -343,6 +471,11 @@ async fn pump_output(
         };
         if count == 0 {
             break;
+        }
+        if let Some(activity) = &acp_activity
+            && let Ok(mut activity) = activity.lock()
+        {
+            activity.feed_output(&buffer[..count]);
         }
         let chunks = rewriter
             .as_mut()
@@ -483,7 +616,24 @@ fn sanitize_lldb_frame(frame: Vec<u8>) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameRewriter, sanitize_lldb_frame};
+    use super::{AcpActivity, FrameRewriter, sanitize_lldb_frame};
+
+    #[test]
+    fn tracks_acp_prompt_until_response() {
+        let mut activity = AcpActivity::default();
+        activity.feed_input(
+            br#"{"jsonrpc":"2.0","id":17,"method":"session/prompt","params":{"sessionId":"claude-session"}}"#,
+        );
+        activity.feed_input(b"\n");
+        assert_eq!(
+            activity.prompts.values().cloned().collect::<Vec<_>>(),
+            ["claude-session"]
+        );
+
+        activity.feed_output(br#"{"jsonrpc":"2.0","id":17,"result":{"stopReason":"end_turn"}}"#);
+        activity.feed_output(b"\n");
+        assert!(activity.prompts.is_empty());
+    }
 
     #[test]
     fn rewrites_virtual_paths_in_plain_agent_messages() {

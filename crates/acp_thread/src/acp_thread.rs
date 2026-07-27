@@ -2092,6 +2092,10 @@ pub struct AcpThread {
     shared_buffers: HashMap<Entity<Buffer>, BufferSnapshot>,
     turn_id: u32,
     running_turn: Option<RunningTurn>,
+    #[cfg(target_family = "wasm")]
+    detached_remote_turn: bool,
+    #[cfg(target_family = "wasm")]
+    _observe_remote_turn: Task<()>,
     connection: Rc<dyn AgentConnection>,
     token_usage: Option<TokenUsage>,
     cost: Option<SessionCost>,
@@ -2263,6 +2267,31 @@ impl AcpThread {
         mut prompt_capabilities_rx: watch::Receiver<acp::PromptCapabilities>,
         cx: &mut Context<Self>,
     ) -> Self {
+        #[cfg(target_family = "wasm")]
+        let remote_session_id = session_id.0.to_string();
+        #[cfg(target_family = "wasm")]
+        let observe_remote_turn = cx.spawn(async move |this, cx| {
+            loop {
+                let is_running = smol::process::remote_session_running(&remote_session_id)
+                    .await
+                    .unwrap_or(false);
+                if this
+                    .update(cx, |this, cx| {
+                        if this.detached_remote_turn != is_running {
+                            this.detached_remote_turn = is_running;
+                            cx.emit(AcpThreadEvent::StatusChanged);
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(500))
+                    .await;
+            }
+        });
+
         let prompt_capabilities = prompt_capabilities_rx.borrow().clone();
         let task = cx.spawn::<_, anyhow::Result<()>>(async move |this, cx| {
             loop {
@@ -2303,6 +2332,10 @@ impl AcpThread {
             provisional_title: None,
             project,
             running_turn: None,
+            #[cfg(target_family = "wasm")]
+            detached_remote_turn: false,
+            #[cfg(target_family = "wasm")]
+            _observe_remote_turn: observe_remote_turn,
             turn_id: 0,
             connection,
             session_id,
@@ -2431,7 +2464,12 @@ impl AcpThread {
     }
 
     pub fn status(&self) -> ThreadStatus {
-        if self.running_turn.is_some() {
+        #[cfg(target_family = "wasm")]
+        let detached_remote_turn = self.detached_remote_turn;
+        #[cfg(not(target_family = "wasm"))]
+        let detached_remote_turn = false;
+
+        if self.running_turn.is_some() || detached_remote_turn {
             ThreadStatus::Generating
         } else {
             ThreadStatus::Idle

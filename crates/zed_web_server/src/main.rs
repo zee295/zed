@@ -58,6 +58,8 @@ pub struct AppState {
     restrict_paths: bool,
     login_limiter: Arc<auth::LoginLimiter>,
     events: tokio::sync::broadcast::Sender<serde_json::Value>,
+    shutdown: tokio::sync::broadcast::Sender<()>,
+    rpc_sessions: Arc<rpc::SessionRegistry>,
     sql: Arc<sql_rpc::SqlRpc>,
     http: reqwest::Client,
 }
@@ -87,6 +89,7 @@ async fn main() -> Result<()> {
     let (auth_token, token_path, created) = load_auth_token(&root, args.auth_token).await?;
     let sql = Arc::new(sql_rpc::SqlRpc::new(&root)?);
     let (events, _) = tokio::sync::broadcast::channel(256);
+    let (shutdown, _) = tokio::sync::broadcast::channel(1);
     let state = AppState {
         root: Arc::new(root),
         static_root: Arc::new(static_root),
@@ -95,6 +98,8 @@ async fn main() -> Result<()> {
         restrict_paths,
         login_limiter: Arc::new(auth::LoginLimiter::default()),
         events,
+        shutdown,
+        rpc_sessions: Arc::new(rpc::SessionRegistry::default()),
         sql,
         http: reqwest::Client::builder()
             .user_agent("ZedRemoteRust/0.1")
@@ -126,10 +131,49 @@ async fn main() -> Result<()> {
     if created {
         tracing::info!(token = %state.auth_token, "new Zed Web access token");
     }
+    let shutdown_state = state.clone();
     axum::Server::bind(&address)
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            tracing::info!("shutting down Zed Web");
+            if shutdown_state.shutdown.send(()).is_err() {
+                tracing::debug!("no active RPC connections during shutdown");
+            }
+            shutdown_state.rpc_sessions.shutdown().await;
+        })
         .await?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+        match terminate {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    result = tokio::signal::ctrl_c() => {
+                        if let Err(error) = result {
+                            tracing::error!(?error, "failed to listen for Ctrl-C");
+                        }
+                    }
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(error) => {
+                tracing::warn!(?error, "failed to listen for SIGTERM");
+                if let Err(error) = tokio::signal::ctrl_c().await {
+                    tracing::error!(?error, "failed to listen for Ctrl-C");
+                }
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        tracing::error!(?error, "failed to listen for Ctrl-C");
+    }
 }
 
 async fn initialize_config(root: &Path) -> Result<()> {
@@ -462,7 +506,24 @@ fn rewrite_acp_registry(bytes: &[u8]) -> Vec<u8> {
     serde_json::to_vec(&registry).unwrap_or_else(|_| bytes.to_vec())
 }
 
-async fn index(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+) -> Response {
+    if let Some(location) = canonical_workspace_location(&uri, &state.root) {
+        return Redirect::temporary(&location).into_response();
+    }
+    let has_workspace_path = uri.query().is_some_and(|query| {
+        query
+            .split('&')
+            .any(|parameter| parameter == "path" || parameter.starts_with("path="))
+    });
+    if !has_workspace_path {
+        let root_text = state.root.to_string_lossy();
+        let root = urlencoding::encode(&root_text);
+        return Redirect::temporary(&format!("/?path={root}")).into_response();
+    }
     for name in ["workspace.html", "index.html"] {
         let target = state.static_root.join(name);
         if target.is_file() {
@@ -470,6 +531,39 @@ async fn index(State(state): State<AppState>, headers: HeaderMap) -> Response {
         }
     }
     (StatusCode::NOT_FOUND, "workspace entry point not found").into_response()
+}
+
+fn canonical_workspace_location(uri: &axum::http::Uri, root: &Path) -> Option<String> {
+    let query = uri.query()?;
+    let mut changed = false;
+    let parameters = query
+        .split('&')
+        .map(|parameter| {
+            let (key, value) = parameter.split_once('=').unwrap_or((parameter, ""));
+            let decoded_key = urlencoding::decode(key).ok();
+            let decoded_value = urlencoding::decode(value).ok();
+            if decoded_key.as_deref() == Some("path")
+                && let Some(path) = decoded_value
+                    .as_deref()
+                    .filter(|path| *path == "/workspace" || path.starts_with("/workspace/"))
+            {
+                changed = true;
+                let relative = path
+                    .strip_prefix("/workspace")
+                    .unwrap_or_default()
+                    .trim_start_matches('/');
+                let canonical = if relative.is_empty() {
+                    root.to_path_buf()
+                } else {
+                    root.join(relative)
+                };
+                format!("path={}", urlencoding::encode(&canonical.to_string_lossy()))
+            } else {
+                parameter.to_string()
+            }
+        })
+        .collect::<Vec<_>>();
+    changed.then(|| format!("/?{}", parameters.join("&")))
 }
 
 async fn static_file(
@@ -589,4 +683,43 @@ main{{width:min(360px,calc(100vw - 32px))}}input,button{{width:100%;height:38px;
 <input id="token" name="token" type="password" autofocus required>
 <button type="submit">Sign in</button></form></main></body></html>"#
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonicalizes_virtual_workspace_path_without_dropping_other_paths() {
+        let uri = "/?path=%2Fworkspace%2Fsrc&path=%2Ftmp%2Fother"
+            .parse::<axum::http::Uri>()
+            .unwrap();
+
+        assert_eq!(
+            canonical_workspace_location(&uri, Path::new("/srv/project")),
+            Some("/?path=%2Fsrv%2Fproject%2Fsrc&path=%2Ftmp%2Fother".to_string())
+        );
+    }
+
+    #[test]
+    fn leaves_canonical_workspace_path_unchanged() {
+        let uri = "/?path=%2Fsrv%2Fproject"
+            .parse::<axum::http::Uri>()
+            .unwrap();
+
+        assert_eq!(
+            canonical_workspace_location(&uri, Path::new("/srv/project")),
+            None
+        );
+    }
+
+    #[test]
+    fn canonicalizes_virtual_workspace_root_without_trailing_slash() {
+        let uri = "/?path=%2Fworkspace".parse::<axum::http::Uri>().unwrap();
+
+        assert_eq!(
+            canonical_workspace_location(&uri, Path::new("/srv/project")),
+            Some("/?path=%2Fsrv%2Fproject".to_string())
+        );
+    }
 }

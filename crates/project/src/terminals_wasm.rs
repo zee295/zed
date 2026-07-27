@@ -137,6 +137,24 @@ impl Project {
         cwd: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
+        self.create_terminal_shell_internal(cwd, None, cx)
+    }
+
+    pub fn restore_terminal_shell(
+        &mut self,
+        cwd: Option<PathBuf>,
+        resume_key: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Terminal>>> {
+        self.create_terminal_shell_internal(cwd, Some(resume_key), cx)
+    }
+
+    fn create_terminal_shell_internal(
+        &mut self,
+        cwd: Option<PathBuf>,
+        resume_key: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Terminal>>> {
         let path: Option<Arc<Path>> = cwd.map(|p| Arc::from(&*p));
 
         let mut settings_location = None;
@@ -149,6 +167,10 @@ impl Project {
             }
         }
         let settings = TerminalSettings::get(settings_location, cx).clone();
+        let mut env = settings.env.clone();
+        if let Some(resume_key) = resume_key {
+            env.insert("ZED_WEB_TERMINAL_RESUME_KEY".to_string(), resume_key);
+        }
         let shell = Shell::Program(get_default_system_shell());
         let path_style = self.path_style(cx);
         let cwd = path.map(|p| p.to_path_buf());
@@ -161,7 +183,7 @@ impl Project {
                         cwd,
                         None,
                         shell,
-                        settings.env.clone(),
+                        env,
                         settings.cursor_shape,
                         settings.alternate_scroll,
                         settings.max_scroll_history_lines,

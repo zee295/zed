@@ -16,10 +16,10 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
 };
 use task::Shell;
 use util::get_default_system_shell_preferring_bash;
+use web_time::Instant;
 
 /// Convert process exit status into ACP terminal exit status.
 /// Avoids portable-pty (not available on browser wasm).

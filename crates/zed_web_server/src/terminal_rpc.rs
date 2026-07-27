@@ -22,12 +22,22 @@ pub struct TerminalManager {
     outgoing: mpsc::UnboundedSender<Message>,
     next_id: u64,
     terminals: HashMap<u64, TerminalEntry>,
+    terminals_by_resume_key: HashMap<String, u64>,
 }
 
 struct TerminalEntry {
     master: Box<dyn MasterPty + Send>,
     writer: Mutex<Box<dyn std::io::Write + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    output: Arc<Mutex<TerminalOutput>>,
+    resume_key: Option<String>,
+}
+
+struct TerminalOutput {
+    history: Vec<u8>,
+    data_method: String,
+    exit_method: String,
+    exit_status: Option<i32>,
 }
 
 impl TerminalManager {
@@ -37,6 +47,7 @@ impl TerminalManager {
             outgoing,
             next_id: 1,
             terminals: HashMap::new(),
+            terminals_by_resume_key: HashMap::new(),
         }
     }
 
@@ -45,14 +56,33 @@ impl TerminalManager {
             "Terminal::open" => self.open(params),
             "Terminal::write" => self.write(params),
             "Terminal::resize" => self.resize(params),
+            "Terminal::bind" => self.bind(params),
             "Terminal::close" => self.close(params),
             _ => bail!("unknown terminal method: {method}"),
         }
     }
 
     fn open(&mut self, params: &Value) -> Result<Value> {
+        let resume_key = params
+            .get("resume_key")
+            .and_then(Value::as_str)
+            .filter(|key| !key.is_empty())
+            .map(ToOwned::to_owned);
+        if let Some(resume_key) = resume_key.as_deref()
+            && let Some(term_id) = self.resume_terminal(resume_key, params)?
+        {
+            return Ok(term_id);
+        }
+
         let term_id = self.next_id;
         self.next_id += 1;
+        let (data_method, exit_method) = notification_methods(params, term_id);
+        let output = Arc::new(Mutex::new(TerminalOutput {
+            history: Vec::new(),
+            data_method,
+            exit_method,
+            exit_status: None,
+        }));
         let pair = native_pty_system().openpty(PtySize {
             rows: dimension(params, "rows", 24),
             cols: dimension(params, "cols", 80),
@@ -122,6 +152,7 @@ impl TerminalManager {
         let mut reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
         let outgoing = self.outgoing.clone();
+        let reader_output = output.clone();
         std::thread::Builder::new()
             .name(format!("zed-terminal-reader-{term_id}"))
             .spawn(move || {
@@ -133,36 +164,98 @@ impl TerminalManager {
                     if count == 0 {
                         break;
                     }
-                    notify(
-                        &outgoing,
-                        &format!("Terminal::data:{term_id}"),
-                        json!({
-                            "term_id": term_id,
-                            "data": BASE64.encode(&buffer[..count]),
-                        }),
-                    );
+                    let method = {
+                        let Ok(mut output) = reader_output.lock() else {
+                            break;
+                        };
+                        output.history.extend_from_slice(&buffer[..count]);
+                        output.data_method.clone()
+                    };
+                    notify(&outgoing, &method, terminal_data(term_id, &buffer[..count]));
                 }
             })?;
         let outgoing = self.outgoing.clone();
+        let wait_output = output.clone();
         std::thread::Builder::new()
             .name(format!("zed-terminal-wait-{term_id}"))
             .spawn(move || {
                 let status = child.wait().ok().map(|status| status.exit_code() as i32);
+                let method = wait_output
+                    .lock()
+                    .map(|mut output| {
+                        output.exit_status = status;
+                        output.exit_method.clone()
+                    })
+                    .unwrap_or_else(|_| format!("Terminal::exit:{term_id}"));
                 notify(
                     &outgoing,
-                    &format!("Terminal::exit:{term_id}"),
+                    &method,
                     json!({"term_id": term_id, "status": status}),
                 );
             })?;
+        if let Some(resume_key) = resume_key.as_ref() {
+            self.terminals_by_resume_key
+                .insert(resume_key.clone(), term_id);
+        }
         self.terminals.insert(
             term_id,
             TerminalEntry {
                 master: pair.master,
                 writer: Mutex::new(writer),
                 killer: Mutex::new(killer),
+                output,
+                resume_key,
             },
         );
-        Ok(json!({"term_id": term_id}))
+        Ok(json!({"term_id": term_id, "resumed": false}))
+    }
+
+    fn resume_terminal(&mut self, resume_key: &str, params: &Value) -> Result<Option<Value>> {
+        let term_id = self
+            .terminals_by_resume_key
+            .get(resume_key)
+            .copied()
+            .or_else(|| {
+                self.terminals
+                    .iter()
+                    .filter(|(_, terminal)| terminal.resume_key.is_none())
+                    .map(|(term_id, _)| *term_id)
+                    .min()
+            });
+        let Some(term_id) = term_id else {
+            return Ok(None);
+        };
+        let Some(terminal) = self.terminals.get_mut(&term_id) else {
+            self.terminals_by_resume_key.remove(resume_key);
+            return Ok(None);
+        };
+        if terminal.resume_key.is_none() {
+            terminal.resume_key = Some(resume_key.to_string());
+            self.terminals_by_resume_key
+                .insert(resume_key.to_string(), term_id);
+        }
+        terminal.master.resize(PtySize {
+            rows: dimension(params, "rows", 24),
+            cols: dimension(params, "cols", 80),
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        let (data_method, exit_method) = notification_methods(params, term_id);
+        let (history, exit_status) = {
+            let mut output = terminal
+                .output
+                .lock()
+                .map_err(|_| anyhow!("terminal output lock poisoned"))?;
+            output.data_method = data_method;
+            output.exit_method = exit_method;
+            (BASE64.encode(&output.history), output.exit_status)
+        };
+        Ok(Some(json!({
+            "term_id": term_id,
+            "resumed": true,
+            "history": history,
+            "exit_status": exit_status,
+        })))
     }
 
     fn write(&self, params: &Value) -> Result<Value> {
@@ -198,9 +291,30 @@ impl TerminalManager {
         Ok(Value::Null)
     }
 
+    fn bind(&mut self, params: &Value) -> Result<Value> {
+        let term_id = terminal_id(params)?;
+        let resume_key = params
+            .get("resume_key")
+            .and_then(Value::as_str)
+            .filter(|key| !key.is_empty())
+            .context("missing terminal resume key")?
+            .to_string();
+        let Some(terminal) = self.terminals.get_mut(&term_id) else {
+            return Ok(Value::Null);
+        };
+        if let Some(previous_key) = terminal.resume_key.replace(resume_key.clone()) {
+            self.terminals_by_resume_key.remove(&previous_key);
+        }
+        self.terminals_by_resume_key.insert(resume_key, term_id);
+        Ok(Value::Null)
+    }
+
     fn close(&mut self, params: &Value) -> Result<Value> {
         let term_id = terminal_id(params)?;
         if let Some(terminal) = self.terminals.remove(&term_id) {
+            if let Some(resume_key) = terminal.resume_key.as_ref() {
+                self.terminals_by_resume_key.remove(resume_key);
+            }
             terminal
                 .killer
                 .lock()
@@ -238,6 +352,26 @@ fn dimension(params: &Value, key: &str, default: u16) -> u16 {
         .max(1)
 }
 
+fn notification_methods(params: &Value, term_id: u64) -> (String, String) {
+    let notification_id = params
+        .get("notification_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| term_id.to_string());
+    (
+        format!("Terminal::data:{notification_id}"),
+        format!("Terminal::exit:{notification_id}"),
+    )
+}
+
+fn terminal_data(term_id: u64, bytes: &[u8]) -> Value {
+    json!({
+        "term_id": term_id,
+        "data": BASE64.encode(bytes),
+    })
+}
+
 fn is_external_agent_npm_prefix(value: &str) -> bool {
     value
         .replace('\\', "/")
@@ -254,7 +388,14 @@ fn notify(outgoing: &mpsc::UnboundedSender<Message>, method: &str, params: Value
 
 #[cfg(test)]
 mod tests {
-    use super::is_external_agent_npm_prefix;
+    use std::{sync::Arc, thread, time::Duration};
+
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use serde_json::json;
+    use tokio::sync::mpsc;
+
+    use super::{TerminalManager, is_external_agent_npm_prefix};
+    use crate::fs_rpc::FsRpc;
 
     #[test]
     fn recognizes_external_agent_npm_prefix() {
@@ -269,5 +410,59 @@ mod tests {
     #[test]
     fn preserves_user_npm_prefix() {
         assert!(!is_external_agent_npm_prefix("/Users/zee/.npm-global"));
+    }
+
+    #[test]
+    fn resumes_bound_terminal_with_same_id_and_history() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let fs = Arc::new(FsRpc::new(root.path().to_path_buf(), false)?);
+        let (outgoing, _notifications) = mpsc::unbounded_channel();
+        let mut terminals = TerminalManager::new(fs, outgoing);
+        let opened = terminals.dispatch(
+            "Terminal::open",
+            &json!({
+                "shell": {
+                    "program": "/bin/sh",
+                    "args": ["-c", "printf 'persistent-terminal-marker\\n'; sleep 30"]
+                },
+                "notification_id": "initial"
+            }),
+        )?;
+        let term_id = opened["term_id"].as_u64().unwrap();
+
+        let marker = b"persistent-terminal-marker";
+        for _ in 0..100 {
+            let has_marker = terminals
+                .terminals
+                .get(&term_id)
+                .unwrap()
+                .output
+                .lock()
+                .unwrap()
+                .history
+                .windows(marker.len())
+                .any(|window| window == marker);
+            if has_marker {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        terminals.dispatch(
+            "Terminal::bind",
+            &json!({"term_id": term_id, "resume_key": "workspace:1:terminal:9"}),
+        )?;
+        let resumed = terminals.dispatch(
+            "Terminal::open",
+            &json!({
+                "resume_key": "workspace:1:terminal:9",
+                "notification_id": "restored"
+            }),
+        )?;
+        assert_eq!(resumed["term_id"], term_id);
+        assert_eq!(resumed["resumed"], true);
+        let history = BASE64.decode(resumed["history"].as_str().unwrap())?;
+        assert!(history.windows(marker.len()).any(|window| window == marker));
+        terminals.dispatch("Terminal::close", &json!({"term_id": term_id}))?;
+        Ok(())
     }
 }

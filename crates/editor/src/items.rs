@@ -1296,6 +1296,9 @@ impl SerializableItem for Editor {
         log::debug!(
             "Deserialized editor {item_id:?} in workspace {workspace_id:?}, {serialized_editor:?}"
         );
+        #[cfg(target_family = "wasm")]
+        let metadata_prefetch =
+            EditorDb::prefetch_metadata(item_id, workspace_id, serialized_editor.abs_path.clone());
 
         match serialized_editor {
             SerializedEditor {
@@ -1306,6 +1309,10 @@ impl SerializableItem for Editor {
             } => window.spawn(cx, {
                 let project = project.clone();
                 async move |cx| {
+                    #[cfg(target_family = "wasm")]
+                    metadata_prefetch
+                        .await
+                        .context("Failed to prefetch editor metadata")?;
                     let language_registry =
                         project.read_with(cx, |project, _| project.languages().clone());
 
@@ -1362,6 +1369,10 @@ impl SerializableItem for Editor {
 
                 match opened_buffer {
                     Some(opened_buffer) => window.spawn(cx, async move |cx| {
+                        #[cfg(target_family = "wasm")]
+                        metadata_prefetch
+                            .await
+                            .context("Failed to prefetch editor metadata")?;
                         let (_, buffer) = opened_buffer
                             .await
                             .context("Failed to open path in project")?;
@@ -1389,6 +1400,10 @@ impl SerializableItem for Editor {
                         // the item to a pane. The caller (deserialize_to) will add the
                         // returned item to the correct pane.
                         window.spawn(cx, async move |cx| {
+                            #[cfg(target_family = "wasm")]
+                            metadata_prefetch
+                                .await
+                                .context("Failed to prefetch editor metadata")?;
                             let buffer = project
                                 .update(cx, |project, cx| project.open_local_buffer(&abs_path, cx))
                                 .await
@@ -1419,6 +1434,10 @@ impl SerializableItem for Editor {
                 contents: None,
                 ..
             } => window.spawn(cx, async move |cx| {
+                #[cfg(target_family = "wasm")]
+                metadata_prefetch
+                    .await
+                    .context("Failed to prefetch editor metadata")?;
                 let buffer = project
                     .update(cx, |project, cx| project.create_buffer(None, true, cx))
                     .await

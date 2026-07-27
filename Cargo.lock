@@ -127,6 +127,7 @@ dependencies = [
  "serde",
  "serde_json",
  "settings",
+ "smol",
  "task",
  "telemetry",
  "tempfile",
@@ -17386,6 +17387,7 @@ dependencies = [
  "futures-lite 1.13.0",
  "serde",
  "serde_json",
+ "uuid",
  "wasm-bindgen-futures",
  "wasm_rpc",
 ]
@@ -23777,6 +23779,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
+ "urlencoding",
  "walkdir",
  "zed-reqwest",
 ]

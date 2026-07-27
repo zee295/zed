@@ -12,11 +12,29 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+#[cfg(target_family = "wasm")]
+use std::sync::TryLockError;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::git::RemoteGitRepository;
 use crate::transport::RemoteClient;
+
+fn lock_shared<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    #[cfg(target_family = "wasm")]
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return guard,
+            Err(TryLockError::Poisoned(error)) => return error.into_inner(),
+            Err(TryLockError::WouldBlock) => std::hint::spin_loop(),
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    {
+        mutex.lock().unwrap_or_else(|error| error.into_inner())
+    }
+}
 
 /// A remote implementation of `fs::Fs` that forwards every operation over a
 /// WebSocket JSON-RPC channel to a backend `zed-server`.
@@ -54,11 +72,7 @@ impl RemoteFs {
                     })
                 })
                 .collect();
-            if let Some(tx) = subs_for_handler
-                .lock()
-                .unwrap()
-                .get(&payload.subscription_id)
-            {
+            if let Some(tx) = lock_shared(&subs_for_handler).get(&payload.subscription_id) {
                 tx.unbounded_send(events).ok();
             }
         });
@@ -125,10 +139,11 @@ struct WatchResponse {
     subscription_id: u64,
 }
 
-#[derive(Debug)]
 struct RemoteWatcher {
     subscriptions: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Vec<PathEvent>>>>>,
     subscription_id: u64,
+    client: RemoteClient,
+    executor: BackgroundExecutor,
 }
 
 impl Watcher for RemoteWatcher {
@@ -143,10 +158,20 @@ impl Watcher for RemoteWatcher {
 
 impl Drop for RemoteWatcher {
     fn drop(&mut self) {
-        self.subscriptions
-            .lock()
-            .unwrap()
-            .remove(&self.subscription_id);
+        lock_shared(&self.subscriptions).remove(&self.subscription_id);
+        let client = self.client.clone();
+        let subscription_id = self.subscription_id;
+        self.executor
+            .spawn(async move {
+                client
+                    .call_void(
+                        "Fs::unwatch",
+                        &json!({ "subscription_id": subscription_id }),
+                    )
+                    .await
+                    .ok();
+            })
+            .detach();
     }
 }
 
@@ -450,10 +475,7 @@ impl Fs for RemoteFs {
             .unwrap_or(WatchResponse { subscription_id: 0 });
 
         let (tx, rx) = mpsc::unbounded::<Vec<PathEvent>>();
-        self.watch_subscriptions
-            .lock()
-            .unwrap()
-            .insert(response.subscription_id, tx);
+        lock_shared(&self.watch_subscriptions).insert(response.subscription_id, tx);
 
         let subscriptions = self.watch_subscriptions.clone();
         let subscription_id = response.subscription_id;
@@ -465,6 +487,8 @@ impl Fs for RemoteFs {
         let watcher = Arc::new(RemoteWatcher {
             subscriptions,
             subscription_id,
+            client: self.client.clone(),
+            executor: self.executor.clone(),
         });
 
         (

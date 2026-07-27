@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -30,6 +30,7 @@ pub struct AgentManager {
     outgoing: mpsc::UnboundedSender<Message>,
     state: Arc<Mutex<AgentState>>,
     cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    running: Arc<StdMutex<HashMap<String, RunningChat>>>,
     sequence: Arc<AtomicU64>,
 }
 
@@ -47,6 +48,14 @@ struct AgentThread {
     messages: Vec<Value>,
     created_at: f64,
     updated_at: f64,
+}
+
+#[derive(Clone)]
+struct RunningChat {
+    chat_id: String,
+    thread_id: String,
+    agent_id: String,
+    output: String,
 }
 
 #[derive(Clone)]
@@ -86,6 +95,7 @@ impl AgentManager {
                 selected_agent_id: "native".into(),
             })),
             cancels: Arc::new(Mutex::new(HashMap::new())),
+            running: Arc::new(StdMutex::new(HashMap::new())),
             sequence: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -100,8 +110,15 @@ impl AgentManager {
             "Agent::open_thread" => self.open_thread(params).await,
             "Agent::delete_thread" => self.delete_thread(params).await,
             "Agent::chat" => self.chat(params).await,
+            "Agent::running" => self.running(params).await,
             "Agent::cancel" => self.cancel(params).await,
             _ => bail!("unknown agent method: {method}"),
+        }
+    }
+
+    pub async fn shutdown(&self) {
+        for cancel in self.cancels.lock().await.values() {
+            cancel.store(true, Ordering::Relaxed);
         }
     }
 
@@ -219,6 +236,18 @@ impl AgentManager {
             .lock()
             .await
             .insert(chat_id.clone(), cancel.clone());
+        self.running
+            .lock()
+            .map_err(|_| anyhow!("running agent state lock poisoned"))?
+            .insert(
+                chat_id.clone(),
+                RunningChat {
+                    chat_id: chat_id.clone(),
+                    thread_id: thread_id.clone(),
+                    agent_id: agent_id.clone(),
+                    output: String::new(),
+                },
+            );
         let model = params
             .get("model")
             .and_then(Value::as_str)
@@ -312,6 +341,9 @@ impl AgentManager {
                     .push(json!({"role": "assistant", "content": output}));
                 thread.updated_at = now();
             }
+        }
+        if let Ok(mut running) = self.running.lock() {
+            running.remove(&chat_id);
         }
         self.cancels.lock().await.remove(&chat_id);
         notify(
@@ -482,6 +514,11 @@ impl AgentManager {
     }
 
     fn chunk(&self, chat_id: &str, text: &str) {
+        if let Ok(mut running) = self.running.lock()
+            && let Some(chat) = running.get_mut(chat_id)
+        {
+            chat.output.push_str(text);
+        }
         notify(
             &self.outgoing,
             &format!("Agent::chunk:{chat_id}"),
@@ -501,6 +538,28 @@ impl AgentManager {
                 true
             });
         Ok(json!({"cancelled": cancelled, "chat_id": chat_id}))
+    }
+
+    async fn running(&self, params: &Value) -> Result<Value> {
+        let thread_id = params
+            .get("thread_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let running = self
+            .running
+            .lock()
+            .map_err(|_| anyhow!("running agent state lock poisoned"))?
+            .values()
+            .find(|chat| thread_id.is_empty() || chat.thread_id == thread_id)
+            .cloned();
+        Ok(json!({
+            "running": running.map(|chat| json!({
+                "chat_id": chat.chat_id,
+                "thread_id": chat.thread_id,
+                "agent_id": chat.agent_id,
+                "output": chat.output,
+            }))
+        }))
     }
 }
 
@@ -756,4 +815,66 @@ fn floor_boundary(text: &str, mut index: usize) -> usize {
         index -= 1;
     }
     index
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, time::Duration};
+
+    use serde_json::json;
+    use tokio::sync::mpsc;
+
+    use super::AgentManager;
+
+    #[tokio::test]
+    async fn exposes_running_chat_until_server_side_completion() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::create_dir_all(root.path().join(".zed"))?;
+        fs::write(
+            root.path().join(".zed/external_agents.json"),
+            serde_json::to_vec(&json!([{
+                "id": "resume-test",
+                "name": "Resume Test",
+                "command": "/bin/sh",
+                "args": ["-c", "sleep 0.2; printf 'agent-resume-output\\n'"]
+            }]))?,
+        )?;
+        let (outgoing, _notifications) = mpsc::unbounded_channel();
+        let manager =
+            AgentManager::new(root.path().to_path_buf(), reqwest::Client::new(), outgoing);
+        let started = manager
+            .dispatch(
+                "Agent::chat",
+                &json!({
+                    "chat_id": "resume-chat",
+                    "agent_id": "resume-test",
+                    "messages": [{"role": "user", "content": "continue"}]
+                }),
+            )
+            .await?;
+        let thread_id = started["thread_id"].as_str().unwrap();
+        let running = manager
+            .dispatch("Agent::running", &json!({"thread_id": thread_id}))
+            .await?;
+        assert_eq!(running["running"]["chat_id"], "resume-chat");
+
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        let completed = manager
+            .dispatch("Agent::running", &json!({"thread_id": thread_id}))
+            .await?;
+        assert!(completed["running"].is_null());
+        let thread = manager
+            .dispatch("Agent::open_thread", &json!({"thread_id": thread_id}))
+            .await?;
+        assert!(
+            thread["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("agent-resume-output")))
+        );
+        Ok(())
+    }
 }

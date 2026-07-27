@@ -419,6 +419,37 @@ impl Domain for TerminalDb {
 db::static_connection!(TerminalDb, [WorkspaceDb]);
 
 impl TerminalDb {
+    #[cfg(target_family = "wasm")]
+    pub async fn prefetch_deserialize(item_id: ItemId, workspace_id: WorkspaceId) -> Result<()> {
+        use db::sqlez::remote_sql::{SqlParam, prefetch_query};
+
+        let workspace_id = serde_json::to_value(workspace_id)?
+            .as_i64()
+            .ok_or_else(|| anyhow::anyhow!("workspace id is not an integer"))?;
+        let item_id = SqlParam::int(item_id as i64);
+        let workspace_id = SqlParam::int(workspace_id);
+        let working_directory_params = [item_id.clone(), workspace_id.clone()];
+        let working_directory = prefetch_query(
+            sql!(
+                SELECT working_directory
+                FROM terminals
+                WHERE item_id = ? AND workspace_id = ?
+            ),
+            &working_directory_params,
+        );
+        let custom_title_params = [item_id, workspace_id];
+        let custom_title = prefetch_query(
+            sql!(
+                SELECT custom_title
+                FROM terminals
+                WHERE item_id = ? AND workspace_id = ?
+            ),
+            &custom_title_params,
+        );
+        futures::try_join!(working_directory, custom_title)?;
+        Ok(())
+    }
+
     query! {
        pub async fn update_workspace_id(
             new_id: WorkspaceId,

@@ -23,6 +23,7 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["full"] }
 toml.workspace = true
 tracing.workspace = true
+urlencoding.workspace = true
 
 axum = { version = "0.6", features = ["headers", "ws"] }
 flate2 = "1"

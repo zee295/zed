@@ -25,5 +25,6 @@ base64.workspace = true
 futures = "0.3"
 serde.workspace = true
 serde_json.workspace = true
+uuid = { workspace = true, features = ["js"] }
 wasm-bindgen-futures.workspace = true
 wasm_rpc = { workspace = true }

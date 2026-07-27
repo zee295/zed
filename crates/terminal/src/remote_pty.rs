@@ -8,6 +8,7 @@
 use collections::HashMap;
 use std::borrow::Cow;
 use std::process::ExitStatus;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context as _, Result};
 use base64::Engine as _;
@@ -18,6 +19,9 @@ use wasm_rpc::RpcClient;
 
 use crate::{PtyEvent, TerminalBackendEvent, TerminalBounds};
 
+const RESUME_KEY_ENV: &str = "ZED_WEB_TERMINAL_RESUME_KEY";
+static NEXT_NOTIFICATION_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Handle to a server-side PTY.
 pub struct RemotePty {
     term_id: u64,
@@ -27,6 +31,10 @@ pub struct RemotePty {
 #[derive(Deserialize)]
 struct OpenResponse {
     term_id: u64,
+    #[serde(default)]
+    history: String,
+    #[serde(default)]
+    exit_status: Option<i32>,
 }
 
 #[derive(Deserialize)]
@@ -51,10 +59,26 @@ impl RemotePty {
         client: RpcClient,
         shell: Option<(String, Vec<String>)>,
         working_directory: Option<std::path::PathBuf>,
-        env: HashMap<String, String>,
+        mut env: HashMap<String, String>,
         initial_bounds: TerminalBounds,
         events_tx: UnboundedSender<PtyEvent>,
     ) -> Result<Self> {
+        let resume_key = env.remove(RESUME_KEY_ENV);
+        let notification_id = format!(
+            "pty-{}",
+            NEXT_NOTIFICATION_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let data_method = format!("Terminal::data:{notification_id}");
+        let exit_method = format!("Terminal::exit:{notification_id}");
+        client.on_notification(&data_method, {
+            let events_tx = events_tx.clone();
+            move |params| forward_data_notification(params, &events_tx)
+        });
+        client.on_notification(&exit_method, {
+            let events_tx = events_tx.clone();
+            move |params| forward_exit_notification(params, &events_tx)
+        });
+
         let shell = shell.map(|(program, args)| json!({ "program": program, "args": args }));
         let response: OpenResponse = client
             .call(
@@ -63,6 +87,8 @@ impl RemotePty {
                     "shell": shell,
                     "working_directory": working_directory.map(|p| p.to_string_lossy().to_string()),
                     "env": env,
+                    "resume_key": resume_key,
+                    "notification_id": notification_id,
                     "cols": initial_bounds.num_columns(),
                     "rows": initial_bounds.num_lines(),
                 }),
@@ -71,40 +97,29 @@ impl RemotePty {
             .context("Terminal::open failed")?;
 
         let term_id = response.term_id;
-
-        // Forward server-side output/exit notifications into the terminal
-        // event loop.
-        let data_method = format!("Terminal::data:{term_id}");
-        let exit_method = format!("Terminal::exit:{term_id}");
-
-        client.on_notification(&data_method, {
-            let events_tx = events_tx.clone();
-            move |params| {
-                let Ok(payload) = serde_json::from_value::<DataNotification>(params) else {
-                    return;
-                };
-                let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&payload.data)
-                else {
-                    return;
-                };
-                let _ = events_tx.unbounded_send(PtyEvent::Bytes(bytes));
-            }
-        });
-
-        client.on_notification(&exit_method, {
-            let events_tx = events_tx.clone();
-            move |params| {
-                let Ok(_payload) = serde_json::from_value::<ExitNotification>(params) else {
-                    return;
-                };
-                let _ = events_tx.unbounded_send(PtyEvent::Event(TerminalBackendEvent::Exit));
-                let _ = events_tx.unbounded_send(PtyEvent::Event(TerminalBackendEvent::ChildExit(
-                    ExitStatus::default(),
-                )));
-            }
-        });
+        if !response.history.is_empty()
+            && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&response.history)
+        {
+            let _ = events_tx.unbounded_send(PtyEvent::Bytes(bytes));
+        }
+        if response.exit_status.is_some() {
+            forward_exit(&events_tx);
+        }
 
         Ok(Self { term_id, client })
+    }
+
+    pub fn bind_persistence_key(&self, resume_key: String) {
+        let term_id = self.term_id;
+        let client = self.client.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let _ = client
+                .call_void(
+                    "Terminal::bind",
+                    &json!({ "term_id": term_id, "resume_key": resume_key }),
+                )
+                .await;
+        });
     }
 
     pub fn write(&self, input: impl Into<Cow<'static, [u8]>>) {
@@ -147,4 +162,28 @@ impl RemotePty {
                 .await;
         });
     }
+}
+
+fn forward_data_notification(params: serde_json::Value, events_tx: &UnboundedSender<PtyEvent>) {
+    let Ok(payload) = serde_json::from_value::<DataNotification>(params) else {
+        return;
+    };
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&payload.data) else {
+        return;
+    };
+    let _ = events_tx.unbounded_send(PtyEvent::Bytes(bytes));
+}
+
+fn forward_exit_notification(params: serde_json::Value, events_tx: &UnboundedSender<PtyEvent>) {
+    let Ok(_payload) = serde_json::from_value::<ExitNotification>(params) else {
+        return;
+    };
+    forward_exit(events_tx);
+}
+
+fn forward_exit(events_tx: &UnboundedSender<PtyEvent>) {
+    let _ = events_tx.unbounded_send(PtyEvent::Event(TerminalBackendEvent::Exit));
+    let _ = events_tx.unbounded_send(PtyEvent::Event(TerminalBackendEvent::ChildExit(
+        ExitStatus::default(),
+    )));
 }

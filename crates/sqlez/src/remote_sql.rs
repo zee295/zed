@@ -299,7 +299,7 @@ mod read_cache {
     }
 
     pub fn prime(kv: Vec<(String, String)>, scoped: Vec<(String, String, String)>) {
-        if let Ok(mut common) = COMMON.lock() {
+        if let Ok(mut common) = COMMON.try_lock() {
             *common = Some(CommonReads {
                 kv: kv.into_iter().collect(),
                 scoped: scoped
@@ -312,7 +312,7 @@ mod read_cache {
 
     pub fn get_common(sql: &str, params: &[Value]) -> Option<SqlQueryResult> {
         let normalized = sql.split_whitespace().collect::<Vec<_>>().join(" ");
-        let common = COMMON.lock().ok()?;
+        let common = COMMON.try_lock().ok()?;
         let common = common.as_ref()?;
         let value = if normalized.contains("FROM scoped_kv_store WHERE") && params.len() == 2 {
             common.scoped.get(&(
@@ -339,7 +339,7 @@ mod read_cache {
             .collect::<Vec<_>>()
             .join(" ")
             .to_ascii_lowercase();
-        let Ok(mut common) = COMMON.lock() else {
+        let Ok(mut common) = COMMON.try_lock() else {
             return;
         };
         let Some(common) = common.as_mut() else {

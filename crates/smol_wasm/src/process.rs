@@ -38,6 +38,24 @@ thread_local! {
 static NEXT_PROC_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[cfg(target_family = "wasm")]
+thread_local! {
+    // A reload creates a new WASM instance while the RPC session and its child
+    // processes remain alive on the server. Namespace IDs per page instance so
+    // the new process counter cannot replace an existing agent or language server.
+    static PROC_NAMESPACE: u64 = (uuid::Uuid::new_v4().as_u128() as u64) & 0xffff_ffff;
+}
+
+#[cfg(target_family = "wasm")]
+fn next_proc_id() -> u64 {
+    let sequence = NEXT_PROC_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst) & 0x000f_ffff;
+    PROC_NAMESPACE.with(|namespace| compose_process_id(*namespace, sequence))
+}
+
+fn compose_process_id(namespace: u64, sequence: u64) -> u64 {
+    ((namespace & 0xffff_ffff) << 20) | (sequence & 0x000f_ffff)
+}
+
+#[cfg(target_family = "wasm")]
 struct RemoteState {
     client: RpcClient,
     router: Arc<Mutex<ProcessRouter>>,
@@ -163,6 +181,26 @@ pub(crate) fn remote_rpc_client() -> io::Result<RpcClient> {
     remote_state().map(|(client, _)| client)
 }
 
+/// Checks the host-side process registry for an ACP prompt that outlived the
+/// browser instance which submitted it.
+#[cfg(target_family = "wasm")]
+pub async fn remote_session_running(session_id: &str) -> io::Result<bool> {
+    #[derive(serde::Deserialize)]
+    struct RunningSessions {
+        sessions: Vec<String>,
+    }
+
+    let (client, _) = remote_state()?;
+    let response: RunningSessions = client
+        .call("Process::running_sessions", &serde_json::json!({}))
+        .await
+        .map_err(|error| io_error(&error.to_string()))?;
+    Ok(response
+        .sessions
+        .iter()
+        .any(|running| running == session_id))
+}
+
 fn io_error(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::Other, message)
 }
@@ -285,7 +323,7 @@ impl Command {
         #[cfg(target_family = "wasm")]
         {
             let (client, router) = remote_state()?;
-            let proc_id = NEXT_PROC_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let proc_id = next_proc_id();
             let request = SpawnRequest {
                 proc_id,
                 program: self.program.to_string_lossy().to_string(),
@@ -770,4 +808,19 @@ struct StatusRequest {
 #[allow(dead_code)]
 struct StatusResponse {
     status_code: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compose_process_id;
+
+    #[test]
+    fn process_ids_are_page_namespaced_and_javascript_safe() {
+        let first_page = compose_process_id(0x1234_5678, 1);
+        let reloaded_page = compose_process_id(0x8765_4321, 1);
+
+        assert_ne!(first_page, reloaded_page);
+        assert!(first_page <= (1_u64 << 53) - 1);
+        assert!(reloaded_page <= (1_u64 << 53) - 1);
+    }
 }

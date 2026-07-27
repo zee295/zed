@@ -234,6 +234,70 @@ db::static_connection!(EditorDb, [WorkspaceDb]);
 const MAX_QUERY_PLACEHOLDERS: usize = 32000;
 
 impl EditorDb {
+    #[cfg(target_family = "wasm")]
+    pub async fn prefetch_metadata(
+        item_id: ItemId,
+        workspace_id: WorkspaceId,
+        file_path: Option<PathBuf>,
+    ) -> Result<()> {
+        use db::sqlez::remote_sql::{SqlParam, prefetch_query};
+
+        let workspace_id = serde_json::to_value(workspace_id)?
+            .as_i64()
+            .ok_or_else(|| anyhow::anyhow!("workspace id is not an integer"))?;
+        let item_id = SqlParam::int(item_id as i64);
+        let workspace_id = SqlParam::int(workspace_id);
+        let file_workspace_id = workspace_id.clone();
+        let file_folds = async {
+            if let Some(file_path) = file_path.as_deref() {
+                let params = [
+                    file_workspace_id,
+                    SqlParam::blob(file_path.as_os_str().as_encoded_bytes()),
+                ];
+                prefetch_query(
+                    sql!(
+                        SELECT start, end, start_fingerprint, end_fingerprint
+                        FROM file_folds
+                        WHERE workspace_id = ?1 AND path = ?2
+                        ORDER BY start
+                    ),
+                    &params,
+                )
+                .await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let editor_folds_params = [item_id.clone(), workspace_id.clone()];
+        let editor_folds = prefetch_query(
+            sql!(
+                SELECT start, end, start_fingerprint, end_fingerprint
+                FROM editor_folds
+                WHERE editor_id = ?1 AND workspace_id = ?2
+            ),
+            &editor_folds_params,
+        );
+        let selection_params = [item_id.clone(), workspace_id.clone()];
+        let selections = prefetch_query(
+            sql!(
+                SELECT start, end
+                FROM editor_selections
+                WHERE editor_id = ?1 AND workspace_id = ?2
+            ),
+            &selection_params,
+        );
+        let scroll_params = [item_id, workspace_id];
+        let scroll_position = prefetch_query(
+            sql!(
+                SELECT scroll_top_row, scroll_horizontal_offset, scroll_vertical_offset
+                FROM editors
+                WHERE item_id = ? AND workspace_id = ?
+            ),
+            &scroll_params,
+        );
+        futures::try_join!(file_folds, editor_folds, selections, scroll_position)?;
+        Ok(())
+    }
+
     query! {
         pub fn get_serialized_editor(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<SerializedEditor>> {
             SELECT path, buffer_path, contents, language, mtime_seconds, mtime_nanos FROM editors
@@ -357,6 +421,18 @@ VALUES {placeholders};
 
             let selections = selections[first_selection..last_selection].to_vec();
             self.write(move |conn| {
+                let editor_exists = conn.select_row_bound::<(ItemId, WorkspaceId), i32>(
+                    "SELECT EXISTS(
+                            SELECT 1 FROM editors
+                            WHERE item_id = ?1 AND workspace_id = ?2
+                        )",
+                )?((editor_id, workspace_id))?
+                .unwrap_or_default()
+                    != 0;
+                if !editor_exists {
+                    return Ok(());
+                }
+
                 let mut statement = Statement::prepare(conn, query)?;
                 statement.bind(&editor_id, 1)?;
                 let mut next_index = statement.bind(&workspace_id, 2)?;

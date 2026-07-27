@@ -136,6 +136,10 @@ impl PtySender {
         self.remote.resize(bounds);
     }
 
+    pub(super) fn bind_persistence_key(&self, resume_key: String) {
+        self.remote.bind_persistence_key(resume_key);
+    }
+
     pub(super) fn shutdown(&self) {
         self.remote.close();
     }

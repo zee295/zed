@@ -4,6 +4,7 @@ pub mod terminal_panel;
 mod terminal_path_like_target;
 pub mod terminal_scrollbar;
 
+use anyhow::Context as _;
 use editor::{
     Editor, EditorSettings, actions::SelectAll, blink_manager::BlinkManager,
     ui_scrollbar_settings_from_raw,
@@ -76,6 +77,11 @@ fn viewport_line_for_point(point: Point, display_offset: usize) -> Option<usize>
 }
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
+
+#[cfg(target_family = "wasm")]
+fn terminal_resume_key(workspace_id: WorkspaceId, item_id: workspace::ItemId) -> String {
+    format!("workspace:{}:terminal:{}", i64::from(workspace_id), item_id)
+}
 
 /// Event to transmit the scroll from the element to the view
 #[derive(Clone, Debug, PartialEq)]
@@ -1872,6 +1878,8 @@ impl SerializableItem for TerminalView {
         }
 
         let workspace_id = self.workspace_id?;
+        #[cfg(target_family = "wasm")]
+        terminal.bind_remote_persistence_key(terminal_resume_key(workspace_id, item_id));
         let cwd = terminal.working_directory();
         let custom_title = self.custom_title.clone();
         self.needs_serialize = false;
@@ -1901,6 +1909,10 @@ impl SerializableItem for TerminalView {
         cx: &mut App,
     ) -> Task<anyhow::Result<Entity<Self>>> {
         window.spawn(cx, async move |cx| {
+            #[cfg(target_family = "wasm")]
+            TerminalDb::prefetch_deserialize(item_id, workspace_id)
+                .await
+                .context("Failed to prefetch terminal metadata")?;
             let (cwd, custom_title) = cx
                 .update(|_window, cx| {
                     let db = TerminalDb::global(cx);
@@ -1929,7 +1941,20 @@ impl SerializableItem for TerminalView {
                 .unwrap_or((None, None));
 
             let terminal = project
-                .update(cx, |project, cx| project.create_terminal_shell(cwd, cx))
+                .update(cx, |project, cx| {
+                    #[cfg(target_family = "wasm")]
+                    {
+                        project.restore_terminal_shell(
+                            cwd,
+                            terminal_resume_key(workspace_id, item_id),
+                            cx,
+                        )
+                    }
+                    #[cfg(not(target_family = "wasm"))]
+                    {
+                        project.create_terminal_shell(cwd, cx)
+                    }
+                })
                 .await?;
             cx.update(|window, cx| {
                 cx.new(|cx| {
