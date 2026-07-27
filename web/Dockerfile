@@ -2,6 +2,7 @@
 
 ARG RUST_VERSION=1.95.0
 ARG NODE_VERSION=22.23.1
+ARG NPM_VERSION=12.0.1
 FROM rust:${RUST_VERSION}-bookworm AS builder
 
 ARG RUST_VERSION
@@ -31,10 +32,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     ./web/build.sh
 
 FROM node:${NODE_VERSION}-bookworm-slim AS node-runtime
+ARG NPM_VERSION
+RUN npm install --global "npm@${NPM_VERSION}" \
+    && npm cache clean --force
 
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
     && apt-get install -y --no-install-recommends \
         bash \
         ca-certificates \
