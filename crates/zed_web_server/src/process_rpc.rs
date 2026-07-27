@@ -1,5 +1,7 @@
 use std::{
     collections::HashMap,
+    env,
+    path::PathBuf,
     process::{Command, Stdio},
     sync::{Arc, Mutex as StdMutex},
 };
@@ -36,6 +38,8 @@ pub struct ProcessManager {
     fs: Arc<FsRpc>,
     outgoing: mpsc::UnboundedSender<Message>,
     processes: HashMap<u64, ProcessEntry>,
+    #[cfg(unix)]
+    open_url_bridge: Option<OpenUrlBridge>,
 }
 
 struct ProcessEntry {
@@ -115,10 +119,16 @@ fn take_lines(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
 
 impl ProcessManager {
     pub fn new(fs: Arc<FsRpc>, outgoing: mpsc::UnboundedSender<Message>) -> Self {
+        #[cfg(unix)]
+        let open_url_bridge = OpenUrlBridge::new(outgoing.clone())
+            .map_err(|error| tracing::warn!(?error, "failed to initialize browser URL bridge"))
+            .ok();
         Self {
             fs,
             outgoing,
             processes: HashMap::new(),
+            #[cfg(unix)]
+            open_url_bridge,
         }
     }
 
@@ -178,8 +188,13 @@ impl ProcessManager {
                 .filter(|path| path.is_dir())
                 .unwrap_or(root),
         );
-        for (key, value) in environment(params) {
+        let process_environment = environment(params);
+        for (key, value) in &process_environment {
             command.env(key, rewrite(&value));
+        }
+        #[cfg(unix)]
+        if let Some(bridge) = &self.open_url_bridge {
+            bridge.configure_command(&mut command, process_environment.get("PATH"))?;
         }
         if bool_param(params, "stdin_pipe") {
             command.stdin(Stdio::piped());
@@ -365,6 +380,98 @@ impl ProcessManager {
         }
         Ok(Value::Null)
     }
+}
+
+#[cfg(unix)]
+struct OpenUrlBridge {
+    _directory: tempfile::TempDir,
+    shim_directory: PathBuf,
+    socket_path: PathBuf,
+    task: JoinHandle<()>,
+}
+
+#[cfg(unix)]
+impl OpenUrlBridge {
+    fn new(outgoing: mpsc::UnboundedSender<Message>) -> Result<Self> {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir()?;
+        let shim_directory = directory.path().join("bin");
+        std::fs::create_dir(&shim_directory)?;
+        let executable = env::current_exe()?;
+        symlink(&executable, shim_directory.join("open"))?;
+        symlink(&executable, shim_directory.join("xdg-open"))?;
+
+        let socket_path = directory.path().join("open-url.sock");
+        let socket = tokio::net::UnixDatagram::bind(&socket_path)?;
+        let task = tokio::spawn(async move {
+            let mut buffer = vec![0_u8; 16 * 1024];
+            loop {
+                let Ok(count) = socket.recv(&mut buffer).await else {
+                    break;
+                };
+                let Ok(url) = std::str::from_utf8(&buffer[..count]) else {
+                    continue;
+                };
+                if !is_allowed_external_url(url) {
+                    tracing::warn!(%url, "browser URL bridge rejected URL");
+                    continue;
+                }
+                notify(&outgoing, "Browser::open_url", json!({"url": url}));
+            }
+        });
+
+        Ok(Self {
+            _directory: directory,
+            shim_directory,
+            socket_path,
+            task,
+        })
+    }
+
+    fn configure_command(
+        &self,
+        command: &mut AsyncCommand,
+        configured_path: Option<&String>,
+    ) -> Result<()> {
+        let inherited_path = configured_path
+            .map(std::ffi::OsString::from)
+            .or_else(|| env::var_os("PATH"))
+            .unwrap_or_default();
+        let path = env::join_paths(
+            std::iter::once(self.shim_directory.clone()).chain(env::split_paths(&inherited_path)),
+        )?;
+        command.env("PATH", path);
+        command.env("ZED_WEB_OPEN_URL_SOCKET", &self.socket_path);
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for OpenUrlBridge {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[cfg(unix)]
+pub fn run_open_url_shim(args: &[String]) -> Result<()> {
+    use std::os::unix::net::UnixDatagram;
+
+    let url = args
+        .iter()
+        .rev()
+        .find(|argument| is_allowed_external_url(argument))
+        .context("browser opener received no supported URL")?;
+    let socket_path =
+        env::var_os("ZED_WEB_OPEN_URL_SOCKET").context("browser URL socket is not configured")?;
+    let socket = UnixDatagram::unbound()?;
+    socket.send_to(url.as_bytes(), socket_path)?;
+    Ok(())
+}
+
+fn is_allowed_external_url(url: &str) -> bool {
+    url.starts_with("https://") || url.starts_with("http://") || url.starts_with("mailto:")
 }
 
 impl Drop for ProcessManager {

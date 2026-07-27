@@ -67,6 +67,15 @@ pub struct AppState {
 #[tokio::main]
 async fn main() -> Result<()> {
     let raw_args = std::env::args().collect::<Vec<_>>();
+    #[cfg(unix)]
+    if raw_args
+        .first()
+        .and_then(|argument| Path::new(argument).file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "open" || name == "xdg-open")
+    {
+        return process_rpc::run_open_url_shim(&raw_args[1..]);
+    }
     if raw_args.get(1).map(String::as_str) == Some("__debug-adapter-proxy") {
         return debug_adapter::run_proxy(&raw_args[2..]).await;
     }

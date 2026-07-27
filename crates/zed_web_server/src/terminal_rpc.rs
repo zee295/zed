@@ -74,6 +74,9 @@ impl TerminalManager {
             return Ok(term_id);
         }
 
+        let root = self.fs.path("/workspace")?;
+        let root_text = root.to_string_lossy().into_owned();
+        let rewrite = |value: &str| value.replace("/workspace", &root_text);
         let term_id = self.next_id;
         self.next_id += 1;
         let (data_method, exit_method) = notification_methods(params, term_id);
@@ -93,15 +96,15 @@ impl TerminalManager {
         let mut program = shell
             .and_then(|shell| shell.get("program"))
             .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
+            .map(rewrite)
+            .unwrap_or_default();
         let args = shell
             .and_then(|shell| shell.get("args"))
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
-            .map(ToOwned::to_owned)
+            .map(rewrite)
             .collect::<Vec<_>>();
         if program.is_empty()
             || ((program == "/bin/sh" || program == "/bin/bash" || program == "sh")
@@ -115,7 +118,6 @@ impl TerminalManager {
         } else {
             command.args(args);
         }
-        let root = self.fs.path("/workspace")?;
         let working_directory = params
             .get("working_directory")
             .and_then(Value::as_str)
@@ -142,7 +144,7 @@ impl TerminalManager {
                     if !key.eq_ignore_ascii_case("npm_config_prefix")
                         || !is_external_agent_npm_prefix(value)
                     {
-                        command.env(key, value);
+                        command.env(key, rewrite(value));
                     }
                 }
             }
@@ -423,6 +425,57 @@ mod tests {
     #[test]
     fn preserves_user_npm_prefix() {
         assert!(!is_external_agent_npm_prefix("/Users/zee/.npm-global"));
+    }
+
+    #[test]
+    fn rewrites_virtual_paths_in_terminal_arguments_and_environment() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let canonical_root = root.path().canonicalize()?;
+        let fs = Arc::new(FsRpc::new(root.path().to_path_buf(), false)?);
+        let (outgoing, _notifications) = mpsc::unbounded_channel();
+        let mut terminals = TerminalManager::new(fs, outgoing);
+        let opened = terminals.dispatch(
+            "Terminal::open",
+            &json!({
+                "shell": {
+                    "program": "/bin/sh",
+                    "args": [
+                        "-c",
+                        "printf '%s|%s' \"$1\" \"$AUTH_PATH\"",
+                        "auth-test",
+                        "/workspace/.config/agent"
+                    ]
+                },
+                "env": {
+                    "AUTH_PATH": "/workspace/.config/credentials"
+                }
+            }),
+        )?;
+        let term_id = opened["term_id"].as_u64().unwrap();
+        let expected = format!(
+            "{}|{}",
+            canonical_root.join(".config/agent").display(),
+            canonical_root.join(".config/credentials").display()
+        );
+
+        for _ in 0..100 {
+            let has_expected = terminals
+                .terminals
+                .get(&term_id)
+                .unwrap()
+                .output
+                .lock()
+                .unwrap()
+                .history
+                .windows(expected.len())
+                .any(|window| window == expected.as_bytes());
+            if has_expected {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        anyhow::bail!("terminal output did not contain rewritten virtual paths")
     }
 
     #[test]

@@ -113,6 +113,10 @@ export function zedSetWorkspaceSidebarOpen(open) {
         self.localStorage.setItem("zed-web-workspace-sidebar-open", open ? "true" : "false");
     } catch {}
 }
+
+export function zedOpenExternalUrl(url) {
+    return self.__zedOpenExternalUrl?.(url) ?? false;
+}
 "#)]
 extern "C" {
     #[wasm_bindgen(js_name = zedFetchAssetPack)]
@@ -141,6 +145,9 @@ extern "C" {
 
     #[wasm_bindgen(js_name = zedSetWorkspaceSidebarOpen)]
     fn save_workspace_sidebar_open(open: bool);
+
+    #[wasm_bindgen(js_name = zedOpenExternalUrl)]
+    fn open_external_url(url: &str) -> bool;
 }
 
 #[cfg(target_family = "wasm")]
@@ -1018,6 +1025,11 @@ fn init_app_state(
     cx.set_global(settings_store);
 
     wasm_remote::set_remote_client(remote_client.clone());
+    remote_client.on_notification("Browser::open_url", |params| {
+        if let Some(url) = params.get("url").and_then(serde_json::Value::as_str) {
+            open_external_url(url);
+        }
+    });
     smol::set_remote_client(remote_client.clone());
     terminal::set_remote_client(remote_client.clone());
     web_agent_panel::set_remote_client(remote_client.clone());

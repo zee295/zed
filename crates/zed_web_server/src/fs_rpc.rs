@@ -78,18 +78,19 @@ impl FsRpc {
         } else {
             requested.trim()
         };
-        let (candidate, project_relative) =
-            if raw == VIRTUAL_ROOT || raw.starts_with(&format!("{VIRTUAL_ROOT}/")) {
-                let relative = raw.trim_start_matches(VIRTUAL_ROOT).trim_start_matches('/');
-                (self.root.join(relative), true)
+        let (candidate, project_relative) = if raw == VIRTUAL_ROOT {
+            (self.root.as_ref().clone(), true)
+        } else if raw.starts_with(&format!("{VIRTUAL_ROOT}/")) {
+            let relative = raw.trim_start_matches(VIRTUAL_ROOT).trim_start_matches('/');
+            (self.root.join(relative), true)
+        } else {
+            let path = Path::new(raw);
+            if path.is_absolute() {
+                (path.to_path_buf(), false)
             } else {
-                let path = Path::new(raw);
-                if path.is_absolute() {
-                    (path.to_path_buf(), false)
-                } else {
-                    (self.root.join(path), true)
-                }
-            };
+                (self.root.join(path), true)
+            }
+        };
 
         if project_relative && has_parent_component(&candidate.strip_prefix(&*self.root)?) {
             bail!("path escapes project-relative path");
@@ -505,6 +506,10 @@ mod tests {
         assert_eq!(
             rpc.path("/workspace/src/main.rs")?,
             root.path().canonicalize()?.join("src/main.rs")
+        );
+        assert_eq!(
+            rpc.path("/workspace")?.to_string_lossy(),
+            root.path().canonicalize()?.to_string_lossy()
         );
         assert!(rpc.path("/workspace/../outside").is_err());
         Ok(())
