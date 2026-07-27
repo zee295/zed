@@ -1,0 +1,20 @@
+services:
+  zed-web:
+    image: ${ZED_WEB_IMAGE:-ghcr.io/zee295/zed-web:latest}
+    build:
+      context: ..
+      dockerfile: web/Dockerfile
+      args:
+        WEB_REVISION: ${WEB_REVISION:-local}
+        UPSTREAM_REVISION: ${UPSTREAM_REVISION:-unknown}
+    init: true
+    restart: unless-stopped
+    ports:
+      - "${ZED_WEB_PORT:-8090}:8090"
+    environment:
+      ZED_WEB_PORT: "8090"
+      ZED_WEB_RESTRICT_PATHS: ${ZED_WEB_RESTRICT_PATHS:-false}
+      ZED_WEB_SECURE_COOKIE: ${ZED_WEB_SECURE_COOKIE:-false}
+      ZED_WEB_TOKEN: ${ZED_WEB_TOKEN:-}
+    volumes:
+      - "${ZED_WORKSPACE:-./workspace}:/workspace"

@@ -1,0 +1,12 @@
+.git
+.github
+.build
+target
+**/target
+web/dist
+node_modules
+**/node_modules
+test-results
+*.png
+*.db
+.DS_Store

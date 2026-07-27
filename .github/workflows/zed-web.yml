@@ -1,0 +1,112 @@
+name: Zed Web
+
+on:
+  push:
+    branches: [zed-web]
+    paths:
+      - ".github/workflows/zed-web.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/**"
+      - "web/**"
+  pull_request:
+    branches: [zed-web]
+    paths:
+      - ".github/workflows/zed-web.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/**"
+      - "web/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: zed-web-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Linux dependencies
+        run: ./script/linux
+      - name: Install Rust toolchains
+        run: |
+          rustup toolchain install 1.95.0
+          rustup toolchain install nightly --component rust-src
+          rustup target add wasm32-unknown-unknown --toolchain nightly
+      - name: Test Rust backend
+        run: rustup run 1.95.0 cargo test -p zed_web_server --bin zed-web-server
+      - name: Check WASM frontend
+        run: >-
+          cargo +nightly check -p zed_web_workspace
+          --target wasm32-unknown-unknown
+          -Z build-std=std,panic_abort
+
+  image:
+    if: github.event_name != 'pull_request'
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Resolve upstream revision
+        id: revisions
+        run: echo "upstream=$(git merge-base HEAD origin/main 2>/dev/null || git rev-parse HEAD^)" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: web/Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/zed-web:${{ github.sha }}-${{ matrix.architecture }}
+          build-args: |
+            WEB_REVISION=${{ github.sha }}
+            UPSTREAM_REVISION=${{ steps.revisions.outputs.upstream }}
+          cache-from: type=gha,scope=zed-web-${{ matrix.architecture }}
+          cache-to: type=gha,mode=max,scope=zed-web-${{ matrix.architecture }}
+
+  manifest:
+    if: github.event_name != 'pull_request'
+    needs: image
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish multi-architecture manifest
+        run: |
+          image="ghcr.io/${{ github.repository_owner }}/zed-web"
+          docker buildx imagetools create \
+            --tag "${image}:latest" \
+            --tag "${image}:zed-web-${{ github.sha }}" \
+            "${image}:${{ github.sha }}-amd64" \
+            "${image}:${{ github.sha }}-arm64"

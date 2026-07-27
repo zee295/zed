@@ -46,6 +46,9 @@ crates/docs_preprocessor/actions.json
 
 # `nix build` output
 /result
+/web/dist/
+/web/workspace/
+**/test-results/
 
 # Visual test baseline images (these will be stored outside
 # the repo in the future, but we don't haven't decided exactly
