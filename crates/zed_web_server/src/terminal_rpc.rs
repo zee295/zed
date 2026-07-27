@@ -302,6 +302,19 @@ impl TerminalManager {
         let Some(terminal) = self.terminals.get_mut(&term_id) else {
             return Ok(Value::Null);
         };
+        if params
+            .get("notification_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+        {
+            let (data_method, exit_method) = notification_methods(params, term_id);
+            let mut output = terminal
+                .output
+                .lock()
+                .map_err(|_| anyhow!("terminal output lock poisoned"))?;
+            output.data_method = data_method;
+            output.exit_method = exit_method;
+        }
         if let Some(previous_key) = terminal.resume_key.replace(resume_key.clone()) {
             self.terminals_by_resume_key.remove(&previous_key);
         }
@@ -449,13 +462,33 @@ mod tests {
         }
         terminals.dispatch(
             "Terminal::bind",
-            &json!({"term_id": term_id, "resume_key": "workspace:1:terminal:9"}),
+            &json!({
+                "term_id": term_id,
+                "resume_key": "workspace:1:terminal:9",
+                "notification_id": "persisted-workspace:1:terminal:9"
+            }),
         )?;
+        let output = terminals
+            .terminals
+            .get(&term_id)
+            .unwrap()
+            .output
+            .lock()
+            .unwrap();
+        assert_eq!(
+            output.data_method,
+            "Terminal::data:persisted-workspace:1:terminal:9"
+        );
+        assert_eq!(
+            output.exit_method,
+            "Terminal::exit:persisted-workspace:1:terminal:9"
+        );
+        drop(output);
         let resumed = terminals.dispatch(
             "Terminal::open",
             &json!({
                 "resume_key": "workspace:1:terminal:9",
-                "notification_id": "restored"
+                "notification_id": "persisted-workspace:1:terminal:9"
             }),
         )?;
         assert_eq!(resumed["term_id"], term_id);

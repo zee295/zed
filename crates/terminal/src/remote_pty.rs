@@ -26,6 +26,7 @@ static NEXT_NOTIFICATION_ID: AtomicU64 = AtomicU64::new(1);
 pub struct RemotePty {
     term_id: u64,
     client: RpcClient,
+    events_tx: UnboundedSender<PtyEvent>,
 }
 
 #[derive(Deserialize)]
@@ -64,20 +65,16 @@ impl RemotePty {
         events_tx: UnboundedSender<PtyEvent>,
     ) -> Result<Self> {
         let resume_key = env.remove(RESUME_KEY_ENV);
-        let notification_id = format!(
-            "pty-{}",
-            NEXT_NOTIFICATION_ID.fetch_add(1, Ordering::Relaxed)
-        );
-        let data_method = format!("Terminal::data:{notification_id}");
-        let exit_method = format!("Terminal::exit:{notification_id}");
-        client.on_notification(&data_method, {
-            let events_tx = events_tx.clone();
-            move |params| forward_data_notification(params, &events_tx)
-        });
-        client.on_notification(&exit_method, {
-            let events_tx = events_tx.clone();
-            move |params| forward_exit_notification(params, &events_tx)
-        });
+        let notification_id = resume_key
+            .as_deref()
+            .map(persistent_notification_id)
+            .unwrap_or_else(|| {
+                format!(
+                    "pty-{}",
+                    NEXT_NOTIFICATION_ID.fetch_add(1, Ordering::Relaxed)
+                )
+            });
+        register_notification_handlers(&client, &notification_id, &events_tx);
 
         let shell = shell.map(|(program, args)| json!({ "program": program, "args": args }));
         let response: OpenResponse = client
@@ -106,17 +103,27 @@ impl RemotePty {
             forward_exit(&events_tx);
         }
 
-        Ok(Self { term_id, client })
+        Ok(Self {
+            term_id,
+            client,
+            events_tx,
+        })
     }
 
     pub fn bind_persistence_key(&self, resume_key: String) {
+        let notification_id = persistent_notification_id(&resume_key);
+        register_notification_handlers(&self.client, &notification_id, &self.events_tx);
         let term_id = self.term_id;
         let client = self.client.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let _ = client
                 .call_void(
                     "Terminal::bind",
-                    &json!({ "term_id": term_id, "resume_key": resume_key }),
+                    &json!({
+                        "term_id": term_id,
+                        "resume_key": resume_key,
+                        "notification_id": notification_id,
+                    }),
                 )
                 .await;
         });
@@ -162,6 +169,25 @@ impl RemotePty {
                 .await;
         });
     }
+}
+
+fn persistent_notification_id(resume_key: &str) -> String {
+    format!("persisted-{resume_key}")
+}
+
+fn register_notification_handlers(
+    client: &RpcClient,
+    notification_id: &str,
+    events_tx: &UnboundedSender<PtyEvent>,
+) {
+    client.on_notification(&format!("Terminal::data:{notification_id}"), {
+        let events_tx = events_tx.clone();
+        move |params| forward_data_notification(params, &events_tx)
+    });
+    client.on_notification(&format!("Terminal::exit:{notification_id}"), {
+        let events_tx = events_tx.clone();
+        move |params| forward_exit_notification(params, &events_tx)
+    });
 }
 
 fn forward_data_notification(params: serde_json::Value, events_tx: &UnboundedSender<PtyEvent>) {
