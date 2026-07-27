@@ -4,6 +4,13 @@ This fork runs Zed's real GPUI workspace in a browser. The browser contains the
 editor UI and WebGPU renderer; filesystem, SQLite, Git, terminals, language
 servers, debuggers, extensions, and ACP agents run in the Rust backend.
 
+> [!CAUTION]
+> Zed Web is a preview port, not an official Zed web release. Automated tests
+> cover the Rust backend, WASM compilation, core browser flows, and amd64/arm64
+> images, but the complete desktop feature surface and long-running production
+> deployments have not been exhaustively tested. Keep backups of important
+> work, pin a release tag, and expect web-specific regressions.
+
 The deployment is intentionally single-user. Collaboration, calls, channels,
 and multi-user presence are outside its scope.
 
@@ -18,7 +25,7 @@ docker run -d \
   --restart unless-stopped \
   -p 8090:8090 \
   -v "$PWD/workspace:/workspace" \
-  zee295/zed-web:1.13.0-web.1
+  zee295/zed-web:1.13.0-web.3
 docker exec zed-web sh -c \
   'until test -s /workspace/.zed/web-auth-token; do sleep 1; done; cat /workspace/.zed/web-auth-token'
 ```
@@ -37,7 +44,7 @@ The same tested multi-architecture release is mirrored to Docker Hub after each
 successful build. To use that registry instead, set:
 
 ```sh
-ZED_WEB_IMAGE=docker.io/zee295/zed-web:1.13.0-web.1 \
+ZED_WEB_IMAGE=docker.io/zee295/zed-web:1.13.0-web.3 \
 ZED_WORKSPACE="$PWD/workspace" \
 docker compose -f web/compose.yml up -d
 ```
@@ -90,7 +97,7 @@ docker run -d \
   -e ZED_WEB_TOKEN='replace-with-a-long-secret' \
   -e ZED_WEB_RESTRICT_PATHS=true \
   -e ZED_WEB_SECURE_COOKIE=false \
-  zee295/zed-web:1.13.0-web.1
+  zee295/zed-web:1.13.0-web.3
 ```
 
 The one image contains:

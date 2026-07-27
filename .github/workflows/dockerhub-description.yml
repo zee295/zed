@@ -1,0 +1,26 @@
+name: Docker Hub Description
+
+on:
+  push:
+    branches: [zed-web]
+    paths:
+      - ".github/workflows/dockerhub-description.yml"
+      - "web/DOCKERHUB.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update Docker Hub description
+        uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ secrets.DOCKERHUB_USERNAME }}/zed-web
+          short-description: Full Zed GPUI editor in a browser with a Rust backend (preview)
+          readme-filepath: ./web/DOCKERHUB.md

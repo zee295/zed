@@ -3,10 +3,14 @@
 [![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
 [![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
 
-> **Zed Web fork:** The `zed-web` branch packages the full GPUI editor for a
-> browser with a Rust backend. It is a single-user deployment and intentionally
-> excludes collaboration. See [web/README.md](./web/README.md) for Docker,
-> source builds, authentication, and upstream update instructions.
+> **Zed Web preview:** The [`zed-web` branch](https://github.com/zee295/zed/tree/zed-web)
+> packages the full GPUI editor for a browser with a Rust backend. It is a
+> single-user deployment and intentionally excludes collaboration. This port
+> has automated backend, WASM, browser, amd64, and arm64 checks, but the complete
+> desktop feature surface and long-running production deployments have not been
+> exhaustively tested. Back up important work and expect web-specific issues.
+> See [web/README.md](./web/README.md) for Docker, source builds,
+> authentication, known scope, and upstream update instructions.
 
 ### Run Zed Web
 
@@ -17,7 +21,7 @@ docker run -d \
   --restart unless-stopped \
   -p 8090:8090 \
   -v "$PWD/workspace:/workspace" \
-  zee295/zed-web:1.13.0-web.1
+  zee295/zed-web:1.13.0-web.3
 docker exec zed-web sh -c \
   'until test -s /workspace/.zed/web-auth-token; do sleep 1; done; cat /workspace/.zed/web-auth-token'
 ```
