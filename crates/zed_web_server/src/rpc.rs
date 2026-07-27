@@ -336,6 +336,8 @@ pub async fn serve(socket: WebSocket, state: AppState) {
             .unwrap_or_default();
         let result = if crate::agent_rpc::handles(&method) {
             session.agents.dispatch(&method, &params).await
+        } else if method == "Browser::relay_localhost_callback" {
+            crate::auth_callback::relay(&params).await
         } else if crate::terminal_rpc::handles(&method) {
             session.terminals.dispatch(&method, &params)
         } else if crate::process_rpc::handles_streaming(&method) {

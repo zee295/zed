@@ -1,5 +1,6 @@
 mod agent_rpc;
 mod auth;
+mod auth_callback;
 mod debug_adapter;
 mod extension_rpc;
 mod fs_rpc;

@@ -4,11 +4,15 @@
 //! title_bar crate (collab / account / updates don't compile for wasm).
 
 use agent_settings::{AgentSettings, WindowLayout};
+use editor::Editor;
 use fs::Fs;
-use gpui::{Action, Anchor, AnyElement, App, Context, IntoElement, WeakEntity, Window, actions};
+use gpui::{
+    Action, Anchor, AnyElement, App, Context, DismissEvent, Entity, EventEmitter, Focusable,
+    IntoElement, Render, SharedString, WeakEntity, Window, actions,
+};
 use settings::Settings as _;
 use ui::{ButtonLike, ContextMenu, ContextMenuEntry, IconPosition, PopoverMenu, prelude::*};
-use workspace::Workspace;
+use workspace::{ModalView, Workspace};
 use zed_actions;
 
 actions!(
@@ -18,6 +22,8 @@ actions!(
         UseClassicLayout,
         /// Switches to the agentic panel layout.
         UseAgenticLayout,
+        /// Relays a localhost OAuth callback to an ACP agent running on the host.
+        CompleteAcpLogin,
     ]
 );
 
@@ -48,6 +54,11 @@ pub fn init(cx: &mut App) {
                 window,
                 cx,
             );
+        });
+    });
+    cx.on_action(|_: &CompleteAcpLogin, cx| {
+        with_workspace(cx, |workspace, window, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| AcpCallbackModal::new(window, cx));
         });
     });
     // Extensions action is handled by web_extensions::init → host install page.
@@ -147,6 +158,7 @@ pub fn render_user_menu_button(_workspace: WeakEntity<Workspace>, _cx: &mut App)
                         "Extensions",
                         zed_actions::Extensions::default().boxed_clone(),
                     )
+                    .action("Complete ACP Login…", CompleteAcpLogin.boxed_clone())
                     .when(ai_enabled, |menu| {
                         menu.separator()
                             .submenu("Panel Layout", move |menu, _window, _cx| {
@@ -196,4 +208,113 @@ pub fn render_user_menu_button(_workspace: WeakEntity<Workspace>, _cx: &mut App)
         })
         .anchor(Anchor::TopRight)
         .into_any_element()
+}
+
+struct AcpCallbackModal {
+    editor: Entity<Editor>,
+    status: Option<SharedString>,
+    submitting: bool,
+}
+
+impl AcpCallbackModal {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("http://localhost:PORT/auth/callback?...", window, cx);
+            editor
+        });
+        Self {
+            editor,
+            status: None,
+            submitting: false,
+        }
+    }
+
+    fn cancel(&mut self, _: &menu::Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.submitting {
+            return;
+        }
+        let callback = self.editor.read(cx).text(cx).trim().to_string();
+        if callback.is_empty() {
+            return;
+        }
+        let Some(client) = wasm_remote::remote_client() else {
+            self.status = Some("RPC connection is unavailable".into());
+            cx.notify();
+            return;
+        };
+
+        self.submitting = true;
+        self.status = Some("Forwarding callback…".into());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = client
+                .call_void(
+                    "Browser::relay_localhost_callback",
+                    &serde_json::json!({"url": callback}),
+                )
+                .await;
+            this.update(cx, |this, cx| {
+                this.submitting = false;
+                match result {
+                    Ok(()) => cx.emit(DismissEvent),
+                    Err(error) => {
+                        this.status = Some(format!("{error:#}").into());
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+}
+
+impl EventEmitter<DismissEvent> for AcpCallbackModal {}
+impl ModalView for AcpCallbackModal {}
+
+impl Focusable for AcpCallbackModal {
+    fn focus_handle(&self, cx: &App) -> gpui::FocusHandle {
+        self.editor.focus_handle(cx)
+    }
+}
+
+impl Render for AcpCallbackModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .key_context("AcpCallbackModal")
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .elevation_3(cx)
+            .w(gpui::px(620.))
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .p_2()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(self.editor.clone())
+                    .child(
+                        Button::new("relay-acp-callback", "Complete Login")
+                            .disabled(self.submitting)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.confirm(&menu::Confirm, window, cx);
+                            })),
+                    ),
+            )
+            .when_some(self.status.clone(), |this, status| {
+                this.child(
+                    div().px_2().py_1().child(
+                        Label::new(status)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+                )
+            })
+    }
 }
