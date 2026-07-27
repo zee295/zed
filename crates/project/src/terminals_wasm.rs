@@ -73,7 +73,19 @@ impl Project {
             }
         }
         let settings = TerminalSettings::get(settings_location, cx).clone();
-        let shell = Shell::Program(get_default_system_shell());
+        let shell = match spawn_task.command.as_ref() {
+            Some(program) => Shell::WithArguments {
+                program: program.clone(),
+                args: spawn_task.args.clone(),
+                title_override: None,
+            },
+            None => match &spawn_task.shell {
+                Shell::System => Shell::Program(get_default_system_shell()),
+                shell => shell.clone(),
+            },
+        };
+        let mut env = settings.env.clone();
+        env.extend(spawn_task.env.clone());
         let path_style = self.path_style(cx);
         let cwd = path.map(|p| p.to_path_buf());
         let window_id = cx.entity_id().as_u64();
@@ -92,7 +104,7 @@ impl Project {
                         cwd,
                         task_state,
                         shell,
-                        settings.env.clone(),
+                        env,
                         settings.cursor_shape,
                         settings.alternate_scroll,
                         settings.max_scroll_history_lines,
