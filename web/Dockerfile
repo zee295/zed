@@ -3,6 +3,8 @@
 ARG RUST_VERSION=1.95.0
 ARG NODE_VERSION=22.23.1
 ARG NPM_VERSION=12.0.1
+ARG NPM_TAR_VERSION=7.5.22
+ARG NPM_BRACE_EXPANSION_VERSION=5.0.8
 ARG DEBIAN_RUNTIME_SUITE=trixie
 FROM rust:${RUST_VERSION}-bookworm AS builder
 
@@ -34,7 +36,21 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM node:${NODE_VERSION}-${DEBIAN_RUNTIME_SUITE}-slim AS node-runtime
 ARG NPM_VERSION
+ARG NPM_TAR_VERSION
+ARG NPM_BRACE_EXPANSION_VERSION
 RUN npm install --global "npm@${NPM_VERSION}" \
+    # npm's published package references unpublished development workspaces, so
+    # temporarily hide them while updating vulnerable bundled dependencies.
+    && cp /usr/local/lib/node_modules/npm/package.json /tmp/npm-package.json \
+    && node -e 'const fs=require("fs"); const path="/usr/local/lib/node_modules/npm/package.json"; const pkg=require(path); delete pkg.devDependencies; delete pkg.workspaces; fs.writeFileSync(path, JSON.stringify(pkg, null, 2)+String.fromCharCode(10))' \
+    && npm install \
+        --prefix /usr/local/lib/node_modules/npm \
+        --no-save \
+        --package-lock=false \
+        --ignore-scripts \
+        "tar@${NPM_TAR_VERSION}" \
+        "brace-expansion@${NPM_BRACE_EXPANSION_VERSION}" \
+    && mv /tmp/npm-package.json /usr/local/lib/node_modules/npm/package.json \
     && npm cache clean --force
 
 FROM debian:${DEBIAN_RUNTIME_SUITE}-slim AS runtime
