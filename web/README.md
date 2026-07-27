@@ -9,6 +9,22 @@ and multi-user presence are outside its scope.
 
 ## Run The Published Image
 
+Run the Docker Hub image directly:
+
+```sh
+mkdir -p workspace
+docker run -d \
+  --name zed-web \
+  --restart unless-stopped \
+  -p 8090:8090 \
+  -v "$PWD/workspace:/workspace" \
+  zee295/zed-web:latest
+docker exec zed-web sh -c \
+  'until test -s /workspace/.zed/web-auth-token; do sleep 1; done; cat /workspace/.zed/web-auth-token'
+```
+
+Or use Compose from the repository:
+
 ```sh
 mkdir -p workspace
 ZED_WORKSPACE="$PWD/workspace" docker compose -f web/compose.yml up -d

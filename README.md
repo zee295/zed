@@ -8,6 +8,22 @@
 > excludes collaboration. See [web/README.md](./web/README.md) for Docker,
 > source builds, authentication, and upstream update instructions.
 
+### Run Zed Web
+
+```sh
+mkdir -p workspace
+docker run -d \
+  --name zed-web \
+  --restart unless-stopped \
+  -p 8090:8090 \
+  -v "$PWD/workspace:/workspace" \
+  zee295/zed-web:latest
+docker exec zed-web sh -c \
+  'until test -s /workspace/.zed/web-auth-token; do sleep 1; done; cat /workspace/.zed/web-auth-token'
+```
+
+Open `http://127.0.0.1:8090` and enter the printed access token.
+
 Welcome to Zed, a high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter).
 
 ---
