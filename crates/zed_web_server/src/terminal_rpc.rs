@@ -428,6 +428,66 @@ mod tests {
     }
 
     #[test]
+    fn preserves_terminal_environment_except_external_agent_npm_prefix() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let fs = Arc::new(FsRpc::new(root.path().to_path_buf(), false)?);
+        let (outgoing, _notifications) = mpsc::unbounded_channel();
+        let mut terminals = TerminalManager::new(fs, outgoing);
+        let opened = terminals.dispatch(
+            "Terminal::open",
+            &json!({
+                "shell": {
+                    "program": "/bin/sh",
+                    "args": [
+                        "-c",
+                        "printf '%s|%s|%s' \"$AUTH_TOKEN\" \"$npm_config_prefix\" \"$PROJECT_ENV\""
+                    ]
+                },
+                "env": {
+                    "AUTH_TOKEN": "auth-token-is-present",
+                    "npm_config_prefix": "/Users/zee/.npm-global",
+                    "PROJECT_ENV": "project-setting-is-present"
+                }
+            }),
+        )?;
+        let term_id = opened["term_id"].as_u64().unwrap();
+
+        wait_for_output(
+            &terminals,
+            term_id,
+            b"auth-token-is-present|/Users/zee/.npm-global|project-setting-is-present",
+        )
+    }
+
+    #[test]
+    fn filters_external_agent_npm_prefix_from_spawned_terminal() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let fs = Arc::new(FsRpc::new(root.path().to_path_buf(), false)?);
+        let (outgoing, _notifications) = mpsc::unbounded_channel();
+        let mut terminals = TerminalManager::new(fs, outgoing);
+        let opened = terminals.dispatch(
+            "Terminal::open",
+            &json!({
+                "shell": {
+                    "program": "/bin/sh",
+                    "args": [
+                        "-c",
+                        "printf '%s|%s|%s' \"${npm_config_prefix-unset}\" \"${NPM_CONFIG_PREFIX-unset}\" \"$AUTH_TOKEN\""
+                    ]
+                },
+                "env": {
+                    "AUTH_TOKEN": "auth-token-is-present",
+                    "npm_config_prefix": "/workspace/.config/zed/external_agents/registry/npx/claude-agent-acp",
+                    "NPM_CONFIG_PREFIX": "/workspace/.config/zed/external_agents/registry/npx/codex-acp"
+                }
+            }),
+        )?;
+        let term_id = opened["term_id"].as_u64().unwrap();
+
+        wait_for_output(&terminals, term_id, b"unset|unset|auth-token-is-present")
+    }
+
+    #[test]
     fn rewrites_virtual_paths_in_terminal_arguments_and_environment() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let canonical_root = root.path().canonicalize()?;
@@ -476,6 +536,34 @@ mod tests {
         }
 
         anyhow::bail!("terminal output did not contain rewritten virtual paths")
+    }
+
+    fn wait_for_output(
+        terminals: &TerminalManager,
+        term_id: u64,
+        expected: &[u8],
+    ) -> anyhow::Result<()> {
+        for _ in 0..100 {
+            let has_expected = terminals
+                .terminals
+                .get(&term_id)
+                .unwrap()
+                .output
+                .lock()
+                .unwrap()
+                .history
+                .windows(expected.len())
+                .any(|window| window == expected);
+            if has_expected {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        anyhow::bail!(
+            "terminal output did not contain {:?}",
+            String::from_utf8_lossy(expected)
+        )
     }
 
     #[test]
