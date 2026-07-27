@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 ARG RUST_VERSION=1.95.0
+ARG NODE_VERSION=22.23.1
 FROM rust:${RUST_VERSION}-bookworm AS builder
 
 ARG RUST_VERSION
@@ -29,6 +30,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     RUST_STABLE_TOOLCHAIN="${RUST_VERSION}" \
     ./web/build.sh
 
+FROM node:${NODE_VERSION}-bookworm-slim AS node-runtime
+
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
@@ -45,8 +48,6 @@ RUN apt-get update \
         libwayland-client0 \
         libx11-xcb1 \
         libxkbcommon0 \
-        nodejs \
-        npm \
         openssh-client \
         tini \
         zsh \
@@ -55,10 +56,13 @@ RUN apt-get update \
     && mkdir -p /workspace /opt/zed-web/static \
     && chown -R zed:zed /workspace /home/zed
 
+COPY --from=node-runtime /usr/local/ /usr/local/
 COPY --from=builder /src/web/dist/bin/zed-web-server /usr/local/bin/zed-web-server
 COPY --from=builder /src/web/dist/bin/zed-extension-runtime /usr/local/bin/zed-extension-runtime
 COPY --from=builder /src/web/dist/static/ /opt/zed-web/static/
 COPY --chmod=0755 web/entrypoint.sh /usr/local/bin/zed-web-entrypoint
+
+RUN node --version && npm --version && npx --version
 
 ENV HOME=/home/zed \
     ZED_EXTENSION_RUNTIME=/usr/local/bin/zed-extension-runtime \

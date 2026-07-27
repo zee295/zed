@@ -50,11 +50,55 @@ ZED_WORKSPACE=/absolute/path/to/project \
 docker compose -f web/compose.yml up -d
 ```
 
+## Docker Environment
+
+Pass container variables with `docker run -e NAME=value` or under the Compose
+service's `environment` section.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ZED_WEB_TOKEN` | Generated once | Stable login token. Without it, the token is stored at `/workspace/.zed/web-auth-token`. |
+| `ZED_WEB_PORT` | `8090` | Port listened to inside the container. The Docker port mapping must match it. |
+| `ZED_WEB_WORKSPACE` | `/workspace` | Server workspace path. Mount persistent storage at the same path. |
+| `ZED_WEB_RESTRICT_PATHS` | `false` | When `true`, prevents opening paths outside the workspace. |
+| `ZED_WEB_SECURE_COOKIE` | `false` | Set to `true` when the public endpoint uses HTTPS. |
+| `RUST_LOG` | `zed_web_server=info` | Rust backend log filter, for example `zed_web_server=debug`. |
+
+Optional built-in agent and API proxy settings:
+
+| Variable | Purpose |
+| --- | --- |
+| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | Provider credential used only by the server. |
+| `ZED_AGENT_API_KEY` | Generic provider credential fallback. |
+| `ZED_AGENT_PROVIDER` | Force `openai`, `anthropic`, or `auto`. |
+| `ZED_AGENT_MODEL` | Override the built-in agent model. |
+| `ZED_AGENT_BASE_URL` | Override the built-in agent API endpoint. |
+| `ZED_EXTERNAL_AGENTS` | JSON array of additional server-side agent commands. |
+
+Compose also reads `ZED_WEB_IMAGE`, `ZED_WORKSPACE`, and the host-side
+`ZED_WEB_PORT` before starting the container. These select the image, bind
+mount source, and published host port respectively.
+
+Example:
+
+```sh
+docker run -d \
+  --name zed-web \
+  --restart unless-stopped \
+  -p 8090:8090 \
+  -v "$PWD/workspace:/workspace" \
+  -e ZED_WEB_TOKEN='replace-with-a-long-secret' \
+  -e ZED_WEB_RESTRICT_PATHS=true \
+  -e ZED_WEB_SECURE_COOKIE=false \
+  zee295/zed-web:latest
+```
+
 The one image contains:
 
 - `zed-web-server`, the native Rust backend
 - `zed-extension-runtime`, the server-side Wasmtime extension host
 - the complete Zed Web WASM frontend
+- Node.js 22 with npm and npx for extensions and ACP agents
 - compressed fonts, icons, themes, prompts, images, and sounds
 - Git, SSH, Node/npm, shells, and terminal runtime dependencies
 
