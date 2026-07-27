@@ -1,0 +1,104 @@
+name: Zed Web Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag, for example v1.13.0-web.1
+        required: true
+        type: string
+      source_sha:
+        description: Zed Web commit whose architecture images passed CI
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: zed-web-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.release.tag_name || inputs.source_sha }}
+      - name: Resolve release
+        id: release
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+          INPUT_SHA: ${{ inputs.source_sha }}
+        run: |
+          if [[ "${EVENT_NAME}" == "release" ]]; then
+            release_tag="${EVENT_TAG}"
+            source_sha="$(git rev-list -n 1 "${release_tag}")"
+          else
+            release_tag="${INPUT_TAG}"
+            source_sha="$(git rev-parse "${INPUT_SHA}^{commit}")"
+          fi
+
+          if [[ ! "${release_tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-web\.[0-9]+$ ]]; then
+            echo "release tag must match vMAJOR.MINOR.PATCH-web.REVISION" >&2
+            exit 2
+          fi
+
+          echo "release_tag=${release_tag}" >> "${GITHUB_OUTPUT}"
+          echo "version_tag=${release_tag#v}" >> "${GITHUB_OUTPUT}"
+          echo "source_sha=${source_sha}" >> "${GITHUB_OUTPUT}"
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tag GHCR release
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+          VERSION_TAG: ${{ steps.release.outputs.version_tag }}
+          SOURCE_SHA: ${{ steps.release.outputs.source_sha }}
+        run: |
+          image="ghcr.io/${{ github.repository_owner }}/zed-web"
+          source="${image}:zed-web-${SOURCE_SHA}"
+          docker buildx imagetools inspect "${source}"
+          docker buildx imagetools create \
+            --tag "${image}:${RELEASE_TAG}" \
+            --tag "${image}:${VERSION_TAG}" \
+            "${source}"
+      - name: Install registry copy tool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends skopeo
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Publish Docker Hub release
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+          VERSION_TAG: ${{ steps.release.outputs.version_tag }}
+        run: |
+          source="docker://ghcr.io/${{ github.repository_owner }}/zed-web:${RELEASE_TAG}"
+          target="docker://docker.io/${DOCKERHUB_USERNAME}/zed-web"
+          auth_file="${HOME}/.docker/config.json"
+
+          for tag in "${RELEASE_TAG}" "${VERSION_TAG}"; do
+            skopeo copy --all \
+              --src-no-creds \
+              --dest-authfile "${auth_file}" \
+              "${source}" \
+              "${target}:${tag}"
+          done
