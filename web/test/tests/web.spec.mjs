@@ -92,3 +92,31 @@ test("restores panel visibility after reload", async ({ browser, baseURL }) => {
     .toEqual({ agent: "true", sidebar: "true" });
   await context.close();
 });
+
+test("offers a real new-tab link when an external popup is blocked", async ({
+  browser,
+  baseURL,
+}) => {
+  const context = await browser.newContext();
+  await authenticate(context, baseURL);
+  const page = await context.newPage();
+  await openWorkspace(page, baseURL);
+
+  await page.evaluate(() => {
+    const open = window.open;
+    window.open = () => null;
+    try {
+      window.__zedOpenExternalUrl("https://example.com/agent-auth");
+    } finally {
+      window.open = open;
+    }
+  });
+
+  const prompt = page.locator("#zed-external-link-prompt");
+  await expect(prompt).toBeVisible();
+  const link = prompt.locator("a");
+  await expect(link).toHaveAttribute("href", "https://example.com/agent-auth");
+  await expect(link).toHaveAttribute("target", "_blank");
+  await expect(link).toHaveAttribute("rel", "noopener noreferrer");
+  await context.close();
+});

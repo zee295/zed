@@ -23,12 +23,111 @@
             justify-content: center;
             pointer-events: none;
         }
+        #zed-external-link-prompt {
+            position: fixed;
+            z-index: 2147483647;
+            top: 12px;
+            right: 12px;
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto auto;
+            align-items: center;
+            gap: 10px;
+            width: min(440px, calc(100vw - 24px));
+            min-height: 48px;
+            padding: 8px 10px 8px 14px;
+            border: 1px solid #4b5363;
+            border-radius: 6px;
+            background: #292d35;
+            box-shadow: 0 8px 24px rgb(0 0 0 / 35%);
+            color: #e6e9ef;
+            font-size: 14px;
+        }
+        #zed-external-link-prompt span {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        #zed-external-link-prompt a {
+            padding: 6px 10px;
+            border-radius: 4px;
+            background: #3b82f6;
+            color: white;
+            font-weight: 600;
+            text-decoration: none;
+        }
+        #zed-external-link-prompt button {
+            width: 30px;
+            height: 30px;
+            border: 0;
+            background: transparent;
+            color: #c9ced8;
+            cursor: pointer;
+            font-size: 22px;
+            line-height: 1;
+        }
     </style>
 </head>
 <body>
     <div id="boot">Starting Zed workspace...</div>
     <script type="module">
         import init from "./zed_web_workspace.js";
+
+        const allowedExternalProtocols = new Set(["http:", "https:", "mailto:"]);
+
+        function showExternalLinkPrompt(url) {
+            document.getElementById("zed-external-link-prompt")?.remove();
+
+            const prompt = document.createElement("div");
+            prompt.id = "zed-external-link-prompt";
+            prompt.setAttribute("role", "dialog");
+            prompt.setAttribute("aria-label", "Open external link");
+
+            const label = document.createElement("span");
+            label.textContent = url.protocol === "mailto:"
+                ? url.href
+                : `Open ${url.host}`;
+            label.title = url.href;
+
+            const link = document.createElement("a");
+            link.href = url.href;
+            link.target = "_blank";
+            link.rel = "noopener noreferrer";
+            link.textContent = "Open";
+            link.addEventListener("click", () => prompt.remove(), { once: true });
+
+            const close = document.createElement("button");
+            close.type = "button";
+            close.setAttribute("aria-label", "Close");
+            close.textContent = "\u00d7";
+            close.addEventListener("click", () => prompt.remove(), { once: true });
+
+            prompt.append(label, link, close);
+            document.body.append(prompt);
+            link.focus();
+        }
+
+        globalThis.__zedOpenExternalUrl = (rawUrl) => {
+            let url;
+            try {
+                url = new URL(String(rawUrl), window.location.href);
+            } catch (error) {
+                console.warn("Zed refused an invalid external URL", error);
+                return false;
+            }
+            if (!allowedExternalProtocols.has(url.protocol)) {
+                console.warn(`Zed refused external URL protocol ${url.protocol}`);
+                return false;
+            }
+
+            const opened = window.open(url.href, "_blank");
+            if (opened) {
+                opened.opener = null;
+                return true;
+            }
+
+            showExternalLinkPrompt(url);
+            return false;
+        };
 
         try {
             await init();

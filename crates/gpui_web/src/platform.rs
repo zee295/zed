@@ -202,8 +202,31 @@ impl Platform for WebPlatform {
     }
 
     fn open_url(&self, url: &str) {
-        if let Err(error) = self.browser_window.open_with_url(url) {
-            log::warn!("Failed to open URL '{url}': {error:?}");
+        let opener = js_sys::Reflect::get(
+            self.browser_window.as_ref(),
+            &JsValue::from_str("__zedOpenExternalUrl"),
+        )
+        .ok()
+        .and_then(|value| value.dyn_into::<js_sys::Function>().ok());
+        if let Some(opener) = opener {
+            if let Err(error) = opener.call1(&self.browser_window, &JsValue::from_str(url)) {
+                log::warn!("Failed to open URL '{url}' through the browser bridge: {error:?}");
+            }
+            return;
+        }
+
+        match self.browser_window.open_with_url_and_target(url, "_blank") {
+            Ok(Some(opened)) => {
+                if let Err(error) = js_sys::Reflect::set(
+                    opened.as_ref(),
+                    &JsValue::from_str("opener"),
+                    &JsValue::NULL,
+                ) {
+                    log::warn!("Failed to isolate opened URL '{url}': {error:?}");
+                }
+            }
+            Ok(None) => log::warn!("Browser blocked opening URL '{url}'"),
+            Err(error) => log::warn!("Failed to open URL '{url}': {error:?}"),
         }
     }
 
