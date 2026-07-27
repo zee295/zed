@@ -41,7 +41,7 @@ use acp_thread::{AcpThread, AuthRequired, LoadError, TerminalProviderEvent};
 use terminal::TerminalBuilder;
 use terminal::terminal_settings::{AlternateScroll, CursorShape};
 
-use crate::{CURSOR_ID, GEMINI_ID};
+use crate::{CODEX_ID, CURSOR_ID, GEMINI_ID};
 
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
 const PARAMETERIZED_MODEL_PICKER_META_KEY: &str = "parameterizedModelPicker";
@@ -1061,6 +1061,8 @@ impl AcpConnection {
                     .description("Login with your Google or Vertex AI account")
                     .meta(meta),
             )]
+        } else if cfg!(target_family = "wasm") && agent_id.0.as_ref() == CODEX_ID {
+            codex_remote_auth_methods(&original_command, response.auth_methods)
         } else {
             response.auth_methods
         };
@@ -1564,6 +1566,46 @@ fn meta_terminal_auth_task(
         terminal_auth.args,
         terminal_auth.env,
     ))
+}
+
+fn codex_remote_auth_methods(
+    command: &AgentServerCommand,
+    auth_methods: Vec<acp::AuthMethod>,
+) -> Vec<acp::AuthMethod> {
+    auth_methods
+        .into_iter()
+        .map(|method| {
+            if method.id().0.as_ref() != "chat-gpt" {
+                return method;
+            }
+
+            let Some(script_index) = command.args.iter().position(|arg| {
+                std::path::Path::new(arg)
+                    .file_name()
+                    .is_some_and(|name| name == "codex-acp")
+            }) else {
+                return method;
+            };
+            let codex_script = std::path::Path::new(&command.args[script_index])
+                .with_file_name("codex")
+                .to_string_lossy()
+                .into_owned();
+            let mut args = command.args[..script_index].to_vec();
+            args.extend([codex_script, "login".into(), "--device-auth".into()]);
+            let value = serde_json::json!({
+                "label": "Codex Login",
+                "command": command.path.to_string_lossy(),
+                "args": args,
+                "env": command.env.clone().unwrap_or_default(),
+            });
+            let meta = acp::Meta::from_iter([("terminal-auth".to_string(), value)]);
+            acp::AuthMethod::Agent(
+                acp::AuthMethodAgent::new("chat-gpt", "ChatGPT")
+                    .description("Authenticate on another device with a one-time code")
+                    .meta(meta),
+            )
+        })
+        .collect()
 }
 
 impl AgentConnection for AcpConnection {
@@ -3062,6 +3104,50 @@ mod tests {
             HashMap::from_iter([("AUTH_MODE".into(), "interactive".into())])
         );
         assert_eq!(task.label, "legacy /auth");
+    }
+
+    #[test]
+    fn codex_remote_auth_uses_installed_cli_device_flow() {
+        let command = AgentServerCommand {
+            path: "/usr/bin/node".into(),
+            args: vec![
+                "--enable-source-maps".into(),
+                "/workspace/.config/zed/node/cache/_npx/hash/node_modules/.bin/codex-acp".into(),
+                "--acp".into(),
+            ],
+            env: Some(HashMap::from_iter([(
+                "CODEX_HOME".into(),
+                "/data/codex".into(),
+            )])),
+        };
+        let methods = codex_remote_auth_methods(
+            &command,
+            vec![
+                acp::AuthMethod::Agent(acp::AuthMethodAgent::new("api-key", "API Key")),
+                acp::AuthMethod::Agent(acp::AuthMethodAgent::new("chat-gpt", "ChatGPT")),
+            ],
+        );
+        let chat_gpt = methods
+            .iter()
+            .find(|method| method.id().0.as_ref() == "chat-gpt")
+            .expect("ChatGPT auth method should remain available");
+        let task = meta_terminal_auth_task(&AgentId::new(CODEX_ID), chat_gpt.id(), chat_gpt)
+            .expect("ChatGPT auth should become a terminal task");
+
+        assert_eq!(task.command.as_deref(), Some("/usr/bin/node"));
+        assert_eq!(
+            task.args,
+            vec![
+                "--enable-source-maps",
+                "/workspace/.config/zed/node/cache/_npx/hash/node_modules/.bin/codex",
+                "login",
+                "--device-auth",
+            ]
+        );
+        assert_eq!(
+            task.env,
+            HashMap::from_iter([("CODEX_HOME".into(), "/data/codex".into())])
+        );
     }
 
     #[test]

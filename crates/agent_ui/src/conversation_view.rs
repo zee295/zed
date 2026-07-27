@@ -1020,6 +1020,25 @@ impl ConversationView {
         cx.notify();
     }
 
+    fn authentication_succeeded(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let has_live_session = self
+            .as_connected()
+            .is_some_and(|connected| !connected.threads.is_empty());
+        if !has_live_session {
+            self.reset(window, cx);
+            return;
+        }
+
+        if let Some(active) = self.root_thread_view() {
+            active.update(cx, |active, cx| active.clear_thread_error(cx));
+        }
+        if let Some(connected) = self.as_connected_mut() {
+            connected.auth_state = AuthState::Ok;
+        }
+        cx.emit(StateChange);
+        cx.notify();
+    }
+
     fn initial_state(
         agent: Rc<dyn AgentServer>,
         connection_store: Entity<AgentConnectionStore>,
@@ -1975,7 +1994,7 @@ impl ConversationView {
                                 })
                             }
                         } else {
-                            this.reset(window, cx);
+                            this.authentication_succeeded(window, cx);
                         }
                         this.auth_task.take()
                     })
@@ -2023,7 +2042,7 @@ impl ConversationView {
                             active.update(cx, |active, cx| active.handle_thread_error(err, cx));
                         }
                     } else {
-                        this.reset(window, cx);
+                        this.authentication_succeeded(window, cx);
                     }
                     this.auth_task.take()
                 })
@@ -4794,6 +4813,46 @@ pub(crate) mod tests {
             assert!(
                 !view.active_thread_renders_request_elicitations(),
                 "Unauthenticated auth UI should render request elicitations outside ThreadView"
+            );
+        });
+
+        let session_before_reauthentication = conversation_view.read_with(cx, |view, cx| {
+            view.active_thread()
+                .expect("existing thread should still be active")
+                .read(cx)
+                .thread
+                .read(cx)
+                .session_id()
+                .clone()
+        });
+        conversation_view.update_in(cx, |view, window, cx| {
+            view.authenticate(
+                acp::AuthMethodId::new(AuthGatedAgentConnection::AUTH_METHOD_ID),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        conversation_view.read_with(cx, |view, cx| {
+            let connected = view
+                .as_connected()
+                .expect("reauthentication should keep the connected state");
+            assert!(
+                connected.auth_state.is_ok(),
+                "successful reauthentication should restore the authenticated state"
+            );
+            let session_after_reauthentication = view
+                .active_thread()
+                .expect("reauthentication should keep the existing thread")
+                .read(cx)
+                .thread
+                .read(cx)
+                .session_id()
+                .clone();
+            assert_eq!(
+                session_after_reauthentication, session_before_reauthentication,
+                "reauthentication must not close and reload the live ACP session"
             );
         });
     }
