@@ -37,7 +37,12 @@ jobs:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
-          source_image="docker://ghcr.io/${{ github.repository_owner }}/zed-web:latest"
+          source_tag="latest"
+          if [[ -n "${RELEASE_SHA}" ]]; then
+            source_tag="zed-web-${RELEASE_SHA}"
+          fi
+
+          source_image="docker://ghcr.io/${{ github.repository_owner }}/zed-web:${source_tag}"
           target_image="docker://docker.io/${DOCKERHUB_USERNAME}/zed-web"
           auth_file="${HOME}/.docker/config.json"
 
