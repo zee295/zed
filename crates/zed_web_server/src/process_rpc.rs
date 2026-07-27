@@ -383,7 +383,7 @@ impl ProcessManager {
 }
 
 #[cfg(unix)]
-struct OpenUrlBridge {
+pub(crate) struct OpenUrlBridge {
     _directory: tempfile::TempDir,
     shim_directory: PathBuf,
     socket_path: PathBuf,
@@ -392,7 +392,7 @@ struct OpenUrlBridge {
 
 #[cfg(unix)]
 impl OpenUrlBridge {
-    fn new(outgoing: mpsc::UnboundedSender<Message>) -> Result<Self> {
+    pub(crate) fn new(outgoing: mpsc::UnboundedSender<Message>) -> Result<Self> {
         use std::os::unix::fs::symlink;
 
         let directory = tempfile::tempdir()?;
@@ -435,6 +435,23 @@ impl OpenUrlBridge {
         configured_path: Option<&String>,
     ) -> Result<()> {
         let inherited_path = configured_path
+            .map(std::ffi::OsString::from)
+            .or_else(|| env::var_os("PATH"))
+            .unwrap_or_default();
+        let path = env::join_paths(
+            std::iter::once(self.shim_directory.clone()).chain(env::split_paths(&inherited_path)),
+        )?;
+        command.env("PATH", path);
+        command.env("ZED_WEB_OPEN_URL_SOCKET", &self.socket_path);
+        Ok(())
+    }
+
+    pub(crate) fn configure_pty_command(
+        &self,
+        command: &mut portable_pty::CommandBuilder,
+    ) -> Result<()> {
+        let inherited_path = command
+            .get_env("PATH")
             .map(std::ffi::OsString::from)
             .or_else(|| env::var_os("PATH"))
             .unwrap_or_default();

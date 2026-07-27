@@ -23,6 +23,8 @@ pub struct TerminalManager {
     next_id: u64,
     terminals: HashMap<u64, TerminalEntry>,
     terminals_by_resume_key: HashMap<String, u64>,
+    #[cfg(unix)]
+    open_url_bridge: Option<crate::process_rpc::OpenUrlBridge>,
 }
 
 struct TerminalEntry {
@@ -42,12 +44,20 @@ struct TerminalOutput {
 
 impl TerminalManager {
     pub fn new(fs: Arc<FsRpc>, outgoing: mpsc::UnboundedSender<Message>) -> Self {
+        #[cfg(unix)]
+        let open_url_bridge = tokio::runtime::Handle::try_current().ok().and_then(|_| {
+            crate::process_rpc::OpenUrlBridge::new(outgoing.clone())
+                .map_err(|error| tracing::warn!(?error, "failed to initialize terminal URL bridge"))
+                .ok()
+        });
         Self {
             fs,
             outgoing,
             next_id: 1,
             terminals: HashMap::new(),
             terminals_by_resume_key: HashMap::new(),
+            #[cfg(unix)]
+            open_url_bridge,
         }
     }
 
@@ -148,6 +158,10 @@ impl TerminalManager {
                     }
                 }
             }
+        }
+        #[cfg(unix)]
+        if let Some(bridge) = &self.open_url_bridge {
+            bridge.configure_pty_command(&mut command)?;
         }
         let mut child = pair.slave.spawn_command(command)?;
         let killer = child.clone_killer();
@@ -485,6 +499,30 @@ mod tests {
         let term_id = opened["term_id"].as_u64().unwrap();
 
         wait_for_output(&terminals, term_id, b"unset|unset|auth-token-is-present")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn configures_frontend_url_bridge_in_spawned_terminal() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let fs = Arc::new(FsRpc::new(root.path().to_path_buf(), false)?);
+        let (outgoing, _notifications) = mpsc::unbounded_channel();
+        let mut terminals = TerminalManager::new(fs, outgoing);
+        let opened = terminals.dispatch(
+            "Terminal::open",
+            &json!({
+                "shell": {
+                    "program": "/bin/sh",
+                    "args": [
+                        "-c",
+                        "case \"$(command -v open)\" in */bin/open) printf 'open-shim|' ;; *) printf 'missing-shim|' ;; esac; case \"$ZED_WEB_OPEN_URL_SOCKET\" in */open-url.sock) printf 'socket-set' ;; *) printf 'socket-missing' ;; esac"
+                    ]
+                }
+            }),
+        )?;
+        let term_id = opened["term_id"].as_u64().unwrap();
+
+        wait_for_output(&terminals, term_id, b"open-shim|socket-set")
     }
 
     #[test]
