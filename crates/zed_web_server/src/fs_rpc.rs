@@ -58,6 +58,7 @@ impl FsRpc {
             "Fs::atomic_write" => self.atomic_write(params),
             "Fs::save" => self.save(params),
             "Fs::write" => self.write(params),
+            "Fs::root" => Ok(json!(self.root.display().to_string())),
             "Fs::canonicalize" => self.canonicalize(params),
             "Fs::is_file" => self.is_file(params),
             "Fs::is_dir" => self.is_dir(params),
@@ -109,16 +110,17 @@ impl FsRpc {
     }
 
     pub fn virtualize(&self, path: &Path) -> String {
-        path.strip_prefix(&*self.root).map_or_else(
-            |_| path.display().to_string(),
-            |relative| {
-                if relative.as_os_str().is_empty() {
-                    VIRTUAL_ROOT.to_string()
-                } else {
-                    format!("{VIRTUAL_ROOT}/{}", relative.to_string_lossy())
-                }
-            },
-        )
+        path.display().to_string()
+    }
+
+    pub fn rewrite_legacy_workspace_path(&self, value: &str) -> String {
+        if value == VIRTUAL_ROOT {
+            self.root.display().to_string()
+        } else if let Some(relative) = value.strip_prefix("/workspace/") {
+            self.root.join(relative).display().to_string()
+        } else {
+            value.to_string()
+        }
     }
 
     fn requested<'a>(&self, params: &'a Value, key: &str) -> &'a str {
@@ -612,21 +614,40 @@ mod tests {
     fn workspace_alias_is_project_relative() -> Result<()> {
         let root = tempfile::tempdir()?;
         let rpc = FsRpc::new(root.path().to_path_buf(), false)?;
+        let canonical_root = root.path().canonicalize()?;
         assert_eq!(
             rpc.path("/workspace/src/main.rs")?,
-            root.path().canonicalize()?.join("src/main.rs")
+            canonical_root.join("src/main.rs")
         );
         assert_eq!(
             rpc.path("/workspace")?.to_string_lossy(),
-            root.path().canonicalize()?.to_string_lossy()
+            canonical_root.to_string_lossy()
         );
         assert_eq!(
             rpc.path("/workspace/workspace")?,
-            root.path().canonicalize()?.join("workspace")
+            canonical_root.join("workspace")
         );
         assert_eq!(
             rpc.path("/workspace/workspace/src")?,
-            root.path().canonicalize()?.join("workspace/src")
+            canonical_root.join("workspace/src")
+        );
+        assert_eq!(
+            rpc.dispatch("Fs::root", &json!({}))?,
+            canonical_root.display().to_string()
+        );
+        assert_eq!(
+            rpc.virtualize(&canonical_root),
+            canonical_root.display().to_string()
+        );
+        assert_eq!(
+            rpc.rewrite_legacy_workspace_path("/workspace/src"),
+            canonical_root.join("src").display().to_string()
+        );
+        assert_eq!(
+            rpc.rewrite_legacy_workspace_path(
+                &canonical_root.join("workspace").display().to_string()
+            ),
+            canonical_root.join("workspace").display().to_string()
         );
         assert!(rpc.path("/workspace/../outside").is_err());
         Ok(())
@@ -698,29 +719,27 @@ mod tests {
             "module.exports = {};",
         )?;
         let rpc = FsRpc::new(root.path().to_path_buf(), false)?;
+        let root = root.path().canonicalize()?;
+        let path = |relative: &str| root.join(relative).display().to_string();
 
         let tree = rpc.dispatch("Fs::read_dir_tree", &json!({"path": "/workspace"}))?;
         let entries = tree["entries"].as_array().context("missing root entries")?;
-        assert!(entries.iter().any(|entry| entry == "/workspace/src"));
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry == "/workspace/node_modules")
-        );
-        assert!(tree["directories"].get("/workspace/src").is_some());
-        assert!(tree["directories"].get("/workspace/src/nested").is_some());
-        assert!(tree["directories"].get("/workspace/node_modules").is_none());
+        assert!(entries.iter().any(|entry| entry == &path("src")));
+        assert!(entries.iter().any(|entry| entry == &path("node_modules")));
+        assert!(tree["directories"].get(path("src")).is_some());
+        assert!(tree["directories"].get(path("src/nested")).is_some());
+        assert!(tree["directories"].get(path("node_modules")).is_none());
         assert!(
             tree["directories"]
-                .get("/workspace/.zed")
+                .get(path(".zed"))
                 .is_some_and(|entries| entries.as_array().is_some_and(|entries| entries
                     .iter()
-                    .any(|entry| entry == "/workspace/.zed/settings.json")))
+                    .any(|entry| entry == &path(".zed/settings.json"))))
         );
         let serialized = tree.to_string();
         assert!(!serialized.contains("remote.sqlite"));
-        assert!(!serialized.contains("/workspace/.zed/extensions"));
-        assert!(!serialized.contains("/workspace/.config/zed"));
+        assert!(!serialized.contains(&path(".zed/extensions")));
+        assert!(!serialized.contains(&path(".config/zed")));
         Ok(())
     }
 }

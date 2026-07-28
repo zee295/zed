@@ -86,8 +86,7 @@ impl TerminalManager {
         }
 
         let root = self.fs.path("/workspace")?;
-        let root_text = root.to_string_lossy().into_owned();
-        let rewrite = |value: &str| value.replace("/workspace", &root_text);
+        let rewrite = |value: &str| self.fs.rewrite_legacy_workspace_path(value);
         let term_id = self.next_id;
         self.next_id += 1;
         let (data_method, exit_method) = notification_methods(params, term_id);
@@ -242,6 +241,26 @@ impl TerminalManager {
         let Some(term_id) = term_id else {
             return Ok(None);
         };
+        let has_exited = self
+            .terminals
+            .get(&term_id)
+            .map(|terminal| {
+                terminal
+                    .output
+                    .lock()
+                    .map(|output| output.exit_status.is_some())
+                    .map_err(|_| anyhow!("terminal output lock poisoned"))
+            })
+            .transpose()?
+            .unwrap_or(false);
+        if has_exited {
+            if let Some(terminal) = self.terminals.remove(&term_id)
+                && let Some(resume_key) = terminal.resume_key
+            {
+                self.terminals_by_resume_key.remove(&resume_key);
+            }
+            return Ok(None);
+        }
         let Some(terminal) = self.terminals.get_mut(&term_id) else {
             self.terminals_by_resume_key.remove(resume_key);
             return Ok(None);
@@ -725,6 +744,66 @@ mod tests {
         )?;
         assert_eq!(missing["attached"], false);
         terminals.dispatch("Terminal::close", &json!({"term_id": term_id}))?;
+        Ok(())
+    }
+
+    #[test]
+    fn replaces_exited_terminal_during_restore() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let fs = Arc::new(FsRpc::new(root.path().to_path_buf(), false)?);
+        let (outgoing, _notifications) = mpsc::unbounded_channel();
+        let mut terminals = TerminalManager::new(fs, outgoing);
+        let resume_key = "workspace:1:terminal:10";
+        let opened = terminals.dispatch(
+            "Terminal::open",
+            &json!({
+                "shell": {
+                    "program": "/bin/sh",
+                    "args": ["-c", "exit 0"]
+                },
+                "resume_key": resume_key,
+                "notification_id": "initial"
+            }),
+        )?;
+        let exited_term_id = opened["term_id"].as_u64().unwrap();
+
+        for _ in 0..100 {
+            let has_exited = terminals
+                .terminals
+                .get(&exited_term_id)
+                .unwrap()
+                .output
+                .lock()
+                .unwrap()
+                .exit_status
+                .is_some();
+            if has_exited {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let restored = terminals.dispatch(
+            "Terminal::open",
+            &json!({
+                "shell": {
+                    "program": "/bin/sh",
+                    "args": ["-c", "sleep 30"]
+                },
+                "resume_key": resume_key,
+                "notification_id": "restored"
+            }),
+        )?;
+        let restored_term_id = restored["term_id"].as_u64().unwrap();
+        assert_ne!(restored_term_id, exited_term_id);
+        assert_eq!(restored["resumed"], false);
+        assert!(!terminals.terminals.contains_key(&exited_term_id));
+        assert_eq!(
+            terminals.terminals_by_resume_key.get(resume_key),
+            Some(&restored_term_id)
+        );
+
+        terminals.dispatch("Terminal::close", &json!({"term_id": restored_term_id}))?;
         Ok(())
     }
 }

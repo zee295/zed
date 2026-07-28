@@ -161,8 +161,7 @@ impl ProcessManager {
             .filter(|program| !program.is_empty())
             .ok_or_else(|| anyhow::anyhow!("missing process program"))?;
         let root = self.fs.path("/workspace")?;
-        let root_text = root.to_string_lossy().to_string();
-        let rewrite = |value: &str| value.replace("/workspace", &root_text);
+        let rewrite = |value: &str| self.fs.rewrite_legacy_workspace_path(value);
         let raw_args = params
             .get("args")
             .and_then(Value::as_array)
@@ -226,7 +225,7 @@ impl ProcessManager {
                 proc_id,
                 "Process::stdout",
                 outgoing.clone(),
-                Some((root_text.clone().into_bytes(), b"/workspace".to_vec())),
+                None,
                 Some(acp_activity.clone()),
             ))
         });
@@ -269,10 +268,7 @@ impl ProcessManager {
                 owner_generation,
                 disconnected: false,
                 stdin,
-                stdin_rewriter: Mutex::new(FrameRewriter::new(
-                    b"/workspace".to_vec(),
-                    root_text.as_bytes().to_vec(),
-                )),
+                stdin_rewriter: Mutex::new(FrameRewriter::new(Vec::new(), Vec::new())),
                 acp_activity,
                 sanitize_lldb,
                 task,
@@ -511,7 +507,7 @@ pub fn dispatch(fs: &FsRpc, method: &str, params: &Value) -> Result<Value> {
         .filter(|program| !program.is_empty())
         .ok_or_else(|| anyhow::anyhow!("missing process program"))?;
     let root = fs.path("/workspace")?;
-    let rewrite = |value: &str| value.replace("/workspace", &root.to_string_lossy());
+    let rewrite = |value: &str| fs.rewrite_legacy_workspace_path(value);
     let args = params
         .get("args")
         .and_then(Value::as_array)

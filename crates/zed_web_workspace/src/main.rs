@@ -111,9 +111,6 @@ extern "C" {
 }
 
 #[cfg(target_family = "wasm")]
-const WORKSPACE_ROOT: &str = "/workspace";
-
-#[cfg(target_family = "wasm")]
 #[derive(Clone, Copy, Default, serde::Deserialize)]
 struct WebWorkspaceUiState {
     sidebar_open: bool,
@@ -1940,14 +1937,21 @@ pub fn main() {
             .call::<_, WebWorkspaceUiState>("Workspace::ui_state", &serde_json::json!({}))
             .await
             .unwrap_or_default();
-        launch(remote_client, ui_state);
+        let workspace_root = remote_client
+            .call::<_, String>("Fs::root", &serde_json::json!({}))
+            .await
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("/"));
+        launch(remote_client, ui_state, workspace_root);
     });
 }
 
 #[cfg(target_family = "wasm")]
-fn launch(remote_client: wasm_remote::RemoteClient, ui_state: WebWorkspaceUiState) {
-    use std::path::PathBuf;
-
+fn launch(
+    remote_client: wasm_remote::RemoteClient,
+    ui_state: WebWorkspaceUiState,
+    workspace_root: std::path::PathBuf,
+) {
     gpui_platform::web_init();
     // Bundle fonts/icons/themes so SVG icons and keymaps assets resolve.
     let extension_assets = Arc::new(RwLock::new(BTreeMap::new()));
@@ -1961,7 +1965,7 @@ fn launch(remote_client: wasm_remote::RemoteClient, ui_state: WebWorkspaceUiStat
 
             let mut paths = workspace_paths_from_url();
             if paths.is_empty() {
-                paths.push(PathBuf::from(WORKSPACE_ROOT));
+                paths.push(workspace_root);
             }
             let project_groups = workspace_project_groups_from_url();
             let open_task =
