@@ -1489,6 +1489,13 @@ impl PlatformInputHandler {
             .ok();
     }
 
+    /// Inserts text supplied by a platform paste event.
+    pub fn paste_text(&mut self, text: &str) {
+        self.cx
+            .update(|window, cx| self.handler.paste_text(text, window, cx))
+            .ok();
+    }
+
     pub fn replace_and_mark_text_in_range(
         &mut self,
         range_utf16: Option<Range<usize>>,
@@ -1693,6 +1700,14 @@ pub trait InputHandler: 'static {
         window: &mut Window,
         cx: &mut App,
     );
+
+    /// Insert text supplied by a platform paste event.
+    ///
+    /// Text inputs normally handle this like an insertion. Specialized inputs,
+    /// such as terminals, can override it to preserve their paste semantics.
+    fn paste_text(&mut self, text: &str, window: &mut Window, cx: &mut App) {
+        self.replace_text_in_range(None, text, window, cx);
+    }
 
     /// Replace the text in the given document range with the given text,
     /// and mark the given text as part of an IME 'composing' state

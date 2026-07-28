@@ -356,6 +356,13 @@ impl WebWindowInner {
                 return;
             }
 
+            // Clipboard reads are asynchronous on the web, but the DOM paste
+            // event exposes its data synchronously. Let the browser produce
+            // that event instead of dispatching GPUI's synchronous Paste action.
+            if is_browser_paste_shortcut(&key, &modifiers, this.is_mac) {
+                return;
+            }
+
             let is_held = event.repeat();
             let key_char = compute_key_char(&event, &key, &modifiers);
 
@@ -483,7 +490,7 @@ impl WebWindowInner {
 
             event.prevent_default();
             this.with_input_handler(|handler| {
-                handler.replace_text_in_range(None, &text);
+                handler.paste_text(&text);
             });
         })
     }
@@ -710,6 +717,18 @@ fn is_modifier_only_key(key: &str) -> bool {
         key,
         "control" | "alt" | "shift" | "platform" | "capslock" | "compose" | "process"
     )
+}
+
+fn is_browser_paste_shortcut(key: &str, modifiers: &Modifiers, is_mac: bool) -> bool {
+    if key != "v" || modifiers.alt || modifiers.function {
+        return false;
+    }
+
+    if is_mac {
+        modifiers.platform && !modifiers.control
+    } else {
+        modifiers.control && !modifiers.platform
+    }
 }
 
 fn compute_key_char(

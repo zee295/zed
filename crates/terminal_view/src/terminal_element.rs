@@ -1575,6 +1575,14 @@ impl InputHandler for TerminalInputHandler {
             .ok();
     }
 
+    fn paste_text(&mut self, text: &str, _window: &mut Window, cx: &mut App) {
+        self.terminal_view.update(cx, |view, view_cx| {
+            view.clear_marked_text(view_cx);
+            view.entity()
+                .update(view_cx, |terminal, _cx| terminal.paste(text));
+        });
+    }
+
     fn replace_and_mark_text_in_range(
         &mut self,
         _range_utf16: Option<std::ops::Range<usize>>,
