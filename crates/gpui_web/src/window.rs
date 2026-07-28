@@ -1,5 +1,5 @@
 use crate::display::WebDisplay;
-use crate::events::{ClickState, WebEventListeners, is_mac_platform};
+use crate::events::{ClickState, EventListenerHandle, WebEventListeners, is_mac_platform};
 use std::sync::Arc;
 use std::{cell::Cell, cell::RefCell, rc::Rc};
 
@@ -57,13 +57,12 @@ pub(crate) struct WebWindowInner {
     pub(crate) is_composing: Cell<bool>,
     mql_handle: RefCell<Option<MqlHandle>>,
     pending_physical_size: Cell<Option<(u32, u32)>>,
+    raf_id: Cell<Option<i32>>,
 }
 
 pub struct WebWindow {
     inner: Rc<WebWindowInner>,
     display: Rc<dyn PlatformDisplay>,
-    #[allow(dead_code)]
-    handle: AnyWindowHandle,
     _raf_closure: Closure<dyn FnMut()>,
     _resize_observer: Option<web_sys::ResizeObserver>,
     _resize_observer_closure: Closure<dyn FnMut(js_sys::Array)>,
@@ -72,7 +71,7 @@ pub struct WebWindow {
 
 impl WebWindow {
     pub fn new(
-        handle: AnyWindowHandle,
+        _handle: AnyWindowHandle,
         _params: WindowParams,
         context: &WgpuContext,
         browser_window: web_sys::Window,
@@ -184,6 +183,7 @@ impl WebWindow {
             is_composing: Cell::new(false),
             mql_handle: RefCell::new(None),
             pending_physical_size: Cell::new(None),
+            raf_id: Cell::new(None),
         });
 
         let raf_closure = inner.create_raf_closure();
@@ -203,7 +203,6 @@ impl WebWindow {
         Ok(Self {
             inner,
             display,
-            handle,
             _raf_closure: raf_closure,
             _resize_observer: resize_observer,
             _resize_observer_closure: resize_observer_closure,
@@ -223,17 +222,26 @@ impl WebWindow {
             let dpr = inner.browser_window.device_pixel_ratio();
             let dpr_f32 = dpr as f32;
 
-            // Logical (CSS) size always comes from contentRect — it's the box the
-            // canvas actually occupies in the page. Physical (backing-store) size
-            // is logical * devicePixelRatio. We deliberately do NOT use
-            // device_pixel_content_box_size: some browsers report a canvas backing
-            // store that is 2x the CSS box even when devicePixelRatio == 1 (page
-            // zoom / GPU scaling), which made the UI render at half size.
-            let rect = entry.content_rect();
-            let logical_width = rect.width() as f32;
-            let logical_height = rect.height() as f32;
-            let physical_width = (logical_width as f64 * dpr).round() as u32;
-            let physical_height = (logical_height as f64 * dpr).round() as u32;
+            let (physical_width, physical_height, logical_width, logical_height) =
+                if inner.has_device_pixel_support {
+                    let size: web_sys::ResizeObserverSize = entry
+                        .device_pixel_content_box_size()
+                        .get(0)
+                        .unchecked_into();
+                    let pw = size.inline_size() as u32;
+                    let ph = size.block_size() as u32;
+                    let lw = pw as f64 / dpr;
+                    let lh = ph as f64 / dpr;
+                    (pw, ph, lw as f32, lh as f32)
+                } else {
+                    // Safari fallback: use contentRect (always CSS px).
+                    let rect = entry.content_rect();
+                    let lw = rect.width() as f32;
+                    let lh = rect.height() as f32;
+                    let pw = (lw as f64 * dpr).round() as u32;
+                    let ph = (lh as f64 * dpr).round() as u32;
+                    (pw, ph, lw, lh)
+                };
 
             let scale_changed = inner.notify_scale.replace(false);
             let prev = inner.last_physical_size.get();
@@ -248,24 +256,36 @@ impl WebWindow {
 
             // Skip rendering to a zero-size canvas (e.g. display:none).
             if physical_width == 0 || physical_height == 0 {
-                let mut s = inner.state.borrow_mut();
-                s.bounds.size = Size::default();
-                s.scale_factor = dpr_f32;
-                // Still fire the callback so GPUI knows the window is gone.
-                drop(s);
-                // Take the callback out so nested platform code cannot re-borrow
-                // `callbacks` while the resize handler runs (common mid-draw).
-                let mut callback = inner.callbacks.borrow_mut().resize.take();
-                if let Some(ref mut cb) = callback {
-                    cb(Size::default(), dpr_f32);
+                {
+                    let mut s = inner.state.borrow_mut();
+                    s.bounds.size = Size::default();
+                    s.scale_factor = dpr_f32;
                 }
-                inner.callbacks.borrow_mut().resize = callback;
+                // Still fire the callback so GPUI knows the window is gone.
+                inner.with_callback(
+                    |callbacks| &mut callbacks.resize,
+                    |callback| callback(Size::default(), dpr_f32),
+                );
                 return;
             }
 
             let max_texture_dimension = inner.state.borrow().max_texture_dimension;
             let clamped_width = physical_width.min(max_texture_dimension);
             let clamped_height = physical_height.min(max_texture_dimension);
+
+            // Recompute the logical size from the clamped physical size so
+            // that scale_factor still maps GPUI's logical bounds exactly onto
+            // the surface; otherwise clamping would silently distort the
+            // effective scale.
+            let (logical_width, logical_height) =
+                if (clamped_width, clamped_height) != (physical_width, physical_height) {
+                    (
+                        (clamped_width as f64 / dpr) as f32,
+                        (clamped_height as f64 / dpr) as f32,
+                    )
+                } else {
+                    (logical_width, logical_height)
+                };
 
             inner
                 .pending_physical_size
@@ -285,37 +305,53 @@ impl WebWindow {
                 height: px(logical_height),
             };
 
-            let mut callback = inner.callbacks.borrow_mut().resize.take();
-            if let Some(ref mut cb) = callback {
-                cb(new_size, dpr_f32);
-            }
-            inner.callbacks.borrow_mut().resize = callback;
+            inner.with_callback(
+                |callbacks| &mut callbacks.resize,
+                |callback| callback(new_size, dpr_f32),
+            );
         })
     }
 }
 
 impl WebWindowInner {
+    /// Invokes a registered callback with take/call/restore semantics.
+    ///
+    /// The callback is removed from the slot for the duration of the call, so
+    /// the `RefCell` is not borrowed while user code runs: a callback that
+    /// re-enters the platform window (dispatching input, registering
+    /// handlers) would otherwise panic with a `BorrowMutError`. A re-entrant
+    /// invocation of the same callback finds the slot empty and is a no-op.
+    pub(crate) fn with_callback<C, R>(
+        &self,
+        select: impl Fn(&mut WebWindowCallbacks) -> &mut Option<C>,
+        invoke: impl FnOnce(&mut C) -> R,
+    ) -> Option<R> {
+        let mut callback = select(&mut self.callbacks.borrow_mut()).take()?;
+        let result = invoke(&mut callback);
+        *select(&mut self.callbacks.borrow_mut()) = Some(callback);
+        Some(result)
+    }
+
     fn create_raf_closure(self: &Rc<Self>) -> Closure<dyn FnMut()> {
         let raf_handle: Rc<RefCell<Option<js_sys::Function>>> = Rc::new(RefCell::new(None));
         let raf_handle_inner = Rc::clone(&raf_handle);
 
         let this = Rc::clone(self);
         let closure = Closure::new(move || {
-            // Take callback out of the RefCell before invoking: request_frame
-            // runs a full GPUI draw, which can re-enter platform code that
-            // touches `callbacks` (resize, input, etc.).
-            let mut callback = this.callbacks.borrow_mut().request_frame.take();
-            if let Some(ref mut cb) = callback {
-                cb(RequestFrameOptions {
-                    require_presentation: true,
-                    force_render: false,
-                });
-            }
-            this.callbacks.borrow_mut().request_frame = callback;
+            this.with_callback(
+                |callbacks| &mut callbacks.request_frame,
+                |callback| {
+                    callback(RequestFrameOptions {
+                        require_presentation: true,
+                        force_render: false,
+                    })
+                },
+            );
 
             // Re-schedule for the next frame
             if let Some(ref func) = *raf_handle_inner.borrow() {
-                this.browser_window.request_animation_frame(func).ok();
+                this.raf_id
+                    .set(this.browser_window.request_animation_frame(func).ok());
             }
         });
 
@@ -327,9 +363,11 @@ impl WebWindowInner {
     }
 
     fn schedule_raf(&self, closure: &Closure<dyn FnMut()>) {
-        self.browser_window
-            .request_animation_frame(closure.as_ref().unchecked_ref())
-            .ok();
+        self.raf_id.set(
+            self.browser_window
+                .request_animation_frame(closure.as_ref().unchecked_ref())
+                .ok(),
+        );
     }
 
     fn observe_canvas(&self, observer: &web_sys::ResizeObserver) {
@@ -369,41 +407,57 @@ impl WebWindowInner {
         });
     }
 
-    pub(crate) fn register_visibility_change(
-        self: &Rc<Self>,
-    ) -> Option<Closure<dyn FnMut(JsValue)>> {
+    pub(crate) fn register_visibility_change(self: &Rc<Self>) -> Option<EventListenerHandle> {
         let document = self.browser_window.document()?;
         let this = Rc::clone(self);
 
-        let closure = Closure::<dyn FnMut(JsValue)>::new(move |_event: JsValue| {
-            let is_visible = this
-                .browser_window
-                .document()
-                .map(|doc| {
-                    let state_str: String = js_sys::Reflect::get(&doc, &"visibilityState".into())
-                        .ok()
-                        .and_then(|v| v.as_string())
-                        .unwrap_or_default();
-                    state_str == "visible"
-                })
-                .unwrap_or(true);
+        Some(EventListenerHandle::add(
+            document.as_ref(),
+            "visibilitychange",
+            move |_event: JsValue| {
+                let is_visible = this
+                    .browser_window
+                    .document()
+                    .map(|doc| {
+                        let state_str: String =
+                            js_sys::Reflect::get(&doc, &"visibilityState".into())
+                                .ok()
+                                .and_then(|v| v.as_string())
+                                .unwrap_or_default();
+                        state_str == "visible"
+                    })
+                    .unwrap_or(true);
 
-            {
-                let mut state = this.state.borrow_mut();
-                state.is_active = is_visible;
-            }
-            let mut callback = this.callbacks.borrow_mut().active_status_change.take();
-            if let Some(ref mut cb) = callback {
-                cb(is_visible);
-            }
-            this.callbacks.borrow_mut().active_status_change = callback;
-        });
+                {
+                    let mut state = this.state.borrow_mut();
+                    state.is_active = is_visible;
+                }
+                this.with_callback(
+                    |callbacks| &mut callbacks.active_status_change,
+                    |callback| callback(is_visible),
+                );
+            },
+        ))
+    }
 
-        document
-            .add_event_listener_with_callback("visibilitychange", closure.as_ref().unchecked_ref())
-            .ok();
+    /// Tracks `fullscreenchange` instead of toggling a local flag: the user
+    /// can exit fullscreen with Esc, and `requestFullscreen` can be rejected,
+    /// so the document is the only reliable source of truth.
+    pub(crate) fn register_fullscreen_change(self: &Rc<Self>) -> Option<EventListenerHandle> {
+        let document = self.browser_window.document()?;
+        let this = Rc::clone(self);
 
-        Some(closure)
+        Some(EventListenerHandle::add(
+            document.as_ref(),
+            "fullscreenchange",
+            move |_event: JsValue| {
+                let is_fullscreen = this
+                    .browser_window
+                    .document()
+                    .is_some_and(|document| document.fullscreen_element().is_some());
+                this.state.borrow_mut().is_fullscreen = is_fullscreen;
+            },
+        ))
     }
 
     pub(crate) fn with_input_handler<R>(
@@ -416,27 +470,51 @@ impl WebWindowInner {
         Some(result)
     }
 
-    pub(crate) fn register_appearance_change(
-        self: &Rc<Self>,
-    ) -> Option<Closure<dyn FnMut(JsValue)>> {
+    pub(crate) fn register_appearance_change(self: &Rc<Self>) -> Option<EventListenerHandle> {
         let mql = self
             .browser_window
             .match_media("(prefers-color-scheme: dark)")
             .ok()??;
 
         let this = Rc::clone(self);
-        let closure = Closure::<dyn FnMut(JsValue)>::new(move |_event: JsValue| {
-            let mut callback = this.callbacks.borrow_mut().appearance_changed.take();
-            if let Some(ref mut cb) = callback {
-                cb();
-            }
-            this.callbacks.borrow_mut().appearance_changed = callback;
-        });
+        Some(EventListenerHandle::add(
+            mql.as_ref(),
+            "change",
+            move |_event: JsValue| {
+                this.with_callback(
+                    |callbacks| &mut callbacks.appearance_changed,
+                    |callback| callback(),
+                );
+            },
+        ))
+    }
+}
 
-        mql.add_event_listener_with_callback("change", closure.as_ref().unchecked_ref())
-            .ok();
+impl Drop for WebWindow {
+    fn drop(&mut self) {
+        // Cancel the pending requestAnimationFrame callback before
+        // `_raf_closure` is freed, and disconnect the resize observer before
+        // `_resize_observer_closure` is freed; a late invocation of either
+        // would throw "closure invoked after being dropped".
+        if let Some(raf_id) = self.inner.raf_id.take() {
+            self.inner
+                .browser_window
+                .cancel_animation_frame(raf_id)
+                .ok();
+        }
+        if let Some(ref observer) = self._resize_observer {
+            observer.disconnect();
+        }
 
-        Some(closure)
+        // The DPR media-query closure captures an `Rc<WebWindowInner>` and is
+        // stored inside the inner itself, forming a reference cycle; take it
+        // out so the inner can actually be freed.
+        self.inner.mql_handle.borrow_mut().take();
+
+        let canvas: &web_sys::Element = self.inner.canvas.as_ref();
+        canvas.remove();
+        let input_element: &web_sys::Element = self.inner.input_element.as_ref();
+        input_element.remove();
     }
 }
 
@@ -606,16 +684,17 @@ impl PlatformWindow for WebWindow {
     }
 
     fn toggle_fullscreen(&self) {
-        let mut state = self.inner.state.borrow_mut();
-        state.is_fullscreen = !state.is_fullscreen;
+        let Some(document) = self.inner.browser_window.document() else {
+            return;
+        };
 
-        if state.is_fullscreen {
+        // `is_fullscreen` is updated by the `fullscreenchange` listener once
+        // the transition actually happens (or not, if the request fails).
+        if document.fullscreen_element().is_some() {
+            document.exit_fullscreen();
+        } else {
             let canvas: &web_sys::Element = self.inner.canvas.as_ref();
             canvas.request_fullscreen().ok();
-        } else {
-            if let Some(document) = self.inner.browser_window.document() {
-                document.exit_fullscreen();
-            }
         }
     }
 

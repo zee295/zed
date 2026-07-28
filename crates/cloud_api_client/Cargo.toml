@@ -22,7 +22,7 @@ serde.workspace = true
 serde_json.workspace = true
 async-lock.workspace = true
 thiserror.workspace = true
+yawc.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 gpui_tokio.workspace = true
-yawc.workspace = true

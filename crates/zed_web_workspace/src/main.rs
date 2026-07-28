@@ -86,34 +86,6 @@ export function zedSyncWorkspaceProjectGroups(groupsJson) {
     self.history.replaceState(self.history.state, "", url);
 }
 
-export function zedAgentPanelOpen() {
-    try {
-        return self.localStorage.getItem("zed-web-agent-panel-open") === "true";
-    } catch {
-        return false;
-    }
-}
-
-export function zedSetAgentPanelOpen(open) {
-    try {
-        self.localStorage.setItem("zed-web-agent-panel-open", open ? "true" : "false");
-    } catch {}
-}
-
-export function zedWorkspaceSidebarOpen() {
-    try {
-        return self.localStorage.getItem("zed-web-workspace-sidebar-open") === "true";
-    } catch {
-        return false;
-    }
-}
-
-export function zedSetWorkspaceSidebarOpen(open) {
-    try {
-        self.localStorage.setItem("zed-web-workspace-sidebar-open", open ? "true" : "false");
-    } catch {}
-}
-
 export function zedOpenExternalUrl(url) {
     return self.__zedOpenExternalUrl?.(url) ?? false;
 }
@@ -134,24 +106,34 @@ extern "C" {
     #[wasm_bindgen(js_name = zedSyncWorkspaceProjectGroups)]
     fn sync_workspace_project_groups_json(groups: &str);
 
-    #[wasm_bindgen(js_name = zedAgentPanelOpen)]
-    fn saved_agent_panel_open() -> bool;
-
-    #[wasm_bindgen(js_name = zedSetAgentPanelOpen)]
-    fn save_agent_panel_open(open: bool);
-
-    #[wasm_bindgen(js_name = zedWorkspaceSidebarOpen)]
-    fn saved_workspace_sidebar_open() -> bool;
-
-    #[wasm_bindgen(js_name = zedSetWorkspaceSidebarOpen)]
-    fn save_workspace_sidebar_open(open: bool);
-
     #[wasm_bindgen(js_name = zedOpenExternalUrl)]
     fn open_external_url(url: &str) -> bool;
 }
 
 #[cfg(target_family = "wasm")]
 const WORKSPACE_ROOT: &str = "/workspace";
+
+#[cfg(target_family = "wasm")]
+#[derive(Clone, Copy, Default, serde::Deserialize)]
+struct WebWorkspaceUiState {
+    sidebar_open: bool,
+}
+
+#[cfg(target_family = "wasm")]
+fn save_workspace_sidebar_open(open: bool) {
+    let Some(client) = wasm_remote::remote_client() else {
+        return;
+    };
+    wasm_bindgen_futures::spawn_local(async move {
+        client
+            .call_void(
+                "Workspace::set_sidebar_open",
+                &serde_json::json!({"open": open}),
+            )
+            .await
+            .log_err();
+    });
+}
 
 #[cfg(target_family = "wasm")]
 fn workspace_paths_from_url() -> Vec<std::path::PathBuf> {
@@ -192,6 +174,11 @@ fn sync_project_paths_url(project: &Entity<project::Project>, cx: &App) {
     if let Ok(paths) = serde_json::to_string(&paths) {
         sync_workspace_paths_json(&paths);
     }
+}
+
+#[cfg(target_family = "wasm")]
+fn sync_active_project_paths_url(multi_workspace: &workspace::MultiWorkspace, cx: &App) {
+    sync_project_paths_url(multi_workspace.workspace().read(cx).project(), cx);
 }
 
 #[cfg(target_family = "wasm")]
@@ -385,7 +372,8 @@ fn register_plain_languages(languages: &language::LanguageRegistry) {
                 path_suffixes: suffixes,
                 first_line_pattern: None,
                 ..LanguageMatcher::default()
-            },
+            }
+            .into(),
             line_comments,
             ..LanguageConfig::default()
         };
@@ -1334,17 +1322,43 @@ fn install_workspace_chrome(cx: &mut App) {
         // Title bar + in-window application menu (desktop Linux/Windows style)
         let multi_workspace = workspace.multi_workspace().cloned();
         let project = workspace.project().clone();
-        sync_project_paths_url(&project, cx);
-        cx.subscribe_in(&project, window, |_, project, event, _, cx| {
-            if matches!(
+        let active_multi_workspace = multi_workspace.clone();
+        let initial_project = project.clone();
+        let initial_multi_workspace = active_multi_workspace.clone();
+        cx.defer(move |cx| {
+            if initial_multi_workspace
+                .as_ref()
+                .and_then(WeakEntity::upgrade)
+                .is_none_or(|multi_workspace| {
+                    multi_workspace.read(cx).workspace().read(cx).project() == &initial_project
+                })
+            {
+                sync_project_paths_url(&initial_project, cx);
+            }
+        });
+        cx.subscribe_in(&project, window, move |_, project, event, _, cx| {
+            if !matches!(
                 event,
                 project::Event::WorktreeAdded(_)
                     | project::Event::WorktreeRemoved(_)
                     | project::Event::WorktreeOrderChanged
                     | project::Event::WorktreePathsChanged { .. }
             ) {
-                sync_project_paths_url(project, cx);
+                return;
             }
+            let project = project.clone();
+            let active_multi_workspace = active_multi_workspace.clone();
+            cx.defer(move |cx| {
+                if active_multi_workspace
+                    .as_ref()
+                    .and_then(WeakEntity::upgrade)
+                    .is_none_or(|multi_workspace| {
+                        multi_workspace.read(cx).workspace().read(cx).project() == &project
+                    })
+                {
+                    sync_project_paths_url(&project, cx);
+                }
+            });
         })
         .detach();
         let title_bar = cx.new(|cx| {
@@ -1376,6 +1390,7 @@ fn install_workspace_chrome(cx: &mut App) {
                         let multi_workspace = multi_workspace.downgrade();
                         cx.defer(move |cx| {
                             if let Some(multi_workspace) = multi_workspace.upgrade() {
+                                sync_active_project_paths_url(multi_workspace.read(cx), cx);
                                 let groups =
                                     multi_workspace_project_groups(multi_workspace.read(cx), cx);
                                 sync_project_groups_url(&groups);
@@ -1786,36 +1801,6 @@ fn load_core_panels(
             ),
         );
 
-        workspace_handle
-            .update_in(cx, |workspace, window, cx| {
-                if saved_agent_panel_open() {
-                    workspace.open_panel::<AgentPanel>(window, cx);
-                }
-
-                let sync_visibility = |workspace: &workspace::Workspace, cx: &App| {
-                    let panel_id = workspace
-                        .panel::<AgentPanel>(cx)
-                        .map(|panel| panel.entity_id());
-                    let visible = panel_id.is_some_and(|panel_id| {
-                        workspace.all_docks().iter().any(|dock| {
-                            dock.read(cx)
-                                .visible_panel()
-                                .is_some_and(|panel| panel.panel_id() == panel_id)
-                        })
-                    });
-                    save_agent_panel_open(visible);
-                };
-                sync_visibility(workspace, cx);
-
-                for dock in workspace.all_docks() {
-                    cx.observe(dock, move |workspace, _, cx| {
-                        sync_visibility(workspace, cx);
-                    })
-                    .detach();
-                }
-            })
-            .ok();
-
         if [
             attached.0, attached.1, attached.2, attached.3, attached.4, attached.5,
         ]
@@ -1838,13 +1823,14 @@ fn load_core_panels(
 fn log_open_result(
     open_result_task: gpui::Task<anyhow::Result<workspace::OpenResult>>,
     project_groups: Vec<Vec<std::path::PathBuf>>,
+    ui_state: WebWorkspaceUiState,
     cx: &mut App,
 ) {
     cx.spawn(async move |cx| {
         web_sys::console::log_1(&"zed_web_workspace: awaiting open_paths…".into());
         match open_result_task.await {
             Ok(result) => {
-                let restore_sidebar = saved_workspace_sidebar_open();
+                let restore_sidebar = ui_state.sidebar_open;
                 if !project_groups.is_empty() {
                     let groups = project_groups
                         .into_iter()
@@ -1867,6 +1853,7 @@ fn log_open_result(
                 let window = result.window;
                 cx.spawn(async move |cx| {
                     let mut restore_pending = restore_sidebar;
+                    let mut saved_sidebar_open = restore_sidebar;
                     loop {
                         let Some(open) = window
                             .update(cx, |multi_workspace, _, cx| {
@@ -1882,8 +1869,9 @@ fn log_open_result(
                         if open {
                             restore_pending = false;
                         }
-                        if !restore_pending {
+                        if !restore_pending && open != saved_sidebar_open {
                             save_workspace_sidebar_open(open);
+                            saved_sidebar_open = open;
                         }
                         cx.background_executor()
                             .timer(std::time::Duration::from_millis(500))
@@ -1948,12 +1936,16 @@ pub fn main() {
             );
             return;
         }
-        launch(remote_client);
+        let ui_state = remote_client
+            .call::<_, WebWorkspaceUiState>("Workspace::ui_state", &serde_json::json!({}))
+            .await
+            .unwrap_or_default();
+        launch(remote_client, ui_state);
     });
 }
 
 #[cfg(target_family = "wasm")]
-fn launch(remote_client: wasm_remote::RemoteClient) {
+fn launch(remote_client: wasm_remote::RemoteClient, ui_state: WebWorkspaceUiState) {
     use std::path::PathBuf;
 
     gpui_platform::web_init();
@@ -1974,7 +1966,7 @@ fn launch(remote_client: wasm_remote::RemoteClient) {
             let project_groups = workspace_project_groups_from_url();
             let open_task =
                 workspace::open_paths(&paths, app_state, workspace::OpenOptions::default(), cx);
-            log_open_result(open_task, project_groups, cx);
+            log_open_result(open_task, project_groups, ui_state, cx);
             cx.activate(true);
         });
     std::mem::forget(handle);

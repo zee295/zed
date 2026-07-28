@@ -28,15 +28,15 @@ fn lock_shared<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(target_family = "wasm")]
 #[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
 export function zedRpcCreate(url, onOpen, onMessage, onClose, onError) {
-    let workspaceKey;
+    let workspaceSession = "default";
     try {
         const pageUrl = new URL(self.location.href);
-        const paths = pageUrl.searchParams.getAll("path");
-        workspaceKey = JSON.stringify(paths.length ? paths : [pageUrl.pathname]);
-    } catch (_) {
-        workspaceKey = self.location?.pathname ?? "/workspace";
-    }
-    const sessionId = `workspace:${self.location?.origin ?? "local"}:${workspaceKey}`;
+        workspaceSession = pageUrl.searchParams.get("workspace_id") || "default";
+    } catch (_) {}
+    // The URL's path parameters select the active project; they must not select
+    // the server process session. A project switch updates the URL without
+    // replacing this socket, and a reload must attach to that same session.
+    const sessionId = `workspace:${workspaceSession}`;
     const state = {
         active: true,
         attempt: 0,

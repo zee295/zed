@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    fs,
     path::{Path, PathBuf},
     sync::Arc,
     sync::Mutex as StdMutex,
@@ -8,10 +7,14 @@ use std::{
     time::{Duration, UNIX_EPOCH},
 };
 
-use anyhow::{Context as _, Result, bail};
+#[cfg(test)]
+use anyhow::Context as _;
+use anyhow::{Result, bail};
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt as _, StreamExt as _};
 use serde_json::{Value, json};
+#[cfg(test)]
+use std::fs;
 use tokio::{
     sync::{Mutex, mpsc},
     task::JoinHandle,
@@ -102,9 +105,10 @@ struct RpcSession {
     fs: Arc<FsRpc>,
     sql: Arc<crate::sql_rpc::SqlRpc>,
     sql_clients: HashSet<String>,
-    processes: crate::process_rpc::ProcessManager,
+    processes: Arc<Mutex<crate::process_rpc::ProcessManager>>,
     terminals: crate::terminal_rpc::TerminalManager,
     agents: crate::agent_rpc::AgentManager,
+    workspace_ui: WorkspaceUiState,
     watches: HashMap<u64, WatchHandle>,
     watch_groups: HashMap<WatchKey, WatchGroup>,
     next_subscription_id: u64,
@@ -112,6 +116,11 @@ struct RpcSession {
     notification_target: Arc<Mutex<NotificationTarget>>,
     notification_forwarder: JoinHandle<()>,
     event_forwarder: JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct WorkspaceUiState {
+    sidebar_open: bool,
 }
 
 struct WatchHandle {
@@ -126,7 +135,7 @@ struct WatchKey {
 }
 
 struct WatchGroup {
-    subscription_ids: Arc<StdMutex<HashSet<u64>>>,
+    subscription_paths: Arc<StdMutex<HashMap<u64, PathBuf>>>,
     task: JoinHandle<()>,
 }
 
@@ -171,13 +180,17 @@ impl RpcSession {
             fs: fs.clone(),
             sql: state.sql.clone(),
             sql_clients: HashSet::new(),
-            processes: crate::process_rpc::ProcessManager::new(fs.clone(), notifications.clone()),
+            processes: Arc::new(Mutex::new(crate::process_rpc::ProcessManager::new(
+                fs.clone(),
+                notifications.clone(),
+            ))),
             terminals: crate::terminal_rpc::TerminalManager::new(fs, notifications.clone()),
             agents: crate::agent_rpc::AgentManager::new(
                 (*state.root).clone(),
                 state.http.clone(),
                 notifications.clone(),
             ),
+            workspace_ui: WorkspaceUiState::default(),
             watches: HashMap::new(),
             watch_groups: HashMap::new(),
             next_subscription_id: 1,
@@ -197,16 +210,24 @@ impl RpcSession {
             return;
         };
         let remove_group = self.watch_groups.get(&watch.key).is_some_and(|group| {
-            let mut subscription_ids = group
-                .subscription_ids
+            let mut subscription_paths = group
+                .subscription_paths
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            subscription_ids.remove(&subscription_id);
-            subscription_ids.is_empty()
+            subscription_paths.remove(&subscription_id);
+            subscription_paths.is_empty()
         });
         if remove_group && let Some(group) = self.watch_groups.remove(&watch.key) {
             group.task.abort();
         }
+    }
+
+    fn covering_watch_key(&self, path: &Path) -> Option<WatchKey> {
+        self.watch_groups
+            .keys()
+            .filter(|key| watch_covers_path(&key.path, path))
+            .max_by_key(|key| key.path.components().count())
+            .cloned()
     }
 
     fn remove_watches_for_generation(&mut self, generation: u64) {
@@ -364,55 +385,150 @@ pub async fn serve(socket: WebSocket, state: AppState) {
             });
             continue;
         }
-        let mut session = session.lock().await;
-        if method.starts_with("Sql::") {
-            session.sql_clients.insert(
-                params
-                    .get("client_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("legacy")
-                    .to_string(),
-            );
+        if handles_stateless(&method) {
+            let (fs, sql) = {
+                let mut session = session.lock().await;
+                if method.starts_with("Sql::") {
+                    session.sql_clients.insert(
+                        params
+                            .get("client_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("legacy")
+                            .to_string(),
+                    );
+                }
+                (session.fs.clone(), session.sql.clone())
+            };
+            let result = dispatch(fs, sql, method.clone(), params).await;
+            let succeeded = result.is_ok();
+            let response = match result {
+                Ok(result) => json!({"id": request_id, "result": result, "error": null}),
+                Err(error) => {
+                    tracing::warn!(?error, %method, "rpc request failed");
+                    json!({"id": request_id, "result": null, "error": error.to_string()})
+                }
+            };
+            if outgoing.send(Message::Text(response.to_string())).is_err() {
+                break;
+            }
+            if succeeded
+                && matches!(
+                    method.as_str(),
+                    "Extensions::install"
+                        | "Extensions::uninstall"
+                        | "Extensions::install_dev"
+                        | "Extensions::rebuild_dev"
+                )
+                && state
+                    .events
+                    .send(json!({
+                        "method": "Host::extensions_changed",
+                        "params": {}
+                    }))
+                    .is_err()
+            {
+                tracing::debug!("no RPC clients subscribed to extension changes");
+            }
+            continue;
         }
+        if crate::agent_rpc::handles(&method) {
+            let agents = session.lock().await.agents.clone();
+            let result = agents.dispatch(&method, &params).await;
+            let response = match result {
+                Ok(result) => json!({"id": request_id, "result": result, "error": null}),
+                Err(error) => {
+                    tracing::warn!(?error, %method, "rpc request failed");
+                    json!({"id": request_id, "result": null, "error": error.to_string()})
+                }
+            };
+            if outgoing.send(Message::Text(response.to_string())).is_err() {
+                break;
+            }
+            continue;
+        }
+        if method == "Browser::relay_localhost_callback" {
+            let result = crate::auth_callback::relay(&params).await;
+            let response = match result {
+                Ok(result) => json!({"id": request_id, "result": result, "error": null}),
+                Err(error) => {
+                    tracing::warn!(?error, %method, "rpc request failed");
+                    json!({"id": request_id, "result": null, "error": error.to_string()})
+                }
+            };
+            if outgoing.send(Message::Text(response.to_string())).is_err() {
+                break;
+            }
+            continue;
+        }
+        if crate::process_rpc::handles_streaming(&method) {
+            let generation = bound_session
+                .as_ref()
+                .map(|(_, _, generation)| *generation)
+                .unwrap_or_default();
+            let processes = session.lock().await.processes.clone();
+            let result = processes
+                .lock()
+                .await
+                .dispatch(&method, &params, generation)
+                .await;
+            let response = match result {
+                Ok(result) => json!({"id": request_id, "result": result, "error": null}),
+                Err(error) => {
+                    tracing::warn!(?error, %method, "rpc request failed");
+                    json!({"id": request_id, "result": null, "error": error.to_string()})
+                }
+            };
+            if outgoing.send(Message::Text(response.to_string())).is_err() {
+                break;
+            }
+            continue;
+        }
+        let mut session = session.lock().await;
         let generation = bound_session
             .as_ref()
             .map(|(_, _, generation)| *generation)
             .unwrap_or_default();
-        let result = if crate::agent_rpc::handles(&method) {
-            session.agents.dispatch(&method, &params).await
-        } else if method == "Browser::relay_localhost_callback" {
-            crate::auth_callback::relay(&params).await
+        let result = if method == "Workspace::ui_state" {
+            Ok(json!({"sidebar_open": session.workspace_ui.sidebar_open}))
+        } else if method == "Workspace::set_sidebar_open" {
+            session.workspace_ui.sidebar_open = params
+                .get("open")
+                .and_then(Value::as_bool)
+                .unwrap_or_default();
+            Ok(Value::Null)
         } else if crate::terminal_rpc::handles(&method) {
             session.terminals.dispatch(&method, &params)
-        } else if crate::process_rpc::handles_streaming(&method) {
-            session
-                .processes
-                .dispatch(&method, &params, generation)
-                .await
         } else if method == "Fs::watch" {
             let subscription_id = session.next_subscription_id;
             session.next_subscription_id += 1;
             match watch_key(&session.fs, &params) {
                 Ok(key) => {
-                    if let Some(group) = session.watch_groups.get(&key) {
+                    let group_key = session.covering_watch_key(&key.path);
+                    if let Some(group_key) = group_key.as_ref() {
+                        let group = session
+                            .watch_groups
+                            .get(group_key)
+                            .expect("covering watch group disappeared");
                         group
-                            .subscription_ids
+                            .subscription_paths
                             .lock()
                             .unwrap_or_else(|error| error.into_inner())
-                            .insert(subscription_id);
+                            .insert(subscription_id, key.path.clone());
                     } else {
-                        let subscription_ids =
-                            Arc::new(StdMutex::new(HashSet::from([subscription_id])));
+                        let subscription_paths = Arc::new(StdMutex::new(HashMap::from([(
+                            subscription_id,
+                            key.path.clone(),
+                        )])));
                         let task = start_watch(
                             session.fs.clone(),
                             key.clone(),
-                            subscription_ids.clone(),
+                            subscription_paths.clone(),
                             session.notifications.clone(),
                         );
                         session.watch_groups.insert(
                             key.clone(),
                             WatchGroup {
-                                subscription_ids,
+                                subscription_paths,
                                 task,
                             },
                         );
@@ -421,7 +537,7 @@ pub async fn serve(socket: WebSocket, state: AppState) {
                         subscription_id,
                         WatchHandle {
                             owner_generation: generation,
-                            key,
+                            key: group_key.unwrap_or(key),
                         },
                     );
                     Ok(json!({"subscription_id": subscription_id}))
@@ -456,13 +572,7 @@ pub async fn serve(socket: WebSocket, state: AppState) {
                 Value::Null
             })
         } else {
-            dispatch(
-                session.fs.clone(),
-                session.sql.clone(),
-                method.clone(),
-                params,
-            )
-            .await
+            Err(anyhow::anyhow!("unknown method: {method}"))
         };
         let response = match result {
             Ok(result) => json!({"id": request_id, "result": result, "error": null}),
@@ -498,12 +608,13 @@ pub async fn serve(socket: WebSocket, state: AppState) {
         }
     }
     if let Some((_, session, generation)) = bound_session {
-        {
-            let mut session = session.lock().await;
+        let processes = {
+            let session = session.lock().await;
             let notification_target = session.notification_target.clone();
             notification_target.lock().await.detach(generation);
-            session.processes.detach_generation(generation);
-        }
+            session.processes.clone()
+        };
+        processes.lock().await.detach_generation(generation);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(30)).await;
             session
@@ -557,6 +668,16 @@ async fn dispatch(
     bail!("unknown method: {method}")
 }
 
+fn handles_stateless(method: &str) -> bool {
+    (FsRpc::handles(method)
+        && !matches!(method, "Fs::watch" | "Fs::attach_watches" | "Fs::unwatch"))
+        || crate::git_rpc::handles(method)
+        || (crate::process_rpc::handles(method) && !crate::process_rpc::handles_streaming(method))
+        || crate::extension_rpc::handles(method)
+        || method == "Highlight::document"
+        || method.starts_with("Sql::")
+}
+
 fn watch_key(fs_rpc: &FsRpc, params: &Value) -> Result<WatchKey> {
     let path = fs_rpc.path(params.get("path").and_then(Value::as_str).unwrap_or("."))?;
     let latency = params
@@ -573,13 +694,14 @@ fn watch_key(fs_rpc: &FsRpc, params: &Value) -> Result<WatchKey> {
 fn start_watch(
     fs_rpc: Arc<FsRpc>,
     key: WatchKey,
-    subscription_ids: Arc<StdMutex<HashSet<u64>>>,
+    subscription_paths: Arc<StdMutex<HashMap<u64, PathBuf>>>,
     outgoing: mpsc::UnboundedSender<Message>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let path = key.path;
         let mut known: Option<HashMap<PathBuf, (u64, u128)>> = None;
         loop {
+            let scan_started = std::time::Instant::now();
             let snapshot_path = path.clone();
             let current = match tokio::task::spawn_blocking(move || watch_snapshot(&snapshot_path))
                 .await
@@ -587,7 +709,7 @@ fn start_watch(
                 Ok(Ok(snapshot)) => snapshot,
                 Ok(Err(error)) => {
                     tracing::warn!(?error, path = %path.display(), "filesystem watch scan failed");
-                    tokio::time::sleep(key.latency).await;
+                    tokio::time::sleep(watch_delay(key.latency, scan_started.elapsed())).await;
                     continue;
                 }
                 Err(error) => {
@@ -597,7 +719,7 @@ fn start_watch(
             };
             let Some(previous) = known.as_ref() else {
                 known = Some(current);
-                tokio::time::sleep(key.latency).await;
+                tokio::time::sleep(watch_delay(key.latency, scan_started.elapsed())).await;
                 continue;
             };
             let mut events = Vec::new();
@@ -608,29 +730,37 @@ fn start_watch(
                     Some(_) => None,
                 };
                 if let Some(kind) = kind {
-                    events.push(json!({"path": fs_rpc.virtualize(path), "kind": kind}));
+                    events.push((path.clone(), kind));
                 }
             }
             for path in previous.keys() {
                 if !current.contains_key(path) {
-                    events.push(json!({"path": fs_rpc.virtualize(path), "kind": "removed"}));
+                    events.push((path.clone(), "removed"));
                 }
             }
             if !events.is_empty() {
-                let subscription_ids = subscription_ids
+                let subscriptions = subscription_paths
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .iter()
-                    .copied()
+                    .map(|(id, path)| (*id, path.clone()))
                     .collect::<Vec<_>>();
-                for subscription_id in subscription_ids {
+                for (subscription_id, subscription_path) in subscriptions {
+                    let subscription_events = events
+                        .iter()
+                        .filter(|(path, _)| path.starts_with(&subscription_path))
+                        .map(|(path, kind)| json!({"path": fs_rpc.virtualize(path), "kind": kind}))
+                        .collect::<Vec<_>>();
+                    if subscription_events.is_empty() {
+                        continue;
+                    }
                     if outgoing
                         .send(Message::Text(
                             json!({
                                 "method": "Fs::watch_event",
                                 "params": {
                                     "subscription_id": subscription_id,
-                                    "events": &events
+                                    "events": subscription_events
                                 }
                             })
                             .to_string(),
@@ -642,9 +772,58 @@ fn start_watch(
                 }
             }
             known = Some(current);
-            tokio::time::sleep(key.latency).await;
+            tokio::time::sleep(watch_delay(key.latency, scan_started.elapsed())).await;
         }
     })
+}
+
+fn watch_delay(latency: Duration, scan_duration: Duration) -> Duration {
+    latency.max(scan_duration.saturating_mul(2))
+}
+
+const WATCH_EXCLUDED_DIRECTORIES: &[&str] = &[
+    "node_modules",
+    ".git",
+    "vendor",
+    ".venv",
+    "venv",
+    ".next",
+    "target",
+    "dist",
+    ".cache",
+    "__pycache__",
+];
+
+fn watch_covers_path(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    if relative
+        .ancestors()
+        .any(|ancestor| ancestor.ends_with(Path::new(".config/zed/node/cache")))
+    {
+        return false;
+    }
+    !relative.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|name| WATCH_EXCLUDED_DIRECTORIES.contains(&name))
+    })
+}
+
+fn watch_entry_is_excluded(root: &Path, entry: &walkdir::DirEntry) -> bool {
+    if entry.depth() == 0 || !entry.file_type().is_dir() {
+        return false;
+    }
+    entry
+        .file_name()
+        .to_str()
+        .is_some_and(|name| WATCH_EXCLUDED_DIRECTORIES.contains(&name))
+        || entry
+            .path()
+            .strip_prefix(root)
+            .is_ok_and(|path| path.ends_with(Path::new(".config/zed/node/cache")))
 }
 
 fn watch_snapshot(root: &Path) -> Result<HashMap<PathBuf, (u64, u128)>> {
@@ -652,9 +831,29 @@ fn watch_snapshot(root: &Path) -> Result<HashMap<PathBuf, (u64, u128)>> {
     if !root.exists() {
         return Ok(snapshot);
     }
-    for entry in walkdir::WalkDir::new(root).follow_links(false) {
-        let entry = entry.with_context(|| format!("scanning {}", root.display()))?;
-        let metadata = fs::symlink_metadata(entry.path())?;
+    let walker = walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| !watch_entry_is_excluded(root, entry));
+    for entry in walker {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::debug!(?error, root = %root.display(), "skipping unreadable watch entry");
+                continue;
+            }
+        };
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::debug!(
+                    ?error,
+                    path = %entry.path().display(),
+                    "skipping vanished watch entry"
+                );
+                continue;
+            }
+        };
         let modified = metadata
             .modified()
             .ok()
@@ -735,9 +934,9 @@ mod tests {
         fs::write(root.path().join("existing.txt"), "existing")?;
         let fs_rpc = Arc::new(FsRpc::new(root.path().to_path_buf(), false)?);
         let key = watch_key(&fs_rpc, &json!({"path": "/workspace", "latency": 0.05}))?;
-        let subscription_ids = Arc::new(StdMutex::new(HashSet::from([7])));
+        let subscription_paths = Arc::new(StdMutex::new(HashMap::from([(7, key.path.clone())])));
         let (outgoing, mut notifications) = mpsc::unbounded_channel();
-        let task = start_watch(fs_rpc, key, subscription_ids, outgoing);
+        let task = start_watch(fs_rpc, key, subscription_paths, outgoing);
 
         assert!(
             tokio::time::timeout(Duration::from_millis(150), notifications.recv())
@@ -764,6 +963,95 @@ mod tests {
                             .as_str()
                             .is_some_and(|path| path.ends_with("/created.txt"))
                 }))
+        );
+        task.abort();
+        Ok(())
+    }
+
+    #[test]
+    fn filesystem_watch_snapshot_skips_generated_directories() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::create_dir_all(root.path().join("src"))?;
+        fs::create_dir_all(root.path().join("node_modules/package"))?;
+        fs::create_dir_all(root.path().join(".git/objects"))?;
+        fs::create_dir_all(root.path().join(".config/zed/node/cache/package"))?;
+        fs::write(root.path().join("src/main.rs"), "fn main() {}")?;
+        fs::write(
+            root.path().join("node_modules/package/index.js"),
+            "module.exports = {}",
+        )?;
+        fs::write(root.path().join(".git/objects/object"), "object")?;
+        fs::write(
+            root.path().join(".config/zed/node/cache/package/index.js"),
+            "cache",
+        )?;
+
+        let snapshot = watch_snapshot(root.path())?;
+
+        assert!(snapshot.contains_key(&root.path().join("src/main.rs")));
+        assert!(!snapshot.contains_key(&root.path().join("node_modules")));
+        assert!(!snapshot.contains_key(&root.path().join(".git")));
+        assert!(!snapshot.contains_key(&root.path().join(".config/zed/node/cache")));
+        Ok(())
+    }
+
+    #[test]
+    fn excluded_descendant_requires_its_own_watch() {
+        let root = Path::new("/workspace");
+        assert!(watch_covers_path(root, Path::new("/workspace/src")));
+        assert!(!watch_covers_path(
+            root,
+            Path::new("/workspace/node_modules/package")
+        ));
+        assert!(!watch_covers_path(
+            root,
+            Path::new("/workspace/.config/zed/node/cache/package")
+        ));
+    }
+
+    #[tokio::test]
+    async fn ancestor_watch_filters_events_for_descendant_subscriptions() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::create_dir_all(root.path().join("project"))?;
+        let fs_rpc = Arc::new(FsRpc::new(root.path().to_path_buf(), false)?);
+        let key = watch_key(&fs_rpc, &json!({"path": "/workspace", "latency": 0.05}))?;
+        let subscription_paths = Arc::new(StdMutex::new(HashMap::from([(
+            9,
+            key.path.join("project"),
+        )])));
+        let (outgoing, mut notifications) = mpsc::unbounded_channel();
+        let task = start_watch(fs_rpc, key, subscription_paths, outgoing);
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        fs::write(root.path().join("outside.txt"), "outside")?;
+        fs::write(root.path().join("project/inside.txt"), "inside")?;
+
+        let message = tokio::time::timeout(Duration::from_secs(1), notifications.recv())
+            .await?
+            .context("filesystem watch notification channel closed")?;
+        let Message::Text(message) = message else {
+            panic!("expected a text notification");
+        };
+        let message: Value = serde_json::from_str(&message)?;
+        let events = message["params"]["events"]
+            .as_array()
+            .context("watch events were not an array")?;
+
+        assert!(
+            events.iter().any(|event| {
+                event["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("/project/inside.txt"))
+            }),
+            "descendant subscription did not receive its event"
+        );
+        assert!(
+            events.iter().all(|event| {
+                !event["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("/outside.txt"))
+            }),
+            "descendant subscription received an event outside its path"
         );
         task.abort();
         Ok(())

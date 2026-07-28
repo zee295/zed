@@ -22,6 +22,19 @@ use crate::{
     role::{HasPeer, Role, handle_incoming_dispatch},
 };
 
+fn preserve_retry(
+    state: Result<Handled<Dispatch>, crate::Error>,
+    prior_retry: bool,
+) -> Result<Handled<Dispatch>, crate::Error> {
+    state.map(|state| match state {
+        Handled::Yes => Handled::Yes,
+        Handled::No { message, retry } => Handled::No {
+            message,
+            retry: prior_retry | retry,
+        },
+    })
+}
+
 /// Role-agnostic helper for pattern-matching on untyped JSON-RPC messages.
 ///
 /// Use this when you already have an unwrapped message and just need to parse it,
@@ -71,14 +84,6 @@ impl MatchDispatch {
                 retry: false,
             }),
         }
-    }
-
-    /// Create a pattern matcher from an existing `Handled` state.
-    ///
-    /// This is useful when composing with [`MatchDispatchFrom`] which applies
-    /// peer transforms before delegating to `MatchDispatch` for parsing.
-    pub fn from_handled(state: Result<Handled<Dispatch>, crate::Error>) -> Self {
-        Self { state }
     }
 
     /// Try to handle the message as a request of type `Req`.
@@ -204,7 +209,7 @@ impl MatchDispatch {
     ///
     /// This attempts to parse the message as either request type `R` or notification type `N`,
     /// providing a typed `Dispatch` to the handler if successful.
-    pub async fn if_message<R: JsonRpcRequest, N: JsonRpcNotification, H>(
+    pub async fn if_dispatch<R: JsonRpcRequest, N: JsonRpcNotification, H>(
         mut self,
         op: impl AsyncFnOnce(Dispatch<R, N>) -> Result<H, crate::Error>,
     ) -> Self
@@ -513,8 +518,8 @@ impl<Counterpart: Role> MatchDispatchFrom<Counterpart> {
         Counterpart: HasPeer<Peer>,
         H: crate::IntoHandled<(Req, Responder<Req::Response>)>,
     {
-        if let Ok(Handled::No { message, retry: _ }) = self.state {
-            self.state = handle_incoming_dispatch(
+        if let Ok(Handled::No { message, retry }) = self.state {
+            let state = handle_incoming_dispatch(
                 self.connection.counterpart(),
                 peer,
                 message,
@@ -525,6 +530,7 @@ impl<Counterpart: Role> MatchDispatchFrom<Counterpart> {
                 },
             )
             .await;
+            self.state = preserve_retry(state, retry);
         }
         self
     }
@@ -570,8 +576,8 @@ impl<Counterpart: Role> MatchDispatchFrom<Counterpart> {
         Counterpart: HasPeer<Peer>,
         H: crate::IntoHandled<N>,
     {
-        if let Ok(Handled::No { message, retry: _ }) = self.state {
-            self.state = handle_incoming_dispatch(
+        if let Ok(Handled::No { message, retry }) = self.state {
+            let state = handle_incoming_dispatch(
                 self.connection.counterpart(),
                 peer,
                 message,
@@ -585,20 +591,21 @@ impl<Counterpart: Role> MatchDispatchFrom<Counterpart> {
                 },
             )
             .await;
+            self.state = preserve_retry(state, retry);
         }
         self
     }
 
     /// Try to handle the message as a typed `Dispatch<Req, N>` from a specific peer.
     ///
-    /// This is similar to [`MatchDispatch::if_message`], but first applies peer-specific
+    /// This is similar to [`MatchDispatch::if_dispatch`], but first applies peer-specific
     /// message transformation (e.g., unwrapping `SuccessorMessage` envelopes).
     ///
     /// # Parameters
     ///
     /// * `peer` - The peer the message is expected to come from
     /// * `op` - The handler to call if the message matches
-    pub async fn if_message_from<Peer: Role, Req: JsonRpcRequest, N: JsonRpcNotification, H>(
+    pub async fn if_dispatch_from<Peer: Role, Req: JsonRpcRequest, N: JsonRpcNotification, H>(
         mut self,
         peer: Peer,
         op: impl AsyncFnOnce(Dispatch<Req, N>) -> Result<H, crate::Error>,
@@ -607,18 +614,19 @@ impl<Counterpart: Role> MatchDispatchFrom<Counterpart> {
         Counterpart: HasPeer<Peer>,
         H: crate::IntoHandled<Dispatch<Req, N>>,
     {
-        if let Ok(Handled::No { message, retry: _ }) = self.state {
-            self.state = handle_incoming_dispatch(
+        if let Ok(Handled::No { message, retry }) = self.state {
+            let state = handle_incoming_dispatch(
                 self.connection.counterpart(),
                 peer,
                 message,
                 self.connection.clone(),
                 async |dispatch, _connection| {
                     // Delegate to MatchDispatch for parsing
-                    MatchDispatch::new(dispatch).if_message(op).await.done()
+                    MatchDispatch::new(dispatch).if_dispatch(op).await.done()
                 },
             )
             .await;
+            self.state = preserve_retry(state, retry);
         }
         self
     }
@@ -644,11 +652,12 @@ impl<Counterpart: Role> MatchDispatchFrom<Counterpart> {
                 ResponseRouter<Req::Response>,
             )>,
     {
-        if let Ok(Handled::No { message, retry: _ }) = self.state {
-            self.state = MatchDispatch::new(message)
+        if let Ok(Handled::No { message, retry }) = self.state {
+            let state = MatchDispatch::new(message)
                 .if_response_to::<Req, H>(op)
                 .await
                 .done();
+            self.state = preserve_retry(state, retry);
         }
         self
     }
@@ -695,8 +704,8 @@ impl<Counterpart: Role> MatchDispatchFrom<Counterpart> {
                 ResponseRouter<Req::Response>,
             )>,
     {
-        if let Ok(Handled::No { message, retry: _ }) = self.state {
-            self.state = handle_incoming_dispatch(
+        if let Ok(Handled::No { message, retry }) = self.state {
+            let state = handle_incoming_dispatch(
                 self.connection.counterpart(),
                 peer,
                 message,
@@ -710,6 +719,7 @@ impl<Counterpart: Role> MatchDispatchFrom<Counterpart> {
                 },
             )
             .await;
+            self.state = preserve_retry(state, retry);
         }
         self
     }
@@ -819,11 +829,11 @@ impl<Counterpart: Role> MatchDispatchFrom<Counterpart> {
 /// # Example
 ///
 /// ```
-/// # use agent_client_protocol::{UntypedMessage, ConnectionTo, Agent};
+/// # use agent_client_protocol::UntypedMessage;
 /// # use agent_client_protocol::schema::v1::SessionNotification;
 /// # use agent_client_protocol::util::TypeNotification;
-/// # async fn example(message: UntypedMessage, cx: &ConnectionTo<Agent>) -> Result<(), agent_client_protocol::Error> {
-/// TypeNotification::new(message, cx)
+/// # async fn example(message: UntypedMessage) -> Result<(), agent_client_protocol::Error> {
+/// TypeNotification::new(message)
 ///     .handle_if(|notif: SessionNotification| async move {
 ///         // Handle session notifications
 ///         println!("Session update: {:?}", notif);
@@ -843,8 +853,7 @@ impl<Counterpart: Role> MatchDispatchFrom<Counterpart> {
 /// notification (not a request context).
 #[must_use]
 #[derive(Debug)]
-pub struct TypeNotification<R: Role> {
-    cx: ConnectionTo<R>,
+pub struct TypeNotification {
     state: Option<TypeNotificationState>,
 }
 
@@ -854,12 +863,11 @@ enum TypeNotificationState {
     Handled(Result<(), crate::Error>),
 }
 
-impl<R: Role> TypeNotification<R> {
+impl TypeNotification {
     /// Create a new pattern matcher for the given untyped notification message.
-    pub fn new(request: UntypedMessage, cx: &ConnectionTo<R>) -> Self {
+    pub fn new(request: UntypedMessage) -> Self {
         let UntypedMessage { method, params } = request;
         Self {
-            cx: cx.clone(),
             state: Some(TypeNotificationState::Unhandled(method, params)),
         }
     }
@@ -867,8 +875,9 @@ impl<R: Role> TypeNotification<R> {
     /// Try to handle the message as type `N`.
     ///
     /// If the message can be parsed as `N`, the handler `op` is called with the parsed
-    /// notification. If parsing fails or the message was already handled by a previous
-    /// `handle_if`, this call has no effect.
+    /// notification. If parsing fails, the malformed matching notification is consumed
+    /// and logged without invoking the handler or sending a response. If the message was
+    /// already handled by a previous `handle_if`, this call has no effect.
     ///
     /// Returns `self` to allow chaining multiple `handle_if` calls.
     pub async fn handle_if<N: JsonRpcNotification>(
@@ -880,8 +889,13 @@ impl<R: Role> TypeNotification<R> {
                 if N::matches_method(&method) {
                     match N::parse_message(&method, &params) {
                         Ok(request) => TypeNotificationState::Handled(op(request).await),
-                        Err(err) => {
-                            TypeNotificationState::Handled(self.cx.send_error_notification(err))
+                        Err(error) => {
+                            tracing::warn!(
+                                ?error,
+                                method,
+                                "Invalid notification params; ignoring notification without replying"
+                            );
+                            TypeNotificationState::Handled(Ok(()))
                         }
                     }
                 } else {
@@ -907,10 +921,83 @@ impl<R: Role> TypeNotification<R> {
             TypeNotificationState::Unhandled(method, params) => {
                 match UntypedMessage::new(&method, params) {
                     Ok(m) => op(m).await,
-                    Err(err) => self.cx.send_error_notification(err),
+                    Err(error) => {
+                        tracing::warn!(
+                            ?error,
+                            method,
+                            "Invalid untyped notification; ignoring notification without replying"
+                        );
+                        Ok(())
+                    }
                 }
             }
             TypeNotificationState::Handled(r) => r,
         }
+    }
+}
+
+#[cfg(test)]
+mod type_notification_tests {
+    use std::{cell::Cell, rc::Rc};
+
+    use serde::{Deserialize, Serialize};
+
+    use super::{TypeNotification, UntypedMessage};
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct TestNotification {
+        required: String,
+    }
+
+    impl crate::JsonRpcMessage for TestNotification {
+        fn matches_method(method: &str) -> bool {
+            method == "test/notification"
+        }
+
+        fn method(&self) -> &'static str {
+            "test/notification"
+        }
+
+        fn to_untyped_message(&self) -> Result<UntypedMessage, crate::Error> {
+            UntypedMessage::new(self.method(), self)
+        }
+
+        fn parse_message(method: &str, params: &impl Serialize) -> Result<Self, crate::Error> {
+            if !Self::matches_method(method) {
+                return Err(crate::Error::method_not_found());
+            }
+            crate::util::json_cast_params(params)
+        }
+    }
+
+    impl crate::JsonRpcNotification for TestNotification {}
+
+    #[test]
+    fn invalid_matching_notification_is_consumed_without_fallback() {
+        futures::executor::block_on(async {
+            let handler_called = Rc::new(Cell::new(false));
+            let fallback_called = Rc::new(Cell::new(false));
+            let handler_called_in_callback = Rc::clone(&handler_called);
+            let fallback_called_in_callback = Rc::clone(&fallback_called);
+            let message =
+                UntypedMessage::new("test/notification", serde_json::json!({ "wrong": "field" }))
+                    .expect("test notification should serialize");
+
+            TypeNotification::new(message)
+                .handle_if(move |_: TestNotification| async move {
+                    handler_called_in_callback.set(true);
+                    Ok(())
+                })
+                .await
+                .otherwise(move |_| async move {
+                    fallback_called_in_callback.set(true);
+                    Ok(())
+                })
+                .await
+                .expect("invalid notification should be ignored");
+
+            assert!(!handler_called.get());
+            assert!(!fallback_called.get());
+        });
     }
 }

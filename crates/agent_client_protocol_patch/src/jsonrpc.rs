@@ -6,15 +6,15 @@ use agent_client_protocol_schema::v1::{
 };
 
 // Types re-exported from crate root
+use serde::ser::SerializeSeq as _;
 use serde::{Deserialize, Serialize};
 use std::any::TypeId;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::panic::Location;
 use std::pin::pin;
-use std::sync::Arc;
 use std::sync::{
-    Mutex,
+    Arc, Mutex, Weak,
     atomic::{AtomicBool, Ordering},
 };
 use uuid::Uuid;
@@ -24,6 +24,7 @@ use futures::channel::{mpsc, oneshot};
 use futures::future::{self, BoxFuture, Either};
 use futures::{AsyncRead, AsyncWrite, StreamExt};
 
+pub(crate) mod close;
 mod dynamic_handler;
 pub(crate) mod handlers;
 mod incoming_actor;
@@ -33,6 +34,8 @@ pub(crate) mod run;
 mod task_actor;
 mod transport_actor;
 
+use crate::jsonrpc::close::{ChainedClose, CloseCallback};
+pub use crate::jsonrpc::close::{HandleConnectionClose, NullClose};
 use crate::jsonrpc::dynamic_handler::DynamicHandlerMessage;
 pub use crate::jsonrpc::handlers::NullHandler;
 use crate::jsonrpc::handlers::{ChainedHandler, NamedHandler};
@@ -42,12 +45,13 @@ use crate::jsonrpc::protocol_compat::{ProtocolCompat, ProtocolMode};
 use crate::jsonrpc::run::SpawnedRun;
 use crate::jsonrpc::run::{ChainRun, NullRun, RunWithConnectionTo};
 use crate::jsonrpc::task_actor::{Task, TaskTx};
+#[cfg(feature = "unstable_mcp_over_acp")]
 use crate::mcp_server::McpServer;
 use crate::role::HasPeer;
 use crate::role::Role;
 use crate::{Agent, Client, ConnectTo, RoleId};
 
-/// Raw JSON-RPC message transported by [`Channel`].
+/// One valid JSON-RPC message carried inside a [`TransportFrame`].
 ///
 /// This uses the JSON-RPC envelope types from `agent-client-protocol-schema`
 /// while keeping method params as raw, JSON-RPC-valid params at the transport boundary.
@@ -59,6 +63,193 @@ pub enum RawJsonRpcMessage {
     Notification(RpcNotification<RawJsonRpcParams>),
     /// A JSON-RPC response to a prior request.
     Response(RpcResponse<serde_json::Value>),
+}
+
+/// A JSON-RPC frame exchanged between protocol components and transports.
+///
+/// A frame preserves the boundary between a single JSON-RPC value and a batch.
+/// Malformed wire input is represented explicitly; transport failures are
+/// reported by the future that drives the transport rather than sent through a
+/// [`Channel`].
+#[derive(Clone, Debug)]
+pub enum TransportFrame {
+    /// One valid JSON-RPC message.
+    Single(RawJsonRpcMessage),
+    /// One malformed or invalid wire value retained for relays.
+    Malformed {
+        /// The original wire representation.
+        raw: String,
+        /// The JSON-RPC error associated with the malformed value.
+        error: crate::Error,
+    },
+    /// Entries retained from one non-empty JSON-RPC batch, kept in source order.
+    Batch(TransportBatch),
+}
+
+/// A structurally non-empty JSON-RPC batch retained across framed relays.
+#[derive(Clone, Debug)]
+pub struct TransportBatch {
+    first: TransportBatchEntry,
+    rest: Vec<TransportBatchEntry>,
+}
+
+/// One entry in a [`TransportBatch`].
+#[derive(Clone, Debug)]
+pub enum TransportBatchEntry {
+    /// A valid JSON-RPC message.
+    Message(RawJsonRpcMessage),
+    /// A malformed or invalid JSON-RPC value retained for relays.
+    Malformed {
+        /// The original JSON value.
+        raw: serde_json::Value,
+        /// The JSON-RPC error associated with the malformed value.
+        error: crate::Error,
+    },
+}
+
+pub(crate) fn is_response_only_shape(value: &serde_json::Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        !object.contains_key("method")
+            && (object.contains_key("result") || object.contains_key("error"))
+    })
+}
+
+pub(crate) fn raw_is_response_only_shape(raw: &str) -> bool {
+    serde_json::from_str(raw).is_ok_and(|value| is_response_only_shape(&value))
+}
+
+impl TransportBatchEntry {
+    /// Create a valid batch entry.
+    #[must_use]
+    pub fn message(message: RawJsonRpcMessage) -> Self {
+        Self::Message(message)
+    }
+
+    /// Create a malformed batch entry.
+    #[must_use]
+    pub fn malformed(raw: serde_json::Value, error: crate::Error) -> Self {
+        Self::Malformed { raw, error }
+    }
+
+    #[cfg(test)]
+    fn as_result(&self) -> Result<&RawJsonRpcMessage, &crate::Error> {
+        match self {
+            Self::Message(message) => Ok(message),
+            Self::Malformed { error, .. } => Err(error),
+        }
+    }
+
+    fn message_ref(&self) -> Option<&RawJsonRpcMessage> {
+        match self {
+            Self::Message(message) => Some(message),
+            Self::Malformed { .. } => None,
+        }
+    }
+}
+
+impl Serialize for TransportBatchEntry {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Message(message) => message.serialize(serializer),
+            Self::Malformed { raw, .. } => raw.serialize(serializer),
+        }
+    }
+}
+
+impl TransportBatch {
+    /// Create a non-empty batch from entries.
+    ///
+    /// Returns `None` when the iterator is empty.
+    pub fn from_entries(entries: impl IntoIterator<Item = TransportBatchEntry>) -> Option<Self> {
+        let mut entries = entries.into_iter();
+        Some(Self {
+            first: entries.next()?,
+            rest: entries.collect(),
+        })
+    }
+
+    /// Create a non-empty batch from valid messages.
+    ///
+    /// Returns `None` when the iterator is empty.
+    pub fn from_messages(messages: impl IntoIterator<Item = RawJsonRpcMessage>) -> Option<Self> {
+        Self::from_entries(messages.into_iter().map(TransportBatchEntry::message))
+    }
+
+    /// Iterate over entries in source order.
+    pub fn entries(&self) -> impl Iterator<Item = &TransportBatchEntry> {
+        std::iter::once(&self.first).chain(&self.rest)
+    }
+
+    /// Iterate mutably over entries in source order.
+    pub fn entries_mut(&mut self) -> impl Iterator<Item = &mut TransportBatchEntry> {
+        std::iter::once(&mut self.first).chain(&mut self.rest)
+    }
+
+    /// Consume this batch and iterate over its entries in source order.
+    pub fn into_entries(self) -> impl Iterator<Item = TransportBatchEntry> {
+        std::iter::once(self.first).chain(self.rest)
+    }
+
+    /// Return the number of entries in this non-empty batch.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        1 + self.rest.len()
+    }
+
+    /// Return whether this batch is empty.
+    ///
+    /// A `TransportBatch` is structurally non-empty, so this always returns
+    /// `false`.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        false
+    }
+
+    #[cfg(test)]
+    pub(crate) fn iter_results(
+        &self,
+    ) -> impl Iterator<Item = Result<&RawJsonRpcMessage, &crate::Error>> {
+        self.entries().map(TransportBatchEntry::as_result)
+    }
+
+    fn messages(&self) -> impl Iterator<Item = &RawJsonRpcMessage> {
+        self.entries().filter_map(TransportBatchEntry::message_ref)
+    }
+}
+
+impl Serialize for TransportBatch {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(1 + self.rest.len()))?;
+        sequence.serialize_element(&self.first)?;
+        for entry in &self.rest {
+            sequence.serialize_element(entry)?;
+        }
+        sequence.end()
+    }
+}
+
+impl TransportFrame {
+    fn inspect_messages(
+        &self,
+        observer: &mut impl FnMut(&RawJsonRpcMessage) -> Result<(), crate::Error>,
+    ) -> Result<(), crate::Error> {
+        match self {
+            Self::Single(message) => observer(message),
+            Self::Malformed { .. } => Ok(()),
+            Self::Batch(batch) => {
+                for message in batch.messages() {
+                    observer(message)?;
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Raw JSON-RPC request or notification parameters.
@@ -189,8 +380,17 @@ impl<'de> Deserialize<'de> for RawJsonRpcMessage {
         D: serde::Deserializer<'de>,
     {
         let value = serde_json::Value::deserialize(deserializer)?;
-        if value.get("method").is_some() {
-            if value.get("id").is_some() {
+        let Some(object) = value.as_object() else {
+            return Err(serde::de::Error::custom("invalid JSON-RPC message"));
+        };
+
+        let has_method = object.contains_key("method");
+        let has_id = object.contains_key("id");
+        let has_result = object.contains_key("result");
+        let has_error = object.contains_key("error");
+
+        if has_method && !has_result && !has_error {
+            if has_id {
                 let request = serde_json::from_value::<
                     VersionedJsonRpcMessage<RpcRequest<RawJsonRpcParams>>,
                 >(value)
@@ -205,7 +405,7 @@ impl<'de> Deserialize<'de> for RawJsonRpcMessage {
                 .into_inner();
                 Ok(Self::Notification(notification))
             }
-        } else if value.get("result").is_some() || value.get("error").is_some() {
+        } else if !has_method && has_id && has_result != has_error {
             let response = serde_json::from_value::<
                 VersionedJsonRpcMessage<RpcResponse<serde_json::Value>>,
             >(value)
@@ -318,17 +518,20 @@ fn params_from_transport(params: Option<RawJsonRpcParams>) -> serde_json::Value 
 ///
 /// # Implementing Custom Handlers
 ///
-/// For advanced use cases, you can implement `HandleMessageAs` directly:
+/// For advanced use cases, you can implement [`HandleDispatchFrom`] directly:
 ///
-/// ```ignore
+/// ```no_run
+/// use agent_client_protocol::{
+///     Client, ConnectionTo, Dispatch, Error, HandleDispatchFrom, Handled,
+/// };
+///
 /// struct MyHandler;
 ///
-/// impl HandleMessageAs<Agent> for MyHandler {
-///
-///     async fn handle_dispatch(
+/// impl HandleDispatchFrom<Client> for MyHandler {
+///     async fn handle_dispatch_from(
 ///         &mut self,
 ///         message: Dispatch,
-///         cx: ConnectionTo<Self::Role>,
+///         _connection: ConnectionTo<Client>,
 ///     ) -> Result<Handled<Dispatch>, Error> {
 ///         if message.method() == "my/custom/method" {
 ///             // Handle it
@@ -376,11 +579,12 @@ fn params_from_transport(params: Option<RawJsonRpcParams>) -> serde_json::Value 
 /// Handlers are registered with a [`Builder`] and are called in order until
 /// one claims the message.
 ///
-/// The type parameter `R` is the role this handler plays - who I am.
-/// For an agent handler, `R = Agent` (I handle messages as an agent).
-/// For a client handler, `R = Client` (I handle messages as a client).
+/// The type parameter is the counterpart role that messages arrive from and
+/// that the supplied [`ConnectionTo`] addresses. An agent handler therefore
+/// implements `HandleDispatchFrom<Client>`, while a client handler implements
+/// `HandleDispatchFrom<Agent>`.
 pub trait HandleDispatchFrom<Counterpart: Role>: Send {
-    /// Attempt to claim an incoming message (request or notification).
+    /// Attempt to claim an incoming dispatch (request, notification, or response).
     ///
     /// # Important: do not block
     ///
@@ -397,7 +601,9 @@ pub trait HandleDispatchFrom<Counterpart: Role>: Send {
     ///
     /// * `Ok(Handled::Yes)` if the message was claimed. It will not be propagated further.
     /// * `Ok(Handled::No(message))` if not; the (possibly changed) message will be passed to the remaining handlers.
-    /// * `Err` if an internal error occurs (this will bring down the server).
+    /// * `Err` if processing fails. Requests receive an Error Response, response
+    ///   errors are routed to the local request awaiter, and notification errors
+    ///   are logged without a wire reply.
     fn handle_dispatch_from(
         &mut self,
         message: Dispatch,
@@ -511,7 +717,8 @@ where
 ///
 /// ## Mixed Message Types
 ///
-/// For enums containing both requests AND notifications, use [`on_receive_dispatch`](Self::on_receive_dispatch):
+/// To handle requests, notifications, and responses in one callback, use
+/// [`on_receive_dispatch`](Self::on_receive_dispatch):
 ///
 /// ```no_run
 /// # use agent_client_protocol_test::*;
@@ -519,7 +726,7 @@ where
 /// # use agent_client_protocol::schema::v1::{InitializeRequest, InitializeResponse, SessionNotification};
 /// # async fn example() -> Result<(), agent_client_protocol::Error> {
 /// # let connection = mock_connection();
-/// // on_receive_dispatch receives Dispatch which can be either a request or notification
+/// // on_receive_dispatch receives requests, notifications, and responses
 /// connection.on_receive_dispatch(async |msg: Dispatch<InitializeRequest, SessionNotification>, _cx| {
 ///     match msg {
 ///         Dispatch::Request(req, responder) => {
@@ -530,7 +737,7 @@ where
 ///         }
 ///         Dispatch::Response(result, router) => {
 ///             // Forward response to its destination
-///             router.respond_with_result(result)
+///             router.route_with_result(result)
 ///         }
 ///     }
 /// }, agent_client_protocol::on_receive_dispatch!())
@@ -545,7 +752,7 @@ where
 ///
 /// * [`on_receive_request`](Self::on_receive_request) - Handle JSON-RPC requests (messages expecting responses)
 /// * [`on_receive_notification`](Self::on_receive_notification) - Handle JSON-RPC notifications (fire-and-forget)
-/// * [`on_receive_dispatch`](Self::on_receive_dispatch) - Handle enums containing both requests and notifications
+/// * [`on_receive_dispatch`](Self::on_receive_dispatch) - Handle requests, notifications, and responses in one callback
 /// * [`with_handler`](Self::with_handler) - Low-level primitive for maximum flexibility
 ///
 /// ## Handler Ordering
@@ -555,7 +762,6 @@ where
 ///
 /// ```no_run
 /// # use agent_client_protocol_test::*;
-/// # use agent_client_protocol::{Dispatch, UntypedMessage};
 /// # use agent_client_protocol::schema::v1::{InitializeRequest, InitializeResponse, PromptRequest, PromptResponse};
 /// # async fn example() -> Result<(), agent_client_protocol::Error> {
 /// # let connection = mock_connection();
@@ -568,10 +774,8 @@ where
 ///         // This runs first for PromptRequest
 ///         responder.respond(PromptResponse::make())
 ///     }, agent_client_protocol::on_receive_request!())
-///     .on_receive_dispatch(async |msg: Dispatch, cx| {
-///         // This runs for any message not handled above
-///         msg.respond_with_error(agent_client_protocol::util::internal_error("unknown method"), cx)
-///     }, agent_client_protocol::on_receive_dispatch!())
+///     // Unknown requests receive Method not found automatically; unhandled
+///     // notifications are ignored.
 /// # .connect_to(agent_client_protocol_test::MockTransport).await?;
 /// # Ok(())
 /// # }
@@ -724,10 +928,11 @@ where
 /// ```
 #[must_use]
 #[derive(Debug)]
-pub struct Builder<Host: Role, Handler = NullHandler, Runner = NullRun>
+pub struct Builder<Host: Role, Handler = NullHandler, Runner = NullRun, Close = NullClose>
 where
     Handler: HandleDispatchFrom<Host::Counterpart>,
     Runner: RunWithConnectionTo<Host::Counterpart>,
+    Close: HandleConnectionClose<Host::Counterpart>,
 {
     /// My role.
     host: Host,
@@ -738,11 +943,14 @@ where
     /// Handler for incoming messages.
     handler: Handler,
 
-    /// Responder for background tasks.
-    responder: Runner,
+    /// Runner for background connection tasks.
+    runner: Runner,
 
     /// Protocol version mode for the public API and wire compatibility layer.
     protocol_mode: ProtocolMode,
+
+    /// Handler run when the incoming transport reaches clean EOF.
+    on_close: Close,
 }
 
 fn default_protocol_mode<Host: Role>() -> ProtocolMode {
@@ -757,7 +965,7 @@ fn default_protocol_mode<Host: Role>() -> ProtocolMode {
     }
 }
 
-impl<Host: Role> Builder<Host, NullHandler, NullRun> {
+impl<Host: Role> Builder<Host, NullHandler, NullRun, NullClose> {
     /// Create a new connection builder for the given role.
     /// This type follows a builder pattern; use other methods to configure and then invoke
     /// [`Self::connect_to`] (to use as a server) or [`Self::connect_with`] to use as a client.
@@ -766,13 +974,14 @@ impl<Host: Role> Builder<Host, NullHandler, NullRun> {
             host: role,
             name: None,
             handler: NullHandler,
-            responder: NullRun,
+            runner: NullRun,
             protocol_mode: default_protocol_mode::<Host>(),
+            on_close: NullClose,
         }
     }
 }
 
-impl<Host: Role, Handler> Builder<Host, Handler, NullRun>
+impl<Host: Role, Handler> Builder<Host, Handler, NullRun, NullClose>
 where
     Handler: HandleDispatchFrom<Host::Counterpart>,
 {
@@ -782,8 +991,9 @@ where
             host: role,
             name: None,
             handler,
-            responder: NullRun,
+            runner: NullRun,
             protocol_mode: default_protocol_mode::<Host>(),
+            on_close: NullClose,
         }
     }
 }
@@ -792,7 +1002,8 @@ impl<
     Host: Role,
     Handler: HandleDispatchFrom<Host::Counterpart>,
     Runner: RunWithConnectionTo<Host::Counterpart>,
-> Builder<Host, Handler, Runner>
+    Close: HandleConnectionClose<Host::Counterpart>,
+> Builder<Host, Handler, Runner, Close>
 {
     /// Set the "name" of this connection -- used only for debugging logs.
     pub fn name(mut self, name: impl ToString) -> Self {
@@ -832,17 +1043,20 @@ impl<
             Host,
             impl HandleDispatchFrom<Host::Counterpart>,
             impl RunWithConnectionTo<Host::Counterpart>,
+            impl HandleConnectionClose<Host::Counterpart>,
         >,
     ) -> Builder<
         Host,
         impl HandleDispatchFrom<Host::Counterpart>,
         impl RunWithConnectionTo<Host::Counterpart>,
+        impl HandleConnectionClose<Host::Counterpart>,
     > {
         let Builder {
             name: other_name,
             handler: other_handler,
-            responder: other_responder,
+            runner: other_runner,
             protocol_mode: other_protocol_mode,
+            on_close: other_on_close,
             host: _,
         } = other;
         Builder {
@@ -852,8 +1066,9 @@ impl<
                 self.handler,
                 NamedHandler::new(other_name, other_handler),
             ),
-            responder: ChainRun::new(self.responder, other_responder),
+            runner: ChainRun::new(self.runner, other_runner),
             protocol_mode: self.protocol_mode.merge(other_protocol_mode),
+            on_close: ChainedClose::new(self.on_close, other_on_close),
         }
     }
 
@@ -864,21 +1079,22 @@ impl<
     pub fn with_handler(
         self,
         handler: impl HandleDispatchFrom<Host::Counterpart>,
-    ) -> Builder<Host, impl HandleDispatchFrom<Host::Counterpart>, Runner> {
+    ) -> Builder<Host, impl HandleDispatchFrom<Host::Counterpart>, Runner, Close> {
         Builder {
             host: self.host,
             name: self.name,
             handler: ChainedHandler::new(self.handler, handler),
-            responder: self.responder,
+            runner: self.runner,
             protocol_mode: self.protocol_mode,
+            on_close: self.on_close,
         }
     }
 
     /// Add a new [`RunWithConnectionTo`] to the chain.
-    pub fn with_responder<Run1>(
+    pub fn with_runner<Run1>(
         self,
-        responder: Run1,
-    ) -> Builder<Host, Handler, impl RunWithConnectionTo<Host::Counterpart>>
+        runner: Run1,
+    ) -> Builder<Host, Handler, impl RunWithConnectionTo<Host::Counterpart>, Close>
     where
         Run1: RunWithConnectionTo<Host::Counterpart>,
     {
@@ -886,8 +1102,9 @@ impl<
             host: self.host,
             name: self.name,
             handler: self.handler,
-            responder: ChainRun::new(self.responder, responder),
+            runner: ChainRun::new(self.runner, runner),
             protocol_mode: self.protocol_mode,
+            on_close: self.on_close,
         }
     }
 
@@ -896,20 +1113,69 @@ impl<
     pub fn with_spawned<F, Fut>(
         self,
         task: F,
-    ) -> Builder<Host, Handler, impl RunWithConnectionTo<Host::Counterpart>>
+    ) -> Builder<Host, Handler, impl RunWithConnectionTo<Host::Counterpart>, Close>
     where
         F: FnOnce(ConnectionTo<Host::Counterpart>) -> Fut + Send,
         Fut: Future<Output = Result<(), crate::Error>> + Send,
     {
         let location = Location::caller();
-        self.with_responder(SpawnedRun::new(location, task))
+        self.with_runner(SpawnedRun::new(location, task))
     }
 
-    /// Register a handler for messages that can be either requests OR notifications.
+    /// Run a callback when the incoming transport reaches clean EOF.
     ///
-    /// Use this when you want to handle an enum type that contains both request and
-    /// notification variants. Your handler receives a [`Dispatch<Req, Notif>`] which
-    /// is an enum with two variants:
+    /// Each callback runs at most once and receives the connection context. A
+    /// successful callback observes the close without otherwise changing the
+    /// lifetime of [`connect_with`](Self::connect_with). Returning an error
+    /// shuts down the connection and cancels a still-running `connect_with`
+    /// future.
+    ///
+    /// Multiple callbacks run sequentially in registration order. All of them
+    /// run even if an earlier callback fails, after which the first error is
+    /// returned. Pending requests are failed before callbacks begin, while
+    /// [`ConnectionTo::incoming_closed`] completes only after they finish. A
+    /// callback must therefore not await that close future itself.
+    ///
+    /// This separation lets applications choose their cancellation policy. A
+    /// callback can notify application-owned tasks and return `Ok(())` for
+    /// graceful cleanup, or return an error to stop them immediately.
+    ///
+    /// ```
+    /// # use agent_client_protocol::{Client, ConnectTo, Error};
+    /// # async fn example(transport: impl ConnectTo<Client>) -> Result<(), Error> {
+    /// Client.builder()
+    ///     .on_close(async |_cx| {
+    ///         Err(Error::internal_error().data("agent transport closed"))
+    ///     })
+    ///     .connect_with(transport, async |_cx| {
+    ///         std::future::pending().await
+    ///     })
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn on_close<F, Fut>(
+        self,
+        callback: F,
+    ) -> Builder<Host, Handler, Runner, impl HandleConnectionClose<Host::Counterpart>>
+    where
+        F: FnOnce(ConnectionTo<Host::Counterpart>) -> Fut + Send,
+        Fut: Future<Output = Result<(), crate::Error>> + Send,
+    {
+        Builder {
+            host: self.host,
+            name: self.name,
+            handler: self.handler,
+            runner: self.runner,
+            protocol_mode: self.protocol_mode,
+            on_close: ChainedClose::new(self.on_close, CloseCallback::new(callback)),
+        }
+    }
+
+    /// Register a handler for requests, notifications, and responses.
+    ///
+    /// Use this when you want to handle all JSON-RPC message kinds in one callback.
+    /// Your handler receives a [`Dispatch<Req, Notif>`] with three variants:
     ///
     /// - `Dispatch::Request(request, responder)` - A request with its response context
     /// - `Dispatch::Notification(notification)` - A notification
@@ -934,7 +1200,7 @@ impl<
     ///         }
     ///         Dispatch::Response(result, router) => {
     ///             // Forward response to its destination
-    ///             router.respond_with_result(result)
+    ///             router.route_with_result(result)
     ///         }
     ///     }
     /// }, agent_client_protocol::on_receive_dispatch!())
@@ -956,7 +1222,7 @@ impl<
         self,
         op: F,
         to_future_hack: ToFut,
-    ) -> Builder<Host, impl HandleDispatchFrom<Host::Counterpart>, Runner>
+    ) -> Builder<Host, impl HandleDispatchFrom<Host::Counterpart>, Runner, Close>
     where
         Host::Counterpart: HasPeer<Host::Counterpart>,
         Req: JsonRpcRequest,
@@ -986,9 +1252,10 @@ impl<
 
     /// Register a handler for JSON-RPC requests of type `Req`.
     ///
-    /// Your handler receives two arguments:
+    /// Your handler receives three arguments:
     /// 1. The request (type `Req`)
-    /// 2. A [`Responder<R, Req::Response>`] for sending the response
+    /// 2. A [`Responder<Req::Response>`] for sending the response
+    /// 3. A [`ConnectionTo`] for the peer that sent the request
     ///
     /// The request context allows you to:
     /// - Send the response with [`Responder::respond`]
@@ -997,23 +1264,21 @@ impl<
     ///
     /// # Example
     ///
-    /// ```ignore
-    /// # use agent_client_protocol::UntypedRole;
-    /// # use agent_client_protocol::{Builder};
+    /// ```no_run
+    /// # use agent_client_protocol::{Agent, ConnectTo};
     /// # use agent_client_protocol::schema::v1::{PromptRequest, PromptResponse, SessionNotification};
-    /// # fn example<R: agent_client_protocol::Role>(connection: Builder<R, impl agent_client_protocol::HandleMessageAs<R>>) {
-    /// connection.on_receive_request(async |request: PromptRequest, responder, cx| {
+    /// # async fn example(transport: impl ConnectTo<Agent>) -> Result<(), agent_client_protocol::Error> {
+    /// Agent.builder().on_receive_request(async |request: PromptRequest, responder, cx| {
     ///     // Send a notification while processing
     ///     let notif: SessionNotification = todo!();
     ///     cx.send_notification(notif)?;
     ///
-    ///     // Do some work...
-    ///     let result = todo!("process the prompt");
-    ///
     ///     // Send the response
     ///     let response: PromptResponse = todo!();
     ///     responder.respond(response)
-    /// }, agent_client_protocol::on_receive_request!());
+    /// }, agent_client_protocol::on_receive_request!())
+    /// .connect_to(transport)
+    /// .await
     /// # }
     /// ```
     ///
@@ -1031,7 +1296,7 @@ impl<
         self,
         op: F,
         to_future_hack: ToFut,
-    ) -> Builder<Host, impl HandleDispatchFrom<Host::Counterpart>, Runner>
+    ) -> Builder<Host, impl HandleDispatchFrom<Host::Counterpart>, Runner, Close>
     where
         Host::Counterpart: HasPeer<Host::Counterpart>,
         F: AsyncFnMut(
@@ -1105,7 +1370,7 @@ impl<
         self,
         op: F,
         to_future_hack: ToFut,
-    ) -> Builder<Host, impl HandleDispatchFrom<Host::Counterpart>, Runner>
+    ) -> Builder<Host, impl HandleDispatchFrom<Host::Counterpart>, Runner, Close>
     where
         Host::Counterpart: HasPeer<Host::Counterpart>,
         Notif: JsonRpcNotification,
@@ -1155,7 +1420,7 @@ impl<
         peer: Peer,
         op: F,
         to_future_hack: ToFut,
-    ) -> Builder<Host, impl HandleDispatchFrom<Host::Counterpart>, Runner>
+    ) -> Builder<Host, impl HandleDispatchFrom<Host::Counterpart>, Runner, Close>
     where
         Host::Counterpart: HasPeer<Peer>,
         F: AsyncFnMut(
@@ -1209,7 +1474,7 @@ impl<
         peer: Peer,
         op: F,
         to_future_hack: ToFut,
-    ) -> Builder<Host, impl HandleDispatchFrom<Host::Counterpart>, Runner>
+    ) -> Builder<Host, impl HandleDispatchFrom<Host::Counterpart>, Runner, Close>
     where
         Host::Counterpart: HasPeer<Peer>,
         F: AsyncFnMut(
@@ -1252,7 +1517,7 @@ impl<
         peer: Peer,
         op: F,
         to_future_hack: ToFut,
-    ) -> Builder<Host, impl HandleDispatchFrom<Host::Counterpart>, Runner>
+    ) -> Builder<Host, impl HandleDispatchFrom<Host::Counterpart>, Runner, Close>
     where
         Host::Counterpart: HasPeer<Peer>,
         F: AsyncFnMut(Notif, ConnectionTo<Host::Counterpart>) -> Result<T, crate::Error> + Send,
@@ -1269,9 +1534,14 @@ impl<
         self.with_handler(handler)
     }
 
-    /// Add an MCP server that will be added to all new sessions that are proxied through this connection.
+    /// Add an MCP server to session setup requests proxied through this connection.
+    ///
+    /// The same native MCP server declaration is added to new, load, and resume
+    /// requests, plus fork requests when `unstable_session_fork` is enabled.
     ///
     /// Only applicable to proxies.
+    #[cfg(feature = "unstable_mcp_over_acp")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "unstable_mcp_over_acp")))]
     pub fn with_mcp_server(
         self,
         mcp_server: McpServer<Host::Counterpart, impl RunWithConnectionTo<Host::Counterpart>>,
@@ -1279,12 +1549,13 @@ impl<
         Host,
         impl HandleDispatchFrom<Host::Counterpart>,
         impl RunWithConnectionTo<Host::Counterpart>,
+        Close,
     >
     where
         Host::Counterpart: HasPeer<Agent> + HasPeer<Client>,
     {
-        let (handler, responder) = mcp_server.into_handler_and_responder();
-        self.with_handler(handler).with_responder(responder)
+        let (handler, runner) = mcp_server.into_handler_and_runner();
+        self.with_handler(handler).with_runner(runner)
     }
 
     /// Run in server mode with the provided transport.
@@ -1293,10 +1564,17 @@ impl<
     /// and dispatching them to your registered handlers. The connection will run until:
     /// - The transport closes (e.g., EOF on byte streams)
     /// - An error occurs
-    /// - One of your handlers returns an error
     ///
-    /// The transport is responsible for serializing and deserializing [`RawJsonRpcMessage`]
-    /// values to/from the underlying I/O mechanism (byte streams, channels, etc.).
+    /// Handler errors are normally contained: requests receive an Error Response,
+    /// response-handler errors are routed to the pending local request, and
+    /// notification errors are logged without a wire reply.
+    ///
+    /// On clean EOF, messages already accepted by the outgoing queue—including
+    /// handler responses and close-callback notifications—are drained through
+    /// the transport sink before this returns `Ok(())`.
+    ///
+    /// The transport boundary carries [`TransportFrame`] values. Physical stream adapters
+    /// serialize and deserialize frames, while channel-based components relay them directly.
     ///
     /// Use this mode when you only need to respond to incoming messages and don't need
     /// to initiate your own requests. If you need to send requests to the other side,
@@ -1325,8 +1603,11 @@ impl<
         self,
         transport: impl ConnectTo<Host> + 'static,
     ) -> Result<(), crate::Error> {
-        self.connect_with(transport, async move |_cx| future::pending().await)
-            .await
+        self.connect_with(transport, async move |cx| {
+            cx.incoming_closed().await;
+            cx.drain_outgoing().await
+        })
+        .await
     }
 
     /// Run the connection until the provided closure completes.
@@ -1335,8 +1616,12 @@ impl<
     /// 1. Running your registered handlers in the background to process incoming messages
     /// 2. Executing your `main_fn` closure with a [`ConnectionTo<R>`] for sending requests/notifications
     ///
-    /// The connection stays active until your `main_fn` returns, then shuts down gracefully.
-    /// If the connection closes unexpectedly before `main_fn` completes, this returns an error.
+    /// The connection stays active until your `main_fn` returns, then shuts down.
+    /// Clean incoming EOF fails every pending request and makes future
+    /// requests fail immediately. It does not cancel unrelated work in
+    /// `main_fn`: that future may observe [`ConnectionTo::incoming_closed`], or
+    /// the builder can use [`on_close`](Self::on_close) to notify it or return
+    /// an error and stop it.
     ///
     /// Use this mode when you need to initiate communication (send requests/notifications)
     /// in addition to responding to incoming messages. For server-only mode where you just
@@ -1384,7 +1669,10 @@ impl<
     ///
     /// # Errors
     ///
-    /// Returns an error if the connection closes before `main_fn` completes.
+    /// Returns an error if a handler, background task, transport, or close
+    /// callback fails, or if `main_fn` returns an error. Clean incoming EOF is
+    /// observable through [`ConnectionTo::incoming_closed`] and is not itself
+    /// an error in this mode.
     pub async fn connect_with<R>(
         self,
         transport: impl ConnectTo<Host> + 'static,
@@ -1406,26 +1694,46 @@ impl<
         let Self {
             name,
             handler,
-            responder,
+            runner,
             host: me,
             protocol_mode,
+            on_close,
         } = self;
 
         let (outgoing_tx, outgoing_rx) = mpsc::unbounded();
         let (new_task_tx, new_task_rx) = mpsc::unbounded();
         let (dynamic_handler_tx, dynamic_handler_rx) = mpsc::unbounded();
+        let pending_replies = PendingReplies::default();
+
+        // Convert transport into server - this returns a channel for us to use
+        // and a future that runs the transport.
+        let transport_component = crate::DynConnectTo::new(transport);
+        let (transport_channel, transport_future) = transport_component.into_channel_and_future();
+        let (transport_completion_tx, transport_completion_rx) = oneshot::channel();
+        let transport_completion = transport_completion_rx
+            .map(|result| {
+                result.unwrap_or_else(|error| {
+                    Err(crate::util::internal_error(format!(
+                        "transport task dropped before reporting completion: {error}"
+                    )))
+                })
+            })
+            .boxed()
+            .shared();
+
         let connection = ConnectionTo::new(
             me.counterpart(),
             outgoing_tx,
             new_task_tx,
             dynamic_handler_tx,
+            transport_completion,
+            pending_replies.registrar(),
         );
-
-        // Convert transport into server - this returns a channel for us to use
-        // and a future that runs the transport
-        let transport_component = crate::DynConnectTo::new(transport);
-        let (transport_channel, transport_future) = transport_component.into_channel_and_future();
-        let spawn_result = connection.spawn(transport_future);
+        let spawn_result = connection.spawn(async move {
+            let result = transport_future.await;
+            drop(transport_completion_tx.send(result.clone()));
+            result
+        });
 
         // Destructure the channel endpoints
         let Channel {
@@ -1433,7 +1741,6 @@ impl<
             tx: transport_outgoing_tx,
         } = transport_channel;
 
-        let (reply_tx, reply_rx) = mpsc::unbounded();
         let protocol_compat = ProtocolCompat::new(protocol_mode);
 
         let future = crate::util::instrument_with_connection_name(name, {
@@ -1442,32 +1749,48 @@ impl<
                 let () = spawn_result?;
 
                 let background = async {
-                    futures::try_join!(
-                        // Protocol layer: OutgoingMessage -> RawJsonRpcMessage
-                        outgoing_actor::outgoing_protocol_actor(
-                            outgoing_rx,
-                            reply_tx.clone(),
-                            transport_outgoing_tx,
-                            protocol_compat.clone(),
-                        ),
-                        // Protocol layer: RawJsonRpcMessage -> handler/reply routing
-                        incoming_actor::incoming_protocol_actor(
-                            me.counterpart(),
-                            &connection,
-                            transport_incoming_rx,
-                            dynamic_handler_rx,
-                            reply_rx,
-                            handler,
-                            protocol_compat,
-                        ),
-                        task_actor::task_actor(new_task_rx, &connection),
-                        responder.run_with_connection_to(connection.clone()),
-                    )?;
-                    Ok(())
+                    let incoming = incoming_actor::incoming_protocol_actor(
+                        me.counterpart(),
+                        &connection,
+                        transport_incoming_rx,
+                        dynamic_handler_rx,
+                        pending_replies.clone(),
+                        incoming_actor::IncomingHandlers::new(handler, on_close),
+                        protocol_compat.clone(),
+                    );
+                    let other_actors = async {
+                        futures::try_join!(
+                            // Protocol layer: OutgoingMessage -> RawJsonRpcMessage
+                            outgoing_actor::outgoing_protocol_actor(
+                                outgoing_rx,
+                                pending_replies,
+                                transport_outgoing_tx,
+                                protocol_compat,
+                            ),
+                            task_actor::task_actor(new_task_rx, &connection),
+                            runner.run_with_connection_to(connection.clone()),
+                        )?;
+                        Ok(())
+                    };
+
+                    // EOF can wake a pending request consumer, which may make
+                    // the task actor fail while close callbacks are running.
+                    // Keep the incoming actor alive until those callbacks have
+                    // all finished, just as we do when the foreground wakes.
+                    run_until_connection_close(
+                        incoming,
+                        other_actors,
+                        connection.incoming_closed.clone(),
+                    )
+                    .await
                 };
 
-                crate::util::run_until(Box::pin(background), Box::pin(main_fn(connection.clone())))
-                    .await
+                run_until_connection_close(
+                    background,
+                    main_fn(connection.clone()),
+                    connection.incoming_closed.clone(),
+                )
+                .await
             }
         });
 
@@ -1475,11 +1798,12 @@ impl<
     }
 }
 
-impl<R, H, Run> ConnectTo<R::Counterpart> for Builder<R, H, Run>
+impl<R, H, Run, Close> ConnectTo<R::Counterpart> for Builder<R, H, Run, Close>
 where
     R: Role,
     H: HandleDispatchFrom<R::Counterpart> + 'static,
     Run: RunWithConnectionTo<R::Counterpart> + 'static,
+    Close: HandleConnectionClose<R::Counterpart> + 'static,
 {
     async fn connect_to(self, client: impl ConnectTo<R>) -> Result<(), crate::Error> {
         Builder::connect_to(self, client).await
@@ -1500,9 +1824,10 @@ pub(crate) struct ResponsePayload {
     /// response processing is complete, allowing the dispatch loop to continue
     /// to the next message.
     ///
-    /// This is `None` for error paths where the response is sent directly
-    /// (e.g., when the outgoing channel is broken) rather than through the
-    /// normal dispatch loop flow.
+    /// This is present only when callback-style consumption was selected before
+    /// the response was routed during its original dispatch. Local error paths,
+    /// blocking consumers, and responses routed later do not hold the dispatch
+    /// loop.
     pub(crate) ack_tx: Option<oneshot::Sender<()>>,
 }
 
@@ -1515,37 +1840,172 @@ impl std::fmt::Debug for ResponsePayload {
     }
 }
 
-/// Message sent to the incoming actor for reply subscription management.
-enum ReplyMessage {
-    /// Subscribe to receive a response for the given request id.
-    /// When a response with this id arrives, it will be sent through the oneshot
-    /// along with an ack channel that must be signaled when processing is complete.
-    /// The method name is stored to allow routing responses through typed handlers.
-    Subscribe {
-        id: RequestId,
-
-        /// id of the peer this request was sent to
-        role_id: RoleId,
-
-        /// (original) method of the request -- the actual request may have been transformed
-        /// to a successor method, but this will reflect the method of the wrapped request
-        method: String,
-
-        sender: oneshot::Sender<ResponsePayload>,
-
-        cancellation_disarm: SentRequestCancellationDisarm,
-    },
+#[derive(Clone, Debug, Default)]
+struct ResponseOrdering {
+    ordered: Arc<AtomicBool>,
 }
 
-impl std::fmt::Debug for ReplyMessage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ReplyMessage::Subscribe { id, method, .. } => f
-                .debug_struct("Subscribe")
-                .field("id", id)
-                .field("method", method)
-                .finish(),
+impl ResponseOrdering {
+    fn mark_ordered(&self) {
+        self.ordered.store(true, Ordering::Release);
+    }
+
+    fn is_ordered(&self) -> bool {
+        self.ordered.load(Ordering::Acquire)
+    }
+}
+
+struct PendingReply {
+    method: String,
+    role_id: RoleId,
+    sender: oneshot::Sender<ResponsePayload>,
+    cancellation_disarm: SentRequestCancellationDisarm,
+    ordering: ResponseOrdering,
+}
+
+impl PendingReply {
+    fn fail(self, error: crate::Error) {
+        self.cancellation_disarm.disarm();
+        if self
+            .sender
+            .send(ResponsePayload {
+                result: Err(error),
+                ack_tx: None,
+            })
+            .is_err()
+        {
+            tracing::trace!(method = %self.method, "Pending request was already dropped");
         }
+    }
+
+    fn fail_incoming_closed(self) {
+        let error = incoming_transport_closed_error(&self.method);
+        self.fail(error);
+    }
+}
+
+#[derive(Default)]
+struct PendingRepliesInner {
+    incoming_closed: bool,
+    replies: HashMap<RequestId, PendingReply>,
+}
+
+#[derive(Clone, Default)]
+struct PendingReplies {
+    inner: Arc<Mutex<PendingRepliesInner>>,
+}
+
+impl PendingReplies {
+    fn registrar(&self) -> PendingRepliesRegistrar {
+        PendingRepliesRegistrar {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
+    fn contains(&self, id: &RequestId) -> bool {
+        self.inner
+            .lock()
+            .expect("pending replies mutex poisoned")
+            .replies
+            .contains_key(id)
+    }
+
+    fn remove(&self, id: &RequestId) -> Option<PendingReply> {
+        self.inner
+            .lock()
+            .expect("pending replies mutex poisoned")
+            .replies
+            .remove(id)
+    }
+
+    /// Atomically reject new subscriptions and fail every existing one.
+    fn close_incoming(&self) -> usize {
+        let replies = {
+            let mut inner = self.inner.lock().expect("pending replies mutex poisoned");
+            inner.incoming_closed = true;
+            std::mem::take(&mut inner.replies)
+        };
+        let count = replies.len();
+        for (_, reply) in replies {
+            reply.fail_incoming_closed();
+        }
+        count
+    }
+}
+
+/// A non-owning handle used to register a request before it enters the
+/// outgoing queue. Keeping this weak prevents escaped [`ConnectionTo`] clones
+/// from extending the lifetime of response senders after the driver stops.
+#[derive(Clone)]
+struct PendingRepliesRegistrar {
+    inner: Weak<Mutex<PendingRepliesInner>>,
+}
+
+impl PendingRepliesRegistrar {
+    /// Register a response destination before the request becomes observable.
+    ///
+    /// Returns `false` after failing `reply` when EOF has already made a
+    /// response impossible or the connection driver is no longer running.
+    fn subscribe(
+        &self,
+        id: RequestId,
+        reply: PendingReply,
+        incoming_closed: &IncomingClosed,
+    ) -> bool {
+        let Some(inner) = self.inner.upgrade() else {
+            if incoming_closed.is_closing() {
+                reply.fail_incoming_closed();
+            } else {
+                let method = reply.method.clone();
+                reply.fail(crate::util::internal_error(format!(
+                    "failed to send outgoing request `{method}`: connection is no longer running"
+                )));
+            }
+            return false;
+        };
+
+        let result = {
+            let mut inner = inner.lock().expect("pending replies mutex poisoned");
+            if inner.incoming_closed {
+                Err(reply)
+            } else {
+                Ok(inner.replies.insert(id, reply))
+            }
+        };
+
+        match result {
+            Err(rejected) => {
+                rejected.fail_incoming_closed();
+                false
+            }
+            Ok(replaced) => {
+                if let Some(replaced) = replaced {
+                    replaced.fail(
+                        crate::Error::internal_error()
+                            .data("outgoing request ID was reused before its response arrived"),
+                    );
+                }
+                true
+            }
+        }
+    }
+
+    fn remove(&self, id: &RequestId) -> Option<PendingReply> {
+        self.inner
+            .upgrade()?
+            .lock()
+            .expect("pending replies mutex poisoned")
+            .replies
+            .remove(id)
+    }
+}
+
+impl Debug for PendingRepliesRegistrar {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingRepliesRegistrar")
+            .field("is_connected", &(self.inner.strong_count() > 0))
+            .finish()
     }
 }
 
@@ -1927,8 +2387,415 @@ pub fn is_cancel_request_notification<N: JsonRpcNotification>(notification: &N) 
 }
 
 /// Messages send to be serialized over the transport.
+#[derive(Clone)]
+enum ResponseDestination {
+    Individual(IndividualResponseSlot),
+    Batch(BatchResponseSlot),
+}
+
+impl std::fmt::Debug for ResponseDestination {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Individual(slot) => formatter.debug_tuple("Individual").field(slot).finish(),
+            Self::Batch(slot) => formatter.debug_tuple("Batch").field(slot).finish(),
+        }
+    }
+}
+
+impl ResponseDestination {
+    fn individual() -> Self {
+        Self::Individual(IndividualResponseSlot::default())
+    }
+
+    fn batch(slot_count: usize) -> (impl Iterator<Item = Self>, BatchDispatchCompletion) {
+        let state = Arc::new(Mutex::new(BatchResponseState {
+            remaining: slot_count,
+            responses: (0..slot_count).map(|_| None).collect(),
+            abandoned: (0..slot_count).map(|_| None).collect(),
+            active_handler_attempts: (0..slot_count).map(|_| 0).collect(),
+            dispatch_complete: false,
+            emitted: false,
+        }));
+
+        (
+            (0..slot_count).map({
+                let state = state.clone();
+                move |index| {
+                    Self::Batch(BatchResponseSlot {
+                        state: state.clone(),
+                        index,
+                    })
+                }
+            }),
+            BatchDispatchCompletion { state },
+        )
+    }
+
+    fn complete(self, response: RawJsonRpcMessage) -> Option<TransportFrame> {
+        match self {
+            Self::Individual(slot) => slot.complete(response),
+            Self::Batch(slot) => slot.complete(response).map(batch_response_frame),
+        }
+    }
+
+    fn abandon(self, fallback: RawJsonRpcMessage) -> Option<TransportFrame> {
+        match self {
+            Self::Individual(_) => None,
+            Self::Batch(slot) => slot.abandon(fallback).map(batch_response_frame),
+        }
+    }
+
+    fn is_batch(&self) -> bool {
+        matches!(self, Self::Batch(_))
+    }
+
+    fn begin_handler_attempt(
+        &self,
+        message_tx: OutgoingMessageTx,
+    ) -> Option<ResponderHandlerAttempt> {
+        let Self::Batch(slot) = self else {
+            return None;
+        };
+        slot.begin_handler_attempt();
+        Some(ResponderHandlerAttempt {
+            message_tx,
+            destination: self.clone(),
+        })
+    }
+
+    fn finish_handler_attempt(self) -> Option<TransportFrame> {
+        match self {
+            Self::Individual(_) => None,
+            Self::Batch(slot) => slot.finish_handler_attempt().map(batch_response_frame),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct IndividualResponseSlot {
+    completed: Arc<AtomicBool>,
+}
+
+impl IndividualResponseSlot {
+    fn complete(self, response: RawJsonRpcMessage) -> Option<TransportFrame> {
+        if self.completed.swap(true, Ordering::AcqRel) {
+            tracing::warn!("Ignoring duplicate completion of JSON-RPC request");
+            return None;
+        }
+
+        Some(TransportFrame::Single(response))
+    }
+}
+
+fn batch_response_frame(responses: Vec<RawJsonRpcMessage>) -> TransportFrame {
+    TransportFrame::Batch(
+        TransportBatch::from_messages(responses)
+            .expect("a completed JSON-RPC response batch is non-empty"),
+    )
+}
+
+#[derive(Clone)]
+struct BatchDispatchCompletion {
+    state: Arc<Mutex<BatchResponseState>>,
+}
+
+impl std::fmt::Debug for BatchDispatchCompletion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BatchDispatchCompletion")
+            .finish_non_exhaustive()
+    }
+}
+
+impl BatchDispatchCompletion {
+    fn complete(self) -> Option<TransportFrame> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("batch response accumulator mutex poisoned");
+        if state.dispatch_complete {
+            tracing::warn!("Ignoring duplicate JSON-RPC batch dispatch completion");
+            return None;
+        }
+        state.dispatch_complete = true;
+        for index in 0..state.responses.len() {
+            promote_abandoned_response(&mut state, index);
+        }
+        take_completed_batch(&mut state).map(batch_response_frame)
+    }
+}
+
+fn promote_abandoned_response(state: &mut BatchResponseState, index: usize) {
+    if state.active_handler_attempts[index] == 0
+        && state.responses[index].is_none()
+        && let Some(fallback) = state.abandoned[index].take()
+    {
+        state.responses[index] = Some(fallback);
+        state.remaining -= 1;
+    }
+}
+
+fn take_completed_batch(state: &mut BatchResponseState) -> Option<Vec<RawJsonRpcMessage>> {
+    if !state.dispatch_complete || state.remaining != 0 || state.emitted {
+        return None;
+    }
+
+    state.emitted = true;
+    Some(
+        state
+            .responses
+            .iter_mut()
+            .map(|response| {
+                response
+                    .take()
+                    .expect("completed JSON-RPC batch has every response slot")
+            })
+            .collect(),
+    )
+}
+
+#[derive(Clone)]
+struct BatchResponseSlot {
+    state: Arc<Mutex<BatchResponseState>>,
+    index: usize,
+}
+
+impl std::fmt::Debug for BatchResponseSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BatchResponseSlot")
+            .field("index", &self.index)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BatchResponseSlot {
+    fn begin_handler_attempt(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("batch response accumulator mutex poisoned");
+        state.active_handler_attempts[self.index] += 1;
+    }
+
+    fn finish_handler_attempt(self) -> Option<Vec<RawJsonRpcMessage>> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("batch response accumulator mutex poisoned");
+        state.active_handler_attempts[self.index] = state.active_handler_attempts[self.index]
+            .checked_sub(1)
+            .expect("handler attempt completion without a matching start");
+        if state.dispatch_complete {
+            promote_abandoned_response(&mut state, self.index);
+        }
+        take_completed_batch(&mut state)
+    }
+
+    fn complete(self, response: RawJsonRpcMessage) -> Option<Vec<RawJsonRpcMessage>> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("batch response accumulator mutex poisoned");
+        if state.emitted {
+            tracing::warn!(
+                index = self.index,
+                "Ignoring response after JSON-RPC batch was already completed"
+            );
+            return None;
+        }
+        if self.index >= state.responses.len() {
+            tracing::error!(index = self.index, "Invalid JSON-RPC batch response slot");
+            return None;
+        }
+        if state.responses[self.index].is_some() {
+            tracing::warn!(
+                index = self.index,
+                "Ignoring duplicate completion of JSON-RPC batch response slot"
+            );
+            return None;
+        }
+
+        state.abandoned[self.index] = None;
+        state.responses[self.index] = Some(response);
+        state.remaining -= 1;
+        take_completed_batch(&mut state)
+    }
+
+    fn abandon(self, fallback: RawJsonRpcMessage) -> Option<Vec<RawJsonRpcMessage>> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("batch response accumulator mutex poisoned");
+        if state.emitted || state.responses[self.index].is_some() {
+            return None;
+        }
+        if state.abandoned[self.index].is_some() {
+            tracing::warn!(
+                index = self.index,
+                "Ignoring duplicate abandonment of JSON-RPC batch response slot"
+            );
+            return None;
+        }
+
+        if state.dispatch_complete && state.active_handler_attempts[self.index] == 0 {
+            state.responses[self.index] = Some(fallback);
+            state.remaining -= 1;
+        } else {
+            state.abandoned[self.index] = Some(fallback);
+        }
+        take_completed_batch(&mut state)
+    }
+}
+
+struct BatchResponseState {
+    remaining: usize,
+    responses: Vec<Option<RawJsonRpcMessage>>,
+    abandoned: Vec<Option<RawJsonRpcMessage>>,
+    active_handler_attempts: Vec<usize>,
+    dispatch_complete: bool,
+    emitted: bool,
+}
+
+#[derive(Clone, Debug)]
+struct RequestReplyTarget {
+    id: RequestId,
+    method: String,
+    destination: ResponseDestination,
+}
+
+struct ResponderHandlerAttempt {
+    message_tx: OutgoingMessageTx,
+    destination: ResponseDestination,
+}
+
+impl Drop for ResponderHandlerAttempt {
+    fn drop(&mut self) {
+        if let Err(error) = send_raw_message(
+            &self.message_tx,
+            OutgoingMessage::BatchHandlerAttemptComplete {
+                destination: self.destination.clone(),
+            },
+        ) {
+            tracing::debug!(?error, "could not complete JSON-RPC batch handler attempt");
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ResponseReplyTarget {
+    id: RequestId,
+    method: String,
+    sender: Arc<Mutex<Option<oneshot::Sender<ResponsePayload>>>>,
+    ordering: ResponseOrdering,
+    dispatch: ResponseDispatch,
+}
+
+impl ResponseReplyTarget {
+    fn route(self, result: Result<serde_json::Value, crate::Error>) {
+        let sender = self
+            .sender
+            .lock()
+            .expect("response reply mutex poisoned")
+            .take();
+        let Some(sender) = sender else {
+            tracing::debug!(
+                method = %self.method,
+                id = ?self.id,
+                "response was already routed to its local awaiter"
+            );
+            return;
+        };
+
+        let ack_tx = self.dispatch.acknowledgment(&self.ordering);
+        if sender.send(ResponsePayload { result, ack_tx }).is_err() {
+            tracing::debug!(
+                method = %self.method,
+                id = ?self.id,
+                "dropped response because local receiver was gone"
+            );
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct ResponseDispatch {
+    state: Arc<Mutex<ResponseDispatchState>>,
+}
+
+#[derive(Default)]
+struct ResponseDispatchState {
+    complete: bool,
+    ack_rx: Option<oneshot::Receiver<()>>,
+}
+
+impl ResponseDispatch {
+    fn acknowledgment(&self, ordering: &ResponseOrdering) -> Option<oneshot::Sender<()>> {
+        if !ordering.is_ordered() {
+            return None;
+        }
+
+        let mut state = self.state.lock().expect("response dispatch mutex poisoned");
+        if state.complete {
+            return None;
+        }
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let previous_ack = state.ack_rx.replace(ack_rx);
+        debug_assert!(
+            previous_ack.is_none(),
+            "a response dispatch can only be routed once"
+        );
+        Some(ack_tx)
+    }
+
+    fn complete(&self) -> Option<oneshot::Receiver<()>> {
+        let mut state = self.state.lock().expect("response dispatch mutex poisoned");
+        state.complete = true;
+        state.ack_rx.take()
+    }
+}
+
+enum HandlerErrorTarget {
+    Request(RequestReplyTarget),
+    Response(ResponseReplyTarget),
+}
+
+impl HandlerErrorTarget {
+    fn begin_handler_attempt(
+        &self,
+        message_tx: &OutgoingMessageTx,
+    ) -> Option<ResponderHandlerAttempt> {
+        match self {
+            Self::Request(target) => target.destination.begin_handler_attempt(message_tx.clone()),
+            Self::Response(_) => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 enum OutgoingMessage {
+    /// Close the outgoing application queue and acknowledge after every
+    /// already-accepted message has entered the raw transport queue.
+    CloseAfterDraining { done: oneshot::Sender<()> },
+
+    /// Mark every entry in an incoming batch as dispatched. A completed
+    /// response array may only be emitted after this barrier.
+    BatchDispatchComplete { completion: BatchDispatchCompletion },
+
+    /// Finish arbitration for a handler attempt that may have dropped a batch
+    /// responder immediately before returning an error.
+    BatchHandlerAttemptComplete { destination: ResponseDestination },
+
+    /// Record that a claimed batch request dropped its responder without
+    /// replying. The fallback remains provisional while its handler attempt is
+    /// active so a handler error can supply the authoritative response.
+    AbandonedBatchResponse {
+        id: RequestId,
+        method: String,
+        destination: ResponseDestination,
+    },
+
     /// Send a request to the server.
     Request {
         /// id assigned to this request (generated by sender)
@@ -1937,17 +2804,9 @@ enum OutgoingMessage {
         /// the original method
         method: String,
 
-        /// the peer we sent this to
-        role_id: RoleId,
-
         /// the message to send; this may have a distinct method
         /// depending on the peer
         untyped: UntypedMessage,
-
-        /// where to send the response when it arrives (includes ack channel)
-        response_tx: oneshot::Sender<ResponsePayload>,
-
-        cancellation_disarm: SentRequestCancellationDisarm,
     },
 
     /// Send a notification to the server.
@@ -1965,10 +2824,15 @@ enum OutgoingMessage {
         method: String,
 
         response: Result<serde_json::Value, crate::Error>,
+
+        destination: ResponseDestination,
     },
 
-    /// Send a generalized error message
-    Error { error: crate::Error },
+    /// Send an Error Response that cannot be correlated to a request ID.
+    UncorrelatedErrorResponse {
+        error: crate::Error,
+        destination: ResponseDestination,
+    },
 }
 
 /// Return type from JrHandler; indicates whether the request was handled or not.
@@ -2047,6 +2911,144 @@ pub struct ConnectionTo<Counterpart: Role> {
     message_tx: OutgoingMessageTx,
     task_tx: TaskTx,
     dynamic_handler_tx: mpsc::UnboundedSender<DynamicHandlerMessage<Counterpart>>,
+    transport_completion: SharedTransportCompletion,
+    pending_replies: PendingRepliesRegistrar,
+    incoming_closed: IncomingClosed,
+}
+
+type SharedTransportCompletion = future::Shared<BoxFuture<'static, Result<(), crate::Error>>>;
+
+#[derive(Clone)]
+struct IncomingClosed {
+    state: Arc<IncomingClosedState>,
+}
+
+struct IncomingClosedState {
+    closing: AtomicBool,
+    closed: AtomicBool,
+    signal_tx: Mutex<Option<oneshot::Sender<()>>>,
+    signal_rx: future::Shared<BoxFuture<'static, ()>>,
+}
+
+impl IncomingClosed {
+    fn new() -> Self {
+        let (signal_tx, signal_rx) = oneshot::channel();
+        Self {
+            state: Arc::new(IncomingClosedState {
+                closing: AtomicBool::new(false),
+                closed: AtomicBool::new(false),
+                signal_tx: Mutex::new(Some(signal_tx)),
+                signal_rx: signal_rx.map(|_| ()).boxed().shared(),
+            }),
+        }
+    }
+
+    fn begin_close(&self) {
+        self.state.closing.store(true, Ordering::Release);
+    }
+
+    fn finish_close(&self) {
+        self.state.closed.store(true, Ordering::Release);
+        let signal_tx = self
+            .state
+            .signal_tx
+            .lock()
+            .expect("incoming-close signal mutex poisoned")
+            .take();
+
+        if let Some(signal_tx) = signal_tx {
+            let _ = signal_tx.send(());
+        }
+    }
+
+    async fn closed(&self) {
+        self.state.signal_rx.clone().await;
+    }
+
+    fn is_closed(&self) -> bool {
+        self.state.closed.load(Ordering::Acquire)
+    }
+
+    fn is_closing(&self) -> bool {
+        self.state.closing.load(Ordering::Acquire)
+    }
+}
+
+impl Debug for IncomingClosed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IncomingClosed")
+            .field("is_closing", &self.is_closing())
+            .field("is_closed", &self.is_closed())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Stable discriminator stored in the `data.reason` field of errors produced
+/// when the incoming transport reaches clean EOF before a request receives its
+/// response.
+pub const INCOMING_TRANSPORT_CLOSED_REASON: &str = "incoming_transport_closed";
+
+/// Return whether `error` reports that the incoming transport reached clean
+/// EOF before a request received its response.
+#[must_use]
+pub fn is_incoming_transport_closed(error: &crate::Error) -> bool {
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("reason"))
+        .and_then(serde_json::Value::as_str)
+        == Some(INCOMING_TRANSPORT_CLOSED_REASON)
+}
+
+fn incoming_transport_closed_error(method: &str) -> crate::Error {
+    let mut error = crate::Error::internal_error();
+    error.message = "Incoming transport closed".to_string();
+    error.data(serde_json::json!({
+        "reason": INCOMING_TRANSPORT_CLOSED_REASON,
+        "method": method,
+    }))
+}
+
+/// Run the connection background alongside its foreground while ensuring that
+/// a foreground woken by incoming EOF cannot cancel close callbacks midway.
+fn run_until_connection_close<R>(
+    background: impl Future<Output = Result<(), crate::Error>>,
+    foreground: impl Future<Output = Result<R, crate::Error>>,
+    incoming_closed: IncomingClosed,
+) -> impl Future<Output = Result<R, crate::Error>> {
+    // Box these before constructing the returned future. Keeping the generic
+    // connection actors directly in this async state would substantially grow
+    // every `connect_*` future.
+    let background = Box::pin(background);
+    let foreground = Box::pin(foreground);
+
+    async move {
+        match future::select(background, foreground).await {
+            Either::Left((background_result, foreground)) => {
+                background_result?;
+                foreground.await
+            }
+            Either::Right((foreground_result, background)) => {
+                if !incoming_closed.is_closing() {
+                    return foreground_result;
+                }
+
+                match future::select(background, Box::pin(incoming_closed.closed())).await {
+                    Either::Left((background_result, _)) => {
+                        background_result?;
+                        foreground_result
+                    }
+                    Either::Right(((), background)) => {
+                        // Poll the background first once more so an error returned
+                        // by the just-finished close callback wins over the ready
+                        // foreground result.
+                        crate::util::run_until(background, future::ready(foreground_result)).await
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl<Counterpart: Role> ConnectionTo<Counterpart> {
@@ -2055,18 +3057,79 @@ impl<Counterpart: Role> ConnectionTo<Counterpart> {
         message_tx: mpsc::UnboundedSender<OutgoingMessage>,
         task_tx: mpsc::UnboundedSender<Task>,
         dynamic_handler_tx: mpsc::UnboundedSender<DynamicHandlerMessage<Counterpart>>,
+        transport_completion: SharedTransportCompletion,
+        pending_replies: PendingRepliesRegistrar,
     ) -> Self {
         Self {
             counterpart,
             message_tx,
             task_tx,
             dynamic_handler_tx,
+            transport_completion,
+            pending_replies,
+            incoming_closed: IncomingClosed::new(),
         }
     }
 
     /// Return the counterpart role this connection is talking to.
     pub fn counterpart(&self) -> Counterpart {
         self.counterpart.clone()
+    }
+
+    /// Wait until the incoming transport reaches clean EOF.
+    ///
+    /// Transport closure means that no more messages or responses can arrive.
+    /// Pending requests are failed first; this completes after registered
+    /// [`Builder::on_close`] callbacks finish.
+    /// It does not automatically cancel the future passed to
+    /// [`Builder::connect_with`]; use [`Builder::on_close`] when the connection
+    /// should run application-specific cleanup or terminate that future.
+    pub async fn incoming_closed(&self) {
+        self.incoming_closed.closed().await;
+    }
+
+    /// Return whether clean incoming-EOF processing has completed.
+    ///
+    /// This remains `false` while [`Builder::on_close`] callbacks are running.
+    #[must_use]
+    pub fn is_incoming_closed(&self) -> bool {
+        self.incoming_closed.is_closed()
+    }
+
+    /// Stop accepting outgoing messages, drain those already accepted through
+    /// the protocol actor, and wait for the transport sink to finish them.
+    async fn drain_outgoing(&self) -> Result<(), crate::Error> {
+        let (done_tx, done_rx) = oneshot::channel();
+        let marker_result = send_raw_message(
+            &self.message_tx,
+            OutgoingMessage::CloseAfterDraining { done: done_tx },
+        );
+        let marker_result = match marker_result {
+            Ok(()) => done_rx.await.map_err(|error| {
+                crate::util::internal_error(format!(
+                    "outgoing drain marker was dropped before completion: {error}"
+                ))
+            }),
+            Err(error) => Err(error),
+        };
+
+        // The marker only proves that all accepted protocol messages entered
+        // the raw transport queue. Transport completion is the sink-level
+        // barrier that proves a backpressured writer finished them.
+        self.transport_completion.clone().await?;
+        marker_result
+    }
+
+    fn is_incoming_closing(&self) -> bool {
+        self.incoming_closed.is_closing()
+    }
+
+    pub(super) fn begin_incoming_close(&self) {
+        self.incoming_closed.begin_close();
+    }
+
+    pub(super) fn finish_incoming_close(&self) {
+        self.incoming_closed.finish_close();
     }
 
     /// Spawns a task that will run so long as the JSON-RPC connection is being served.
@@ -2158,6 +3221,7 @@ impl<Counterpart: Role> ConnectionTo<Counterpart> {
             R,
             impl HandleDispatchFrom<R::Counterpart> + 'static,
             impl RunWithConnectionTo<R::Counterpart> + 'static,
+            impl HandleConnectionClose<R::Counterpart> + 'static,
         >,
         transport: impl ConnectTo<R> + 'static,
     ) -> Result<ConnectionTo<R::Counterpart>, crate::Error> {
@@ -2226,20 +3290,20 @@ impl<Counterpart: Role> ConnectionTo<Counterpart> {
             }
             Dispatch::Response(result, router) => {
                 // Responses are forwarded directly to their destination
-                router.respond_with_result(result)
+                router.route_with_result(result)
             }
         }
     }
 
     /// Send an outgoing request and return a [`SentRequest`] for handling the reply.
     ///
-    /// The returned [`SentRequest`] provides methods for receiving the response without
-    /// blocking the event loop:
+    /// The returned [`SentRequest`] makes the response-consumption mode explicit:
     ///
-    /// * [`on_receiving_result`](SentRequest::on_receiving_result) - Schedule
-    ///   a callback to run when the response arrives (doesn't block the event loop)
-    /// * [`block_task`](SentRequest::block_task) - Block the current task until the response
-    ///   arrives (only safe in spawned tasks, not in handlers)
+    /// * [`on_receiving_result`](SentRequest::on_receiving_result) - Register a callback and
+    ///   return immediately. If registered before the response is routed during its original
+    ///   dispatch, the loop waits for the callback to complete.
+    /// * [`block_task`](SentRequest::block_task) - Wait on the current task until the response
+    ///   arrives. This is only safe when that task already runs outside the dispatch loop.
     ///
     /// # Anti-Footgun Design
     ///
@@ -2258,7 +3322,7 @@ impl<Counterpart: Role> ConnectionTo<Counterpart> {
     /// ```no_run
     /// # use agent_client_protocol_test::*;
     /// # async fn example(cx: agent_client_protocol::ConnectionTo<agent_client_protocol::UntypedRole>) -> Result<(), agent_client_protocol::Error> {
-    /// // ✅ Option 1: Schedule callback (safe in handlers)
+    /// // ✅ Option 1: Register an ordered callback (safe in handlers)
     /// cx.send_request(MyRequest {})
     ///     .on_receiving_result(async |result| {
     ///         // Handle the response
@@ -2305,44 +3369,68 @@ impl<Counterpart: Role> ConnectionTo<Counterpart> {
         let method = request.method().to_string();
         let id = RequestId::Str(uuid::Uuid::new_v4().to_string());
         let (response_tx, response_rx) = oneshot::channel();
+        let response_ordering = ResponseOrdering::default();
         let role_id = peer.role_id();
         let remote_style = self.counterpart.remote_style(peer);
         let cancellation =
             SentRequestCancellation::new(self.message_tx.clone(), remote_style, id.clone());
+        if self.is_incoming_closing() {
+            cancellation.disarm();
+            drop(response_tx.send(ResponsePayload {
+                result: Err(incoming_transport_closed_error(&method)),
+                ack_tx: None,
+            }));
+            return SentRequest::new(
+                id,
+                method.clone(),
+                self.task_tx.clone(),
+                response_rx,
+                cancellation,
+                response_ordering,
+            )
+            .map(move |json| <Req::Response>::from_value(&method, json));
+        }
+
         match remote_style.transform_outgoing_message(request) {
             Ok(untyped) => {
-                // Transform the message for the target role
-                let message = OutgoingMessage::Request {
-                    id: id.clone(),
+                // Register before enqueueing so incoming EOF can fail every
+                // observable request before close callbacks begin. The
+                // outgoing actor checks that the registration still exists
+                // before sending the request.
+                let pending_reply = PendingReply {
                     method: method.clone(),
                     role_id,
-                    untyped,
-                    response_tx,
+                    sender: response_tx,
                     cancellation_disarm: cancellation.disarm_handle(),
+                    ordering: response_ordering.clone(),
                 };
 
-                match self.message_tx.unbounded_send(message) {
-                    Ok(()) => (),
-                    Err(error) => {
+                if self
+                    .pending_replies
+                    .subscribe(id.clone(), pending_reply, &self.incoming_closed)
+                {
+                    let message = OutgoingMessage::Request {
+                        id: id.clone(),
+                        method: method.clone(),
+                        untyped,
+                    };
+
+                    if let Err(error) = self.message_tx.unbounded_send(message) {
                         cancellation.disarm();
 
-                        let OutgoingMessage::Request {
-                            method,
-                            response_tx,
-                            ..
-                        } = error.into_inner()
-                        else {
+                        let OutgoingMessage::Request { id, method, .. } = error.into_inner() else {
                             unreachable!();
                         };
 
-                        response_tx
-                            .send(ResponsePayload {
-                                result: Err(crate::util::internal_error(format!(
-                                    "failed to send outgoing request `{method}"
-                                ))),
-                                ack_tx: None,
-                            })
-                            .unwrap();
+                        if let Some(pending_reply) = self.pending_replies.remove(&id) {
+                            if self.is_incoming_closing() {
+                                pending_reply.fail_incoming_closed();
+                            } else {
+                                pending_reply.fail(crate::util::internal_error(format!(
+                                    "failed to send outgoing request `{method}`"
+                                )));
+                            }
+                        }
                     }
                 }
             }
@@ -2367,6 +3455,7 @@ impl<Counterpart: Role> ConnectionTo<Counterpart> {
             self.task_tx.clone(),
             response_rx,
             cancellation,
+            response_ordering,
         )
         .map(move |json| <Req::Response>::from_value(&method, json))
     }
@@ -2470,23 +3559,17 @@ impl<Counterpart: Role> ConnectionTo<Counterpart> {
         )
     }
 
-    /// Send an error notification (no reply expected).
-    pub fn send_error_notification(&self, error: crate::Error) -> Result<(), crate::Error> {
-        send_raw_message(&self.message_tx, OutgoingMessage::Error { error })
-    }
-
     /// Register a dynamic message handler, used to intercept messages specific to a particular session
     /// or some similar modal thing.
     ///
-    /// Dynamic message handlers are called first for every incoming message.
-    ///
-    /// If they decline to handle the message, then the message is passed to the regular registered handlers.
+    /// Dynamic message handlers run after the handlers registered on [`Builder`] and before the
+    /// role's default handler. They receive messages that the builder handlers decline.
     ///
     /// The handler will stay registered until the returned registration guard is dropped.
     pub fn add_dynamic_handler(
         &self,
         handler: impl HandleDispatchFrom<Counterpart> + 'static,
-    ) -> Result<DynamicHandlerRegistration<Counterpart>, crate::Error> {
+    ) -> Result<DynamicHandlerGuard<Counterpart>, crate::Error> {
         let uuid = Uuid::new_v4();
         self.dynamic_handler_tx
             .unbounded_send(DynamicHandlerMessage::AddDynamicHandler(
@@ -2495,7 +3578,7 @@ impl<Counterpart: Role> ConnectionTo<Counterpart> {
             ))
             .map_err(crate::util::internal_error)?;
 
-        Ok(DynamicHandlerRegistration::new(uuid, self.clone()))
+        Ok(DynamicHandlerGuard::new(uuid, self.clone()))
     }
 
     fn remove_dynamic_handler(&self, uuid: Uuid) {
@@ -2507,26 +3590,40 @@ impl<Counterpart: Role> ConnectionTo<Counterpart> {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct DynamicHandlerRegistration<R: Role> {
-    uuid: Uuid,
+/// A guard that keeps a dynamic message handler registered.
+///
+/// Dropping the guard unregisters the handler. Use [`detach`](Self::detach) to
+/// keep the handler registered for the remaining lifetime of the connection.
+#[must_use = "dropping this guard unregisters the dynamic handler"]
+#[derive(Debug)]
+pub struct DynamicHandlerGuard<R: Role> {
+    uuid: Option<Uuid>,
     cx: ConnectionTo<R>,
 }
 
-impl<R: Role> DynamicHandlerRegistration<R> {
+impl<R: Role> DynamicHandlerGuard<R> {
     fn new(uuid: Uuid, cx: ConnectionTo<R>) -> Self {
-        Self { uuid, cx }
+        Self {
+            uuid: Some(uuid),
+            cx,
+        }
     }
 
-    /// Prevents the dynamic handler from being removed when dropped.
-    pub fn run_indefinitely(self) {
-        std::mem::forget(self);
+    /// Keep the dynamic handler registered after this guard is dropped.
+    ///
+    /// The handler remains registered until the connection itself shuts down.
+    /// Unlike leaking the guard, detaching does not retain an extra
+    /// [`ConnectionTo`] handle.
+    pub fn detach(mut self) {
+        self.uuid = None;
     }
 }
 
-impl<R: Role> Drop for DynamicHandlerRegistration<R> {
+impl<R: Role> Drop for DynamicHandlerGuard<R> {
     fn drop(&mut self) {
-        self.cx.remove_dynamic_handler(self.uuid);
+        if let Some(uuid) = self.uuid {
+            self.cx.remove_dynamic_handler(uuid);
+        }
     }
 }
 
@@ -2572,6 +3669,13 @@ impl<R: Role> Drop for DynamicHandlerRegistration<R> {
 ///
 /// See the [Event Loop and Concurrency](Builder#event-loop-and-concurrency)
 /// section for more details.
+///
+/// # Drop behavior
+///
+/// Dropping a responder for a request that arrived in a batch completes that
+/// slot with an Internal Error, so one abandoned request cannot withhold valid
+/// sibling responses forever. A responder for an individual request retains
+/// the historical behavior: dropping it does not automatically send a reply.
 #[must_use]
 pub struct Responder<T: JsonRpcResponse = serde_json::Value> {
     /// The method of the request.
@@ -2583,11 +3687,55 @@ pub struct Responder<T: JsonRpcResponse = serde_json::Value> {
     /// Request-local cancellation state.
     cancellation: ResponderCancellation,
 
+    /// Whether this response is emitted on its own or collected into a batch.
+    destination: ResponseDestination,
+
     /// Function to send the response to its destination.
     ///
     /// For incoming requests: serializes to JSON and sends over the wire.
     /// For incoming responses: sends to the waiting oneshot channel.
     send_fn: Box<dyn FnOnce(Result<T, crate::Error>) -> Result<(), crate::Error> + Send>,
+
+    /// Completes an abandoned batch slot unless an explicit response disarms it.
+    drop_guard: ResponderDropGuard,
+}
+
+struct ResponderDropGuard {
+    message_tx: OutgoingMessageTx,
+    id: RequestId,
+    method: String,
+    destination: ResponseDestination,
+    armed: bool,
+}
+
+impl ResponderDropGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ResponderDropGuard {
+    fn drop(&mut self) {
+        if !self.armed || !self.destination.is_batch() {
+            return;
+        }
+
+        if let Err(error) = send_raw_message(
+            &self.message_tx,
+            OutgoingMessage::AbandonedBatchResponse {
+                id: self.id.clone(),
+                method: self.method.clone(),
+                destination: self.destination.clone(),
+            },
+        ) {
+            tracing::debug!(
+                id = ?self.id,
+                method = %self.method,
+                ?error,
+                "could not complete abandoned JSON-RPC batch response slot"
+            );
+        }
+    }
 }
 
 impl<T: JsonRpcResponse> std::fmt::Debug for Responder<T> {
@@ -2609,14 +3757,24 @@ impl Responder<serde_json::Value> {
         method: String,
         id: RequestId,
         cancellation_registry: &RequestCancellationRegistry,
+        destination: ResponseDestination,
     ) -> Self {
         let id_clone = id.clone();
         let method_clone = method.clone();
         let cancellation = cancellation_registry.register(&id);
+        let send_destination = destination.clone();
+        let drop_guard = ResponderDropGuard {
+            message_tx: message_tx.clone(),
+            id: id.clone(),
+            method: method.clone(),
+            destination: destination.clone(),
+            armed: true,
+        };
         Self {
             method,
             id,
             cancellation,
+            destination,
             send_fn: Box::new(move |response: Result<serde_json::Value, crate::Error>| {
                 send_raw_message(
                     &message_tx,
@@ -2624,9 +3782,11 @@ impl Responder<serde_json::Value> {
                         id: id_clone,
                         method: method_clone,
                         response,
+                        destination: send_destination,
                     },
                 )
             }),
+            drop_guard,
         }
     }
 
@@ -2648,10 +3808,10 @@ impl<T: JsonRpcResponse> Responder<T> {
         &self.method
     }
 
-    /// ID of the incoming request/response as a JSON value
+    /// ID of the incoming request.
     #[must_use]
-    pub fn id(&self) -> serde_json::Value {
-        crate::util::id_to_json(&self.id)
+    pub fn id(&self) -> &RequestId {
+        &self.id
     }
 
     /// Returns the cancellation marker for this request.
@@ -2675,12 +3835,15 @@ impl<T: JsonRpcResponse> Responder<T> {
     }
 
     /// Return a new Responder with a different method name.
-    pub fn wrap_method(self, method: String) -> Responder<T> {
+    pub fn wrap_method(mut self, method: String) -> Responder<T> {
+        self.drop_guard.method.clone_from(&method);
         Responder {
             method,
             id: self.id,
             cancellation: self.cancellation,
+            destination: self.destination,
             send_fn: self.send_fn,
+            drop_guard: self.drop_guard,
         }
     }
 
@@ -2697,19 +3860,22 @@ impl<T: JsonRpcResponse> Responder<T> {
             method: self.method,
             id: self.id,
             cancellation: self.cancellation,
+            destination: self.destination,
             send_fn: Box::new(move |input: Result<U, crate::Error>| {
                 let t_value = wrap_fn(&method, input);
                 (self.send_fn)(t_value)
             }),
+            drop_guard: self.drop_guard,
         }
     }
 
     /// Respond to the JSON-RPC request with either a value (`Ok`) or an error (`Err`).
     pub fn respond_with_result(
-        self,
+        mut self,
         response: Result<T, crate::Error>,
     ) -> Result<(), crate::Error> {
         tracing::debug!(id = ?self.id, "respond called");
+        self.drop_guard.disarm();
         (self.send_fn)(response)
     }
 
@@ -2728,6 +3894,14 @@ impl<T: JsonRpcResponse> Responder<T> {
         tracing::debug!(id = ?self.id, ?error, "respond_with_error called");
         self.respond_with_result(Err(error))
     }
+
+    fn reply_target(&self) -> RequestReplyTarget {
+        RequestReplyTarget {
+            id: self.id.clone(),
+            method: self.method.clone(),
+            destination: self.destination.clone(),
+        }
+    }
 }
 
 /// Context for handling an incoming JSON-RPC response.
@@ -2741,7 +3915,7 @@ impl<T: JsonRpcResponse> Responder<T> {
 ///
 /// # Drop Behavior
 ///
-/// Dropping a `ResponseRouter` without responding (for example, from a
+/// Dropping a `ResponseRouter` without routing the response (for example, from a
 /// dispatch handler that claims a [`Dispatch::Response`]) discards the
 /// response: the local awaiter observes the response as never received. The
 /// request still counts as settled: routing a response this far disarms the
@@ -2761,6 +3935,9 @@ pub struct ResponseRouter<T: JsonRpcResponse = serde_json::Value> {
 
     /// Function to send the response to the waiting task.
     send_fn: Box<dyn FnOnce(Result<T, crate::Error>) -> Result<(), crate::Error> + Send>,
+
+    /// Shared route used to deliver a dispatch-handler error to the same waiter.
+    reply_target: ResponseReplyTarget,
 }
 
 impl<T: JsonRpcResponse> std::fmt::Debug for ResponseRouter<T> {
@@ -2776,18 +3953,26 @@ impl<T: JsonRpcResponse> std::fmt::Debug for ResponseRouter<T> {
 impl ResponseRouter<serde_json::Value> {
     /// Create a new response context for routing a response to a local awaiter.
     ///
-    /// When `respond_with_result` is called, the response is sent through the oneshot
+    /// When [`route_with_result`](Self::route_with_result) is called, the response is sent through the oneshot
     /// channel to the code that originally sent the request. If that receiver was
     /// dropped, the response is discarded because there is no local awaiter left.
-    pub(crate) fn new(
+    fn new(
         method: String,
         id: RequestId,
         role_id: RoleId,
         sender: oneshot::Sender<ResponsePayload>,
         cancellation_disarm: SentRequestCancellationDisarm,
+        ordering: ResponseOrdering,
+        dispatch: ResponseDispatch,
     ) -> Self {
-        let response_method = method.clone();
-        let response_id = id.clone();
+        let reply_target = ResponseReplyTarget {
+            id: id.clone(),
+            method: method.clone(),
+            sender: Arc::new(Mutex::new(Some(sender))),
+            ordering,
+            dispatch,
+        };
+        let send_target = reply_target.clone();
         // A response for the request reached this router, so the request is
         // settled from the peer's perspective and a `$/cancel_request` could
         // only ever be redundant. Disarm immediately so handlers may retain
@@ -2798,21 +3983,10 @@ impl ResponseRouter<serde_json::Value> {
             id,
             role_id,
             send_fn: Box::new(move |response: Result<serde_json::Value, crate::Error>| {
-                if sender
-                    .send(ResponsePayload {
-                        result: response,
-                        ack_tx: None,
-                    })
-                    .is_err()
-                {
-                    tracing::debug!(
-                        method = %response_method,
-                        id = ?response_id,
-                        "dropped response because local receiver was gone"
-                    );
-                }
+                send_target.route(response);
                 Ok(())
             }),
+            reply_target,
         }
     }
 
@@ -2834,10 +4008,10 @@ impl<T: JsonRpcResponse> ResponseRouter<T> {
         &self.method
     }
 
-    /// ID of the original request as a JSON value
+    /// ID of the original request.
     #[must_use]
-    pub fn id(&self) -> serde_json::Value {
-        crate::util::id_to_json(&self.id)
+    pub fn id(&self) -> &RequestId {
+        &self.id
     }
 
     /// The peer to which the original request was sent.
@@ -2872,32 +4046,30 @@ impl<T: JsonRpcResponse> ResponseRouter<T> {
                 let t_value = wrap_fn(&method, input);
                 (self.send_fn)(t_value)
             }),
+            reply_target: self.reply_target,
         }
     }
 
-    /// Complete the response by sending the result to the waiting task.
-    pub fn respond_with_result(
-        self,
-        response: Result<T, crate::Error>,
-    ) -> Result<(), crate::Error> {
+    /// Route the response result to the waiting task.
+    pub fn route_with_result(self, response: Result<T, crate::Error>) -> Result<(), crate::Error> {
         tracing::debug!(id = ?self.id, "response routed to awaiter");
         (self.send_fn)(response)
     }
 
-    /// Complete the response by sending a value to the waiting task.
-    pub fn respond(self, response: T) -> Result<(), crate::Error> {
-        self.respond_with_result(Ok(response))
+    /// Route a successful response value to the waiting task.
+    pub fn route(self, response: T) -> Result<(), crate::Error> {
+        self.route_with_result(Ok(response))
     }
 
-    /// Complete the response by sending an internal error to the waiting task.
-    pub fn respond_with_internal_error(self, message: impl ToString) -> Result<(), crate::Error> {
-        self.respond_with_error(crate::util::internal_error(message))
+    /// Route an internal error to the waiting task.
+    pub fn route_with_internal_error(self, message: impl ToString) -> Result<(), crate::Error> {
+        self.route_with_error(crate::util::internal_error(message))
     }
 
-    /// Complete the response by sending an error to the waiting task.
-    pub fn respond_with_error(self, error: crate::Error) -> Result<(), crate::Error> {
+    /// Route an error response to the waiting task.
+    pub fn route_with_error(self, error: crate::Error) -> Result<(), crate::Error> {
         tracing::debug!(id = ?self.id, ?error, "error routed to awaiter");
-        self.respond_with_result(Err(error))
+        self.route_with_result(Err(error))
     }
 }
 
@@ -2935,8 +4107,7 @@ pub trait JsonRpcMessage: 'static + Debug + Sized + Send + Clone {
 /// use agent_client_protocol::JsonRpcResponse;
 /// use serde::{Serialize, Deserialize};
 ///
-/// #[derive(Debug, Serialize, Deserialize, JsonRpcResponse)]
-/// #[response(method = "_hello")]
+/// #[derive(Debug, Clone, Serialize, Deserialize, JsonRpcResponse)]
 /// struct HelloResponse {
 ///     greeting: String,
 /// }
@@ -2993,7 +4164,7 @@ pub trait JsonRpcNotification: JsonRpcMessage {}
 ///     name: String,
 /// }
 ///
-/// #[derive(Debug, Serialize, Deserialize, JsonRpcResponse)]
+/// #[derive(Debug, Clone, Serialize, Deserialize, JsonRpcResponse)]
 /// struct HelloResponse {
 ///     greeting: String,
 /// }
@@ -3003,14 +4174,16 @@ pub trait JsonRpcRequest: JsonRpcMessage {
     type Response: JsonRpcResponse;
 }
 
-/// An enum capturing an in-flight request or notification.
-/// In the case of a request, also includes the context used to respond to the request.
+/// An incoming request, notification, or response being dispatched through handlers.
+/// Requests include the context used to answer them; responses include the context
+/// used to route them to the local requester.
 ///
 /// Type parameters allow specifying the concrete request and notification types.
 /// By default, both are `UntypedMessage` for dynamic dispatch.
 /// The request context's response type matches the request's response type.
 #[derive(Debug)]
-pub enum Dispatch<Req: JsonRpcRequest = UntypedMessage, Notif: JsonRpcMessage = UntypedMessage> {
+pub enum Dispatch<Req: JsonRpcRequest = UntypedMessage, Notif: JsonRpcNotification = UntypedMessage>
+{
     /// Incoming request and the context where the response should be sent.
     Request(Req, Responder<Req::Response>),
 
@@ -3028,7 +4201,7 @@ pub enum Dispatch<Req: JsonRpcRequest = UntypedMessage, Notif: JsonRpcMessage = 
     ),
 }
 
-impl<Req: JsonRpcRequest, Notif: JsonRpcMessage> Dispatch<Req, Notif> {
+impl<Req: JsonRpcRequest, Notif: JsonRpcNotification> Dispatch<Req, Notif> {
     /// Map the request and notification types to new types.
     ///
     /// Note: Response variants are passed through unchanged since they don't
@@ -3040,7 +4213,7 @@ impl<Req: JsonRpcRequest, Notif: JsonRpcMessage> Dispatch<Req, Notif> {
     ) -> Dispatch<Req1, Notif1>
     where
         Req1: JsonRpcRequest<Response = Req::Response>,
-        Notif1: JsonRpcMessage,
+        Notif1: JsonRpcNotification,
     {
         match self {
             Dispatch::Request(request, responder) => {
@@ -3052,46 +4225,6 @@ impl<Req: JsonRpcRequest, Notif: JsonRpcMessage> Dispatch<Req, Notif> {
                 Dispatch::Notification(new_notification)
             }
             Dispatch::Response(result, router) => Dispatch::Response(result, router),
-        }
-    }
-
-    /// Respond to the message with an error.
-    ///
-    /// If this message is a request, this error becomes the reply to the request.
-    ///
-    /// If this message is a notification, the error is sent as a notification.
-    ///
-    /// If this message is a response, the error is forwarded to the waiting handler.
-    pub fn respond_with_error<R: Role>(
-        self,
-        error: crate::Error,
-        cx: ConnectionTo<R>,
-    ) -> Result<(), crate::Error> {
-        match self {
-            Dispatch::Request(_, responder) => responder.respond_with_error(error),
-            Dispatch::Notification(_) => cx.send_error_notification(error),
-            Dispatch::Response(_, responder) => responder.respond_with_error(error),
-        }
-    }
-
-    /// Convert to a `Responder` that expects a JSON value
-    /// and which checks (dynamically) that the JSON value it receives
-    /// can be converted to `T`.
-    ///
-    /// Note: Response variants cannot be erased since their payload is already
-    /// parsed. This returns an error for Response variants.
-    pub fn erase_to_json(self) -> Result<Dispatch, crate::Error> {
-        match self {
-            Dispatch::Request(response, responder) => Ok(Dispatch::Request(
-                response.to_untyped_message()?,
-                responder.erase_to_json(),
-            )),
-            Dispatch::Notification(notification) => {
-                Ok(Dispatch::Notification(notification.to_untyped_message()?))
-            }
-            Dispatch::Response(_, _) => Err(crate::util::internal_error(
-                "cannot erase Response variant to JSON",
-            )),
         }
     }
 
@@ -3128,11 +4261,23 @@ impl<Req: JsonRpcRequest, Notif: JsonRpcMessage> Dispatch<Req, Notif> {
     }
 
     /// Returns the request ID if this is a request or response, None if notification.
-    pub fn id(&self) -> Option<serde_json::Value> {
+    pub fn id(&self) -> Option<&RequestId> {
         match self {
             Dispatch::Request(_, cx) => Some(cx.id()),
             Dispatch::Notification(_) => None,
             Dispatch::Response(_, cx) => Some(cx.id()),
+        }
+    }
+
+    fn handler_error_target(&self) -> Option<HandlerErrorTarget> {
+        match self {
+            Dispatch::Request(_, responder) => {
+                Some(HandlerErrorTarget::Request(responder.reply_target()))
+            }
+            Dispatch::Notification(_) => None,
+            Dispatch::Response(_, router) => {
+                Some(HandlerErrorTarget::Response(router.reply_target.clone()))
+            }
         }
     }
 
@@ -3154,9 +4299,9 @@ impl Dispatch {
     ///
     /// # Returns
     ///
-    /// * `Ok(Ok(typed))` if this is a request/notification of the given types
-    /// * `Ok(Err(self))` if not
-    /// * `Err` if has the correct method for the given types but parsing fails
+    /// * `Ok(Ok(typed))` if this dispatch matches the requested type for its variant
+    /// * `Ok(Err(self))` if it does not match the requested type for its variant
+    /// * `Err` if its method matches the requested type but parsing fails
     #[tracing::instrument(skip(self), fields(Request = ?std::any::type_name::<Req>(), Notif = ?std::any::type_name::<Notif>()), level = "trace", ret)]
     pub(crate) fn into_typed_dispatch<Req: JsonRpcRequest, Notif: JsonRpcNotification>(
         self,
@@ -3268,9 +4413,9 @@ impl Dispatch {
     ///
     /// # Returns
     ///
-    /// * `Ok(Ok(typed))` if this is a request/notification of the given types
-    /// * `Ok(Err(self))` if not
-    /// * `Err` if has the correct method for the given types but parsing fails
+    /// * `Ok(Ok(typed))` if this is a notification of the requested type
+    /// * `Ok(Err(self))` if this is not a matching notification
+    /// * `Err` if its method matches the requested type but parsing fails
     pub fn into_notification<N: JsonRpcNotification>(
         self,
     ) -> Result<Result<N, Dispatch>, crate::Error> {
@@ -3292,9 +4437,9 @@ impl Dispatch {
     ///
     /// # Returns
     ///
-    /// * `Ok(Ok(typed))` if this is a request/notification of the given types
-    /// * `Ok(Err(self))` if not
-    /// * `Err` if has the correct method for the given types but parsing fails
+    /// * `Ok(Ok(typed))` if this is a request of the requested type
+    /// * `Ok(Err(self))` if this is not a matching request
+    /// * `Err` if its method matches the requested type but parsing fails
     pub fn into_request<Req: JsonRpcRequest>(
         self,
     ) -> Result<Result<(Req, Responder<Req::Response>), Dispatch>, crate::Error> {
@@ -3418,19 +4563,21 @@ impl JsonRpcNotification for UntypedMessage {}
 
 /// Represents a pending response of type `R` from an outgoing request.
 ///
-/// Returned by [`ConnectionTo::send_request`], this type provides methods for handling
-/// the response without blocking the event loop. The API is intentionally designed to make
-/// it difficult to accidentally block.
+/// Returned by [`ConnectionTo::send_request`], this type provides explicit response-consumption
+/// modes. The API is intentionally designed to make it difficult to accidentally wait for a
+/// response inside the dispatch loop.
 ///
 /// # Anti-Footgun Design
 ///
 /// You cannot directly `.await` a `SentRequest`. Instead, you must choose how to handle
 /// the response:
 ///
-/// ## Option 1: Schedule a Callback (Safe in Handlers)
+/// ## Option 1: Register an Ordered Callback (Safe in Handlers)
 ///
-/// Use [`on_receiving_result`](Self::on_receiving_result) to schedule a task
-/// that runs when the response arrives. This doesn't block the event loop:
+/// Calling [`on_receiving_result`](Self::on_receiving_result) registers the callback and returns
+/// immediately. When ordered consumption is selected before the response is routed during its
+/// original dispatch, the loop waits for the callback to complete before processing the next
+/// message:
 ///
 /// ```no_run
 /// # use agent_client_protocol_test::*;
@@ -3452,10 +4599,11 @@ impl JsonRpcNotification for UntypedMessage {}
 /// # }
 /// ```
 ///
-/// ## Option 2: Block in a Spawned Task (Safe Only in `spawn`)
+/// ## Option 2: Wait Outside the Dispatch Loop
 ///
-/// Use [`block_task`](Self::block_task) to block until the response arrives, but **only**
-/// in a spawned task (never in a handler):
+/// Use [`block_task`](Self::block_task) only when the current task already runs outside the
+/// dispatch loop—for example, in the foreground future passed to `connect_with` or in a task
+/// created with [`ConnectionTo::spawn`]. Never await it in a handler:
 ///
 /// ```no_run
 /// # use agent_client_protocol_test::*;
@@ -3504,6 +4652,15 @@ impl JsonRpcNotification for UntypedMessage {}
 /// the request, then discards the response when it arrives. Requests whose
 /// eventual response should be ignored, but which should keep running on the
 /// peer, should use [`detach`](Self::detach) instead.
+///
+/// # Incoming Transport EOF
+///
+/// If the incoming transport reaches clean EOF before the response arrives, every
+/// consumption mode receives an error with the message `Incoming transport
+/// closed` and data containing
+/// `{"reason":"incoming_transport_closed","method":"..."}`. Requests made
+/// after incoming EOF fail immediately with the same error. Use
+/// [`is_incoming_transport_closed`] to identify it.
 #[must_use = "dropping a SentRequest asks the peer to cancel the request and \
               discards the response; consume it with `block_task`, \
               `on_receiving_result`, `forward_response_to`, or `detach`"]
@@ -3512,8 +4669,9 @@ pub struct SentRequest<T> {
     method: String,
     task_tx: TaskTx,
     response_rx: oneshot::Receiver<ResponsePayload>,
-    to_result: Box<dyn Fn(serde_json::Value) -> Result<T, crate::Error> + Send>,
+    to_result: Box<dyn FnOnce(serde_json::Value) -> Result<T, crate::Error> + Send>,
     cancellation: SentRequestCancellation,
+    response_ordering: ResponseOrdering,
     /// Cancellation markers of other (incoming) requests whose cancellation
     /// should be forwarded to this request. See
     /// [`forward_cancellation_from`](Self::forward_cancellation_from).
@@ -3668,6 +4826,7 @@ impl SentRequest<serde_json::Value> {
         task_tx: mpsc::UnboundedSender<Task>,
         response_rx: oneshot::Receiver<ResponsePayload>,
         cancellation: SentRequestCancellation,
+        response_ordering: ResponseOrdering,
     ) -> Self {
         Self {
             id,
@@ -3676,6 +4835,7 @@ impl SentRequest<serde_json::Value> {
             task_tx,
             to_result: Box::new(Ok),
             cancellation,
+            response_ordering,
             cancellation_sources: Vec::new(),
         }
     }
@@ -3761,11 +4921,11 @@ impl<T> SentRequest<T> {
     }
 }
 
-impl<T: JsonRpcResponse> SentRequest<T> {
+impl<T> SentRequest<T> {
     /// The id of the outgoing request.
     #[must_use]
-    pub fn id(&self) -> serde_json::Value {
-        crate::util::id_to_json(&self.id)
+    pub fn id(&self) -> &RequestId {
+        &self.id
     }
 
     /// The method of the request this is in response to.
@@ -3774,11 +4934,21 @@ impl<T: JsonRpcResponse> SentRequest<T> {
         &self.method
     }
 
-    /// Create a new response that maps the result of the response to a new type.
+    /// Map a successful JSON-RPC response into an application type.
+    ///
+    /// The mapped type does not need to implement [`JsonRpcResponse`]. The
+    /// mapper runs at most once and may consume captured state. JSON-RPC error
+    /// responses bypass the mapper. The mapped type may carry a non-`'static`
+    /// lifetime when it is consumed with [`block_task`](Self::block_task);
+    /// callback-style consumption still requires a `'static` mapped type
+    /// because its work is spawned onto the connection.
     pub fn map<U>(
         self,
-        map_fn: impl Fn(T) -> Result<U, crate::Error> + 'static + Send,
-    ) -> SentRequest<U> {
+        map_fn: impl FnOnce(T) -> Result<U, crate::Error> + 'static + Send,
+    ) -> SentRequest<U>
+    where
+        T: 'static,
+    {
         SentRequest {
             id: self.id,
             method: self.method,
@@ -3786,6 +4956,7 @@ impl<T: JsonRpcResponse> SentRequest<T> {
             task_tx: self.task_tx,
             to_result: Box::new(move |value| map_fn((self.to_result)(value)?)),
             cancellation: self.cancellation,
+            response_ordering: self.response_ordering,
             cancellation_sources: self.cancellation_sources,
         }
     }
@@ -3842,9 +5013,11 @@ impl<T: JsonRpcResponse> SentRequest<T> {
     /// This is equivalent to calling `on_receiving_result` and manually forwarding
     /// the result, with two proxy-specific additions:
     ///
-    /// - If the pending response is dropped without ever being delivered (for
-    ///   example, the downstream connection closed), the incoming request is
+    /// - If the pending response cannot be delivered, the incoming request is
     ///   answered with an internal error instead of being left unanswered.
+    ///   Known clean incoming EOF is delivered like any other response
+    ///   error; an unexpected response-channel loss is forwarded as an outer
+    ///   consumption error.
     /// - When the peer cancels the incoming request, the cancellation is
     ///   forwarded to the outgoing request, and the downstream response
     ///   (normal data or a cancellation error) is still forwarded back. This is
@@ -3853,14 +5026,13 @@ impl<T: JsonRpcResponse> SentRequest<T> {
     #[track_caller]
     pub fn forward_response_to(self, responder: Responder<T>) -> Result<(), crate::Error>
     where
-        T: Send,
+        T: JsonRpcResponse,
     {
         let this = self.forward_cancellation_from(responder.cancellation());
 
         this.consume_with(async move |response| {
-            // A response that was never delivered (outer `Err`, e.g. the
-            // downstream connection closed) is forwarded as an error: the
-            // incoming request must not be left unanswered.
+            // An unexpected response-channel loss (outer `Err`) is forwarded
+            // as an error: the incoming request must not be left unanswered.
             responder.respond_with_result(response.unwrap_or_else(Err))
         })
     }
@@ -3874,18 +5046,20 @@ impl<T: JsonRpcResponse> SentRequest<T> {
     /// the typed result (`Ok(Result<T, _>)`). The dispatch loop's ack, if any,
     /// is sent after `handle` completes.
     ///
-    /// If the pending response is dropped without ever being delivered (for
-    /// example, the connection closed), `handle` receives the outer `Err`
-    /// describing the loss; there is no ack in that case.
+    /// Clean incoming EOF is delivered as `Ok(Err(error))`, just like
+    /// a peer response error, so callback-style consumers still run. If the
+    /// response channel disappears for another reason, `handle` receives an
+    /// outer `Err` describing that unexpected loss; there is no ack then.
     #[track_caller]
     fn consume_with<F>(
         self,
         handle: impl FnOnce(Result<Result<T, crate::Error>, crate::Error>) -> F + 'static + Send,
     ) -> Result<(), crate::Error>
     where
+        T: 'static,
         F: Future<Output = Result<(), crate::Error>> + 'static + Send,
-        T: Send,
     {
+        self.response_ordering.mark_ordered();
         let task_tx = self.task_tx.clone();
         let method = self.method;
         let response_rx = self.response_rx;
@@ -3934,11 +5108,12 @@ impl<T: JsonRpcResponse> SentRequest<T> {
 
     /// Block the current task until the response is received.
     ///
-    /// **Warning:** This method blocks the current async task. It is **only safe** to use
-    /// in spawned tasks created with [`ConnectionTo::spawn`]. Using it directly in a
+    /// **Warning:** This method blocks the current async task. It is safe only when that task
+    /// already runs outside the dispatch loop, such as the foreground future passed to
+    /// `connect_with` or a task created with [`ConnectionTo::spawn`]. Using it directly in a
     /// handler callback will deadlock the connection.
     ///
-    /// # Safe Usage (in spawned tasks)
+    /// # Safe Usage (outside the dispatch loop)
     ///
     /// ```no_run
     /// # use agent_client_protocol_test::*;
@@ -3989,15 +5164,12 @@ impl<T: JsonRpcResponse> SentRequest<T> {
     /// # When to Use
     ///
     /// Use this method when:
-    /// - You're in a spawned task (via [`ConnectionTo::spawn`])
+    /// - Your current task already runs outside the dispatch loop
     /// - You need the response value to proceed with your logic
     /// - Linear control flow is more natural than callbacks
     ///
     /// For handler callbacks, use [`on_receiving_result`](Self::on_receiving_result) instead.
-    pub async fn block_task(self) -> Result<T, crate::Error>
-    where
-        T: Send,
-    {
+    pub async fn block_task(self) -> Result<T, crate::Error> {
         let response = await_response_forwarding_cancellation(
             self.response_rx,
             &self.cancellation,
@@ -4010,8 +5182,8 @@ impl<T: JsonRpcResponse> SentRequest<T> {
                 result: Ok(json_value),
                 ack_tx,
             }) => {
-                // Ack immediately - we're in a spawned task, so the dispatch loop
-                // can continue while we process the value.
+                // Blocking consumers ack before converting or returning the
+                // value, so dispatch can continue while the caller processes it.
                 if let Some(tx) = ack_tx {
                     let _ = tx.send(());
                 }
@@ -4076,9 +5248,12 @@ impl<T: JsonRpcResponse> SentRequest<T> {
     ///
     /// # Ordering
     ///
-    /// Like [`on_receiving_result`](Self::on_receiving_result), the callback blocks the
-    /// dispatch loop until it completes. See the [`ordering`](crate::concepts::ordering) module
-    /// for details.
+    /// Like [`on_receiving_result`](Self::on_receiving_result), response handling holds the
+    /// dispatch loop through callback completion when ordered consumption is selected before a
+    /// peer response is routed during its original dispatch. Pending-request failures delivered
+    /// without an incoming response and delayed routes do not carry that barrier. The callback
+    /// must not await later inbound traffic on the same connection. See the
+    /// [`ordering`](crate::concepts::ordering) module for details.
     ///
     /// # When to Use
     ///
@@ -4096,7 +5271,7 @@ impl<T: JsonRpcResponse> SentRequest<T> {
     ) -> Result<(), crate::Error>
     where
         F: Future<Output = Result<(), crate::Error>> + 'static + Send,
-        T: Send,
+        T: JsonRpcResponse,
     {
         self.on_receiving_result(async move |result| match result {
             Ok(value) => task(value, responder).await,
@@ -4104,10 +5279,12 @@ impl<T: JsonRpcResponse> SentRequest<T> {
         })
     }
 
-    /// Schedule an async task to run when the response is received.
+    /// Register an async callback to run when the response is received.
     ///
-    /// This is the recommended way to handle responses in handler callbacks, as it doesn't
-    /// block the event loop. The task will be spawned automatically when the response arrives.
+    /// This is the recommended way to select response handling from inside a handler because
+    /// registration returns immediately. The response-consumption task waits concurrently for
+    /// the response; once the response is dispatched, the ordered callback may hold the dispatch
+    /// loop until it completes.
     ///
     /// # Example: Handle response in callback
     ///
@@ -4136,7 +5313,7 @@ impl<T: JsonRpcResponse> SentRequest<T> {
     ///             }
     ///         })?;
     ///
-    ///     // Handler continues immediately without waiting
+    ///     // Handler continues immediately after registering the callback
     ///     responder.respond(MyResponse { status: "processing".into() })
     /// }, agent_client_protocol::on_receive_request!())
     /// # .connect_to(agent_client_protocol_test::MockTransport).await?;
@@ -4146,12 +5323,22 @@ impl<T: JsonRpcResponse> SentRequest<T> {
     ///
     /// # Ordering
     ///
-    /// The callback runs as a spawned task, but the dispatch loop waits for it to complete
-    /// before processing the next message. This gives you ordering guarantees: no other
-    /// messages will be processed while your callback runs.
+    /// When ordered consumption is selected before a peer response is routed during its original
+    /// dispatch, the callback runs in a connection-managed task and the dispatch loop waits for
+    /// it to complete before processing the next message.
     ///
-    /// This differs from [`block_task`](Self::block_task), which signals completion immediately
-    /// upon receiving the response (before your code processes it).
+    /// The barrier does not apply when the pending request is failed without an incoming response,
+    /// such as on EOF. If the response was already routed, or an interceptor routes a retained
+    /// [`ResponseRouter`] after its original dispatch, the callback still runs but cannot
+    /// retroactively block messages that were already released.
+    ///
+    /// While the barrier is held, the callback must not await a later response, notification, or
+    /// other inbound traffic on the same connection: that traffic cannot be dispatched until the
+    /// callback completes. Spawn follow-up work with [`ConnectionTo::spawn`] and return, or use
+    /// [`block_task`](Self::block_task) from a task already outside the dispatch loop.
+    ///
+    /// This differs from [`block_task`](Self::block_task), which does not select ordered
+    /// consumption: dispatch remains free while the caller processes the delivered response.
     ///
     /// See the [`ordering`](crate::concepts::ordering) module for details on ordering guarantees
     /// and how to avoid deadlocks.
@@ -4164,28 +5351,28 @@ impl<T: JsonRpcResponse> SentRequest<T> {
     /// # When to Use
     ///
     /// Use this method when:
-    /// - You're in a handler callback (not a spawned task)
-    /// - You want ordering guarantees (no other messages processed during your callback)
-    /// - You need to do async work before "releasing" control back to the dispatch loop
+    /// - You need to register response handling from a handler callback
+    /// - You want a peer response callback to complete before later messages are dispatched
+    /// - The callback performs bounded work that does not depend on later inbound traffic
     ///
-    /// For spawned tasks where you don't need ordering guarantees, consider [`block_task`](Self::block_task).
+    /// When already outside the dispatch loop and you do not need ordering guarantees, consider
+    /// [`block_task`](Self::block_task).
     #[track_caller]
     pub fn on_receiving_result<F>(
         self,
         task: impl FnOnce(Result<T, crate::Error>) -> F + 'static + Send,
     ) -> Result<(), crate::Error>
     where
+        T: 'static,
         F: Future<Output = Result<(), crate::Error>> + 'static + Send,
-        T: Send,
     {
-        self.consume_with(async move |response| {
-            match response {
-                // Run the user's callback on the peer's result.
-                Ok(result) => task(result).await,
-                // A response that was never delivered fails the consuming
-                // task instead of invoking the callback.
-                Err(err) => Err(err),
-            }
+        self.consume_with(move |response| match response {
+            // Invoke the callback before constructing its future so the
+            // response value does not need to be `Send` across an await.
+            Ok(result) => Either::Left(task(result)),
+            // A response that was never delivered fails the consuming
+            // task instead of invoking the callback.
+            Err(err) => Either::Right(future::ready(Err(err))),
         })
     }
 }
@@ -4199,6 +5386,10 @@ impl<T: JsonRpcResponse> SentRequest<T> {
 /// `Lines` implements the [`ConnectTo`] trait for any pair of line-based streams
 /// (a `Stream<Item = io::Result<String>>` for incoming and a `Sink<String>` for outgoing),
 /// handling serialization of JSON-RPC messages to/from newline-delimited JSON.
+/// An incoming line may contain one JSON-RPC message or a non-empty batch array. Batch
+/// entries are dispatched individually in source order, and responses to the batch are
+/// collected into one response-array line. SDK-initiated requests and notifications remain
+/// individual messages.
 ///
 /// This is a lower-level primitive than [`ByteStreams`] that enables interception and
 /// transformation of individual lines before they are parsed or after they are serialized.
@@ -4218,10 +5409,8 @@ impl<T: JsonRpcResponse> SentRequest<T> {
 /// [`ConnectTo`]: crate::ConnectTo
 #[derive(Debug)]
 pub struct Lines<OutgoingSink, IncomingStream> {
-    /// Outgoing line sink (where we write serialized JSON-RPC messages)
-    pub outgoing: OutgoingSink,
-    /// Incoming line stream (where we read and parse JSON-RPC messages)
-    pub incoming: IncomingStream,
+    outgoing: OutgoingSink,
+    incoming: IncomingStream,
 }
 
 impl<OutgoingSink, IncomingStream> Lines<OutgoingSink, IncomingStream>
@@ -4233,6 +5422,21 @@ where
     pub fn new(outgoing: OutgoingSink, incoming: IncomingStream) -> Self {
         Self { outgoing, incoming }
     }
+
+    fn into_channel_transport(self) -> (Channel, BoxFuture<'static, Result<(), crate::Error>>) {
+        let Self { outgoing, incoming } = self;
+        let (channel_for_caller, channel_for_lines) = Channel::duplex();
+
+        let server_future = Box::pin(async move {
+            let Channel { rx, tx } = channel_for_lines;
+            let outgoing_future = transport_actor::transport_outgoing_lines_actor(rx, outgoing);
+            let incoming_future = transport_actor::transport_incoming_lines_actor(incoming, tx);
+            futures::try_join!(outgoing_future, incoming_future)?;
+            Ok(())
+        });
+
+        (channel_for_caller, server_future)
+    }
 }
 
 impl<OutgoingSink, IncomingStream, R: Role> ConnectTo<R> for Lines<OutgoingSink, IncomingStream>
@@ -4241,33 +5445,67 @@ where
     IncomingStream: futures::Stream<Item = std::io::Result<String>> + Send + 'static,
 {
     async fn connect_to(self, client: impl ConnectTo<R::Counterpart>) -> Result<(), crate::Error> {
-        let (channel, serve_self) = ConnectTo::<R>::into_channel_and_future(self);
-        match futures::future::select(Box::pin(client.connect_to(channel)), serve_self).await {
-            Either::Left((result, _)) | Either::Right((result, _)) => result,
+        let Self { outgoing, incoming } = self;
+        let (Channel { rx, tx }, client_channel) = Channel::duplex();
+        let close_client_output = client_channel.tx.clone();
+        let client_future = Box::pin(async move {
+            let result = client.connect_to(client_channel).await;
+            close_client_output.close_channel();
+            result
+        });
+
+        // Once the client completes successfully, its incoming channel is
+        // gone. Keep consuming successful messages from the physical read
+        // half without forwarding them so a full-duplex peer cannot block our
+        // outgoing sink while it is being drained. Transport errors must still
+        // fail the connection.
+        let discard_incoming = Arc::new(AtomicBool::new(false));
+        let incoming = incoming.filter_map({
+            let discard_incoming = discard_incoming.clone();
+            move |item| {
+                let discard_incoming = discard_incoming.load(Ordering::Acquire);
+                future::ready((!discard_incoming || item.is_err()).then_some(item))
+            }
+        });
+
+        let outgoing = transport_actor::transport_outgoing_lines_actor(rx, outgoing)
+            .boxed()
+            .shared();
+        let serve_self = Box::pin({
+            let outgoing = outgoing.clone();
+            async move {
+                futures::try_join!(
+                    outgoing,
+                    transport_actor::transport_incoming_lines_actor(incoming, tx),
+                )?;
+                Ok(())
+            }
+        });
+
+        match futures::future::select(client_future, serve_self).await {
+            Either::Left((result, serve_self)) => {
+                result?;
+                discard_incoming.store(true, Ordering::Release);
+
+                // Drive the read half while waiting for the write half, but do
+                // not require the peer's independent incoming stream to reach
+                // EOF. If incoming processing finishes successfully first,
+                // the shared outgoing future still owns and drains the sink.
+                // A successful `serve_self` result includes its shared
+                // outgoing clone, while any error must remain authoritative
+                // instead of being hidden behind the other handle. Poll it
+                // first so a ready read error wins over clean outgoing
+                // completion.
+                match future::select(serve_self, outgoing).await {
+                    Either::Left((result, _)) | Either::Right((result, _)) => result,
+                }
+            }
+            Either::Right((result, _)) => result,
         }
     }
 
     fn into_channel_and_future(self) -> (Channel, BoxFuture<'static, Result<(), crate::Error>>) {
-        let Self { outgoing, incoming } = self;
-
-        // Create a channel pair for the client to use
-        let (channel_for_caller, channel_for_lines) = Channel::duplex();
-
-        // Create the server future that runs the line stream actors
-        let server_future = Box::pin(async move {
-            let Channel { rx, tx } = channel_for_lines;
-
-            // Run both actors concurrently
-            let outgoing_future = transport_actor::transport_outgoing_lines_actor(rx, outgoing);
-            let incoming_future = transport_actor::transport_incoming_lines_actor(incoming, tx);
-
-            // Wait for both to complete
-            futures::try_join!(outgoing_future, incoming_future)?;
-
-            Ok(())
-        });
-
-        (channel_for_caller, server_future)
+        self.into_channel_transport()
     }
 }
 
@@ -4311,10 +5549,8 @@ where
 /// [`ConnectTo`]: crate::ConnectTo
 #[derive(Debug)]
 pub struct ByteStreams<OB, IB> {
-    /// Outgoing byte stream (where we write serialized messages)
-    pub outgoing: OB,
-    /// Incoming byte stream (where we read and parse messages)
-    pub incoming: IB,
+    outgoing: OB,
+    incoming: IB,
 }
 
 impl<OB, IB> ByteStreams<OB, IB>
@@ -4326,6 +5562,38 @@ where
     pub fn new(outgoing: OB, incoming: IB) -> Self {
         Self { outgoing, incoming }
     }
+
+    fn into_lines(
+        self,
+    ) -> Lines<
+        impl futures::Sink<String, Error = std::io::Error> + Send + 'static,
+        impl futures::Stream<Item = std::io::Result<String>> + Send + 'static,
+    > {
+        use futures::AsyncBufReadExt;
+        use futures::io::BufReader;
+        let Self { outgoing, incoming } = self;
+
+        let incoming_lines = Box::pin(BufReader::new(incoming).lines());
+        let outgoing_lines =
+            futures::sink::unfold(Box::pin(outgoing), async move |mut writer, line: String| {
+                write_line(&mut writer, line).await?;
+                Ok::<_, std::io::Error>(writer)
+            });
+
+        Lines::new(outgoing_lines, incoming_lines)
+    }
+}
+
+pub(crate) async fn write_line<W>(writer: &mut W, line: String) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    use futures::AsyncWriteExt as _;
+
+    let mut bytes = line.into_bytes();
+    bytes.push(b'\n');
+    writer.write_all(&bytes).await?;
+    writer.flush().await
 }
 
 impl<OB, IB, R: Role> ConnectTo<R> for ByteStreams<OB, IB>
@@ -4334,54 +5602,29 @@ where
     IB: AsyncRead + Send + 'static,
 {
     async fn connect_to(self, client: impl ConnectTo<R::Counterpart>) -> Result<(), crate::Error> {
-        let (channel, serve_self) = ConnectTo::<R>::into_channel_and_future(self);
-        match futures::future::select(pin!(client.connect_to(channel)), serve_self).await {
-            Either::Left((result, _)) | Either::Right((result, _)) => result,
-        }
+        ConnectTo::<R>::connect_to(self.into_lines(), client).await
     }
 
     fn into_channel_and_future(self) -> (Channel, BoxFuture<'static, Result<(), crate::Error>>) {
-        use futures::AsyncBufReadExt;
-        use futures::AsyncWriteExt;
-        use futures::io::BufReader;
-        let Self { outgoing, incoming } = self;
-
-        // Convert byte streams to line streams
-        // Box both streams to satisfy Unpin requirements
-        let incoming_lines = Box::pin(BufReader::new(incoming).lines());
-
-        // Create a sink that writes lines (with newlines) to the outgoing byte stream
-        // We need to Box the writer since it may not be Unpin
-        let outgoing_sink =
-            futures::sink::unfold(Box::pin(outgoing), async move |mut writer, line: String| {
-                let mut bytes = line.into_bytes();
-                bytes.push(b'\n');
-                writer.write_all(&bytes).await?;
-                Ok::<_, std::io::Error>(writer)
-            });
-
-        // Delegate to Lines component
-        ConnectTo::<R>::into_channel_and_future(Lines::new(outgoing_sink, incoming_lines))
+        ConnectTo::<R>::into_channel_and_future(self.into_lines())
     }
 }
 
-/// A channel endpoint representing one side of a bidirectional message channel.
+/// A channel endpoint representing one side of a bidirectional JSON-RPC transport.
 ///
-/// `Channel` represents a single endpoint's view of a bidirectional communication channel.
-/// Each endpoint has:
-/// - `rx`: A receiver for incoming messages (or errors) from the counterpart
-/// - `tx`: A sender for outgoing messages (or errors) to the counterpart
+/// A channel carries complete TransportFrame values, preserving batch boundaries
+/// across in-process components and transport adapters. Malformed wire input is an
+/// explicit frame; failures while driving a physical transport are returned by that
+/// transport's future.
 ///
 /// # Example
 ///
 /// ```no_run
 /// # use agent_client_protocol::UntypedRole;
-/// # use agent_client_protocol::{Channel, Builder};
+/// # use agent_client_protocol::Channel;
 /// # async fn example() -> Result<(), agent_client_protocol::Error> {
-/// // Create a pair of connected channels
-/// let (channel_a, channel_b) = Channel::duplex();
+/// let (channel_a, _channel_b) = Channel::duplex();
 ///
-/// // Each channel can be used by a different component
 /// UntypedRole.builder()
 ///     .name("connection-a")
 ///     .connect_to(channel_a)
@@ -4391,69 +5634,104 @@ where
 /// ```
 #[derive(Debug)]
 pub struct Channel {
-    /// Receives messages (or errors) from the counterpart.
-    pub rx: mpsc::UnboundedReceiver<Result<RawJsonRpcMessage, crate::Error>>,
-    /// Sends messages (or errors) to the counterpart.
-    pub tx: mpsc::UnboundedSender<Result<RawJsonRpcMessage, crate::Error>>,
+    /// Receives frames from the counterpart.
+    pub rx: mpsc::UnboundedReceiver<TransportFrame>,
+    /// Sends frames to the counterpart.
+    pub tx: mpsc::UnboundedSender<TransportFrame>,
 }
 
 impl Channel {
     /// Create a pair of connected channel endpoints.
     ///
-    /// Returns two `Channel` instances that are connected to each other:
-    /// - Messages sent via `channel_a.tx` are received on `channel_b.rx`
-    /// - Messages sent via `channel_b.tx` are received on `channel_a.rx`
-    ///
-    /// # Returns
-    ///
-    /// A tuple `(channel_a, channel_b)` of connected channel endpoints.
+    /// Frames sent through either endpoint are received by the other endpoint.
     #[must_use]
     pub fn duplex() -> (Self, Self) {
-        // Create channels: A sends Result<Message> which B receives as Message
         let (a_tx, b_rx) = mpsc::unbounded();
         let (b_tx, a_rx) = mpsc::unbounded();
 
-        let channel_a = Self { rx: a_rx, tx: a_tx };
-        let channel_b = Self { rx: b_rx, tx: b_tx };
-
-        (channel_a, channel_b)
+        (Self { rx: a_rx, tx: a_tx }, Self { rx: b_rx, tx: b_tx })
     }
 
-    /// Copy messages from `rx` to `tx`.
+    /// Copy frames from `rx` to `tx` until the input closes.
     ///
-    /// # Returns
+    /// # Errors
     ///
-    /// A `Result` indicating success or failure.
-    pub async fn copy(mut self) -> Result<(), crate::Error> {
-        while let Some(msg) = self.rx.next().await {
+    /// Returns an error if the receiving endpoint closes before the input.
+    pub(crate) async fn copy(mut self) -> Result<(), crate::Error> {
+        while let Some(frame) = self.rx.next().await {
             self.tx
-                .unbounded_send(msg)
+                .unbounded_send(frame)
                 .map_err(crate::util::internal_error)?;
         }
+        Ok(())
+    }
+
+    /// Bridge two endpoints while inspecting every valid message.
+    ///
+    /// Observers are invoked in source order, including for each valid member of
+    /// a batch. The original frame is forwarded unchanged after inspection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an observer error or an error if a destination closes before its
+    /// source.
+    pub async fn bridge_with_inspection(
+        left: Self,
+        right: Self,
+        mut left_to_right: impl FnMut(&RawJsonRpcMessage) -> Result<(), crate::Error> + Send,
+        mut right_to_left: impl FnMut(&RawJsonRpcMessage) -> Result<(), crate::Error> + Send,
+    ) -> Result<(), crate::Error> {
+        let Self {
+            rx: mut left_rx,
+            tx: left_tx,
+        } = left;
+        let Self {
+            rx: mut right_rx,
+            tx: right_tx,
+        } = right;
+
+        let left_to_right = async move {
+            while let Some(frame) = left_rx.next().await {
+                frame.inspect_messages(&mut left_to_right)?;
+                right_tx
+                    .unbounded_send(frame)
+                    .map_err(crate::util::internal_error)?;
+            }
+            Ok::<(), crate::Error>(())
+        };
+        let right_to_left = async move {
+            while let Some(frame) = right_rx.next().await {
+                frame.inspect_messages(&mut right_to_left)?;
+                left_tx
+                    .unbounded_send(frame)
+                    .map_err(crate::util::internal_error)?;
+            }
+            Ok::<(), crate::Error>(())
+        };
+
+        futures::try_join!(left_to_right, right_to_left)?;
         Ok(())
     }
 }
 
 impl<R: Role> ConnectTo<R> for Channel {
     async fn connect_to(self, client: impl ConnectTo<R::Counterpart>) -> Result<(), crate::Error> {
-        let (client_channel, client_serve) = client.into_channel_and_future();
+        let (client_channel, client_future) = client.into_channel_and_future();
 
-        match futures::try_join!(
+        let ((), (), ()) = futures::try_join!(
             Channel {
                 rx: client_channel.rx,
-                tx: self.tx
+                tx: self.tx,
             }
             .copy(),
             Channel {
                 rx: self.rx,
-                tx: client_channel.tx
+                tx: client_channel.tx,
             }
             .copy(),
-            client_serve
-        ) {
-            Ok(((), (), ())) => Ok(()),
-            Err(err) => Err(err),
-        }
+            client_future,
+        )?;
+        Ok(())
     }
 
     fn into_channel_and_future(self) -> (Channel, BoxFuture<'static, Result<(), crate::Error>>) {
@@ -4464,6 +5742,86 @@ impl<R: Role> ConnectTo<R> for Channel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn connection_with_dynamic_handler_receiver() -> (
+        ConnectionTo<crate::role::UntypedRole>,
+        mpsc::UnboundedReceiver<DynamicHandlerMessage<crate::role::UntypedRole>>,
+    ) {
+        let (message_tx, _message_rx) = mpsc::unbounded();
+        let (task_tx, _task_rx) = mpsc::unbounded();
+        let (dynamic_handler_tx, dynamic_handler_rx) = mpsc::unbounded();
+        let transport_completion: SharedTransportCompletion =
+            future::ready(Ok::<(), crate::Error>(())).boxed().shared();
+        let pending_replies = PendingReplies::default();
+
+        (
+            ConnectionTo::new(
+                crate::role::UntypedRole,
+                message_tx,
+                task_tx,
+                dynamic_handler_tx,
+                transport_completion,
+                pending_replies.registrar(),
+            ),
+            dynamic_handler_rx,
+        )
+    }
+
+    fn next_dynamic_handler_message(
+        receiver: &mut mpsc::UnboundedReceiver<DynamicHandlerMessage<crate::role::UntypedRole>>,
+    ) -> Option<DynamicHandlerMessage<crate::role::UntypedRole>> {
+        futures::FutureExt::now_or_never(futures::StreamExt::next(receiver))
+            .expect("dynamic-handler receiver should be ready")
+    }
+
+    #[test]
+    fn dropping_dynamic_handler_guard_unregisters_handler() {
+        let (connection, mut receiver) = connection_with_dynamic_handler_receiver();
+        let guard = connection.add_dynamic_handler(NullHandler).unwrap();
+
+        let added_uuid = match next_dynamic_handler_message(&mut receiver) {
+            Some(DynamicHandlerMessage::AddDynamicHandler(uuid, _)) => uuid,
+            other => panic!("expected handler registration, got {other:?}"),
+        };
+
+        drop(guard);
+
+        match next_dynamic_handler_message(&mut receiver) {
+            Some(DynamicHandlerMessage::RemoveDynamicHandler(uuid)) => {
+                assert_eq!(uuid, added_uuid);
+            }
+            other => panic!("expected handler removal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detaching_dynamic_handler_guard_does_not_leak_connection() {
+        let (connection, mut receiver) = connection_with_dynamic_handler_receiver();
+        let guard = connection.add_dynamic_handler(NullHandler).unwrap();
+
+        assert!(matches!(
+            next_dynamic_handler_message(&mut receiver),
+            Some(DynamicHandlerMessage::AddDynamicHandler(_, _))
+        ));
+
+        drop(connection);
+        guard.detach();
+
+        assert!(
+            next_dynamic_handler_message(&mut receiver).is_none(),
+            "detach should retain the handler without retaining a connection sender"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_line_flushes_buffered_writers() {
+        let mut writer =
+            futures::io::BufWriter::with_capacity(4096, futures::io::Cursor::new(Vec::new()));
+
+        write_line(&mut writer, "message".into()).await.unwrap();
+
+        assert_eq!(writer.into_inner().into_inner(), b"message\n");
+    }
 
     #[test]
     fn peel_successor_envelopes_returns_plain_messages_unchanged() {

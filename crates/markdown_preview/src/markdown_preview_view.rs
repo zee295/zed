@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
+use editor::items::open_resolved_target;
 use editor::scroll::Autoscroll;
 use editor::{Editor, EditorEvent, MultiBufferOffset, SelectionEffects};
 use gpui::{
@@ -25,10 +26,15 @@ use settings::{SeedQuerySetting, Settings, update_settings_file};
 use theme::{SystemAppearance, Theme, ThemeRegistry};
 use theme_settings::ThemeSettings;
 use ui::utils::WithRemSize;
-use ui::{ContextMenu, WithScrollbar, prelude::*, right_click_menu};
-use util::markdown::split_local_url_fragment;
+use ui::{ContextMenu, LinkPreview, WithScrollbar, prelude::*, right_click_menu};
+use util::{
+    ResultExt,
+    markdown::{source_position_from_fragment, split_local_url_fragment},
+    paths::PathWithPosition,
+};
 use workspace::item::{Item, ItemBufferKind, ItemHandle, SaveOptions, SerializableItem};
-use workspace::notifications::NotifyResultExt;
+use workspace::notifications::{NotifyResultExt, NotifyTaskExt};
+use workspace::path_link::{PathMatching, resolve_open_target};
 use workspace::searchable::{
     Direction, SearchEvent, SearchOptions, SearchToken, SearchableItem, SearchableItemHandle,
 };
@@ -55,6 +61,7 @@ pub struct MarkdownPreviewView {
     image_cache: Entity<RetainAllImageCache>,
     base_directory: Option<PathBuf>,
     pending_update_task: Option<Task<Result<()>>>,
+    hovered_url: Option<SharedString>,
     mode: MarkdownPreviewMode,
 }
 
@@ -302,6 +309,7 @@ impl MarkdownPreviewView {
                 image_cache: RetainAllImageCache::new(cx),
                 base_directory: None,
                 pending_update_task: None,
+                hovered_url: None,
                 mode,
             };
 
@@ -449,6 +457,7 @@ impl MarkdownPreviewView {
         );
 
         self.base_directory = Self::get_folder_for_active_editor(editor.read(cx), cx);
+        self.hovered_url = None;
         self.active_editor = Some(EditorState {
             editor,
             _subscription: subscription,
@@ -560,6 +569,7 @@ impl MarkdownPreviewView {
 
             view.update(cx, move |view, cx| {
                 if let Some((contents, selection_start)) = update {
+                    view.hovered_url = None;
                     view.markdown.update(cx, |markdown, cx| {
                         markdown.reset(contents, cx);
                     });
@@ -636,15 +646,20 @@ impl MarkdownPreviewView {
 
     /// The absolute path of the file that is currently being previewed.
     fn get_folder_for_active_editor(editor: &Editor, cx: &App) -> Option<PathBuf> {
-        if let Some(file) = editor.file_at(MultiBufferOffset(0), cx) {
-            if let Some(file) = file.as_local() {
-                file.abs_path(cx).parent().map(|p| p.to_path_buf())
-            } else {
-                None
-            }
-        } else {
-            None
-        }
+        let file = editor.file_at(MultiBufferOffset(0), cx)?;
+        let absolute_path = editor
+            .project()
+            .and_then(|project| {
+                project.read(cx).absolute_path(
+                    &ProjectPath {
+                        worktree_id: file.worktree_id(cx),
+                        path: file.path().clone(),
+                    },
+                    cx,
+                )
+            })
+            .or_else(|| file.as_local().map(|file| file.abs_path(cx)))?;
+        absolute_path.parent().map(Path::to_path_buf)
     }
 
     fn line_scroll_amount(&self, cx: &App) -> Pixels {
@@ -929,6 +944,19 @@ impl MarkdownPreviewView {
                         cx,
                     );
                 }
+            })
+            .on_url_hover({
+                let view_handle = cx.entity().downgrade();
+                move |hovered_url, _window, cx| {
+                    view_handle
+                        .update(cx, |view, cx| {
+                            if view.hovered_url != hovered_url {
+                                view.hovered_url = hovered_url;
+                                cx.notify();
+                            }
+                        })
+                        .log_err();
+                }
             });
 
         if let Some(active_editor) = active_editor {
@@ -1049,6 +1077,7 @@ fn handle_url_click(
     } else {
         open_preview_url(
             SharedString::from(path_part.to_string()),
+            fragment.map(|fragment| SharedString::from(fragment.to_string())),
             base_directory,
             workspace,
             window,
@@ -1059,15 +1088,46 @@ fn handle_url_click(
 
 fn open_preview_url(
     url: SharedString,
+    fragment: Option<SharedString>,
     base_directory: Option<PathBuf>,
     workspace: &WeakEntity<Workspace>,
     window: &mut Window,
     cx: &mut App,
 ) {
-    let (path_text, _) = split_preview_url(url.as_ref());
+    let decoded_path = urlencoding::decode(&url).unwrap_or_else(|_| Cow::Borrowed(&url));
 
-    // URL-decode the path for proper handling of encoded characters
-    let decoded_path = urlencoding::decode(path_text).unwrap_or_else(|_| Cow::Borrowed(path_text));
+    // Only `://` URLs skip position handling (a scheme check would misclassify `main.rs:2`); ambiguous links like `tel:123` are tried as files first, then fall back to the URL handler.
+    let path_with_position = if !decoded_path.contains("://") {
+        if PathWithPosition::parse_str(&decoded_path).row.is_some() {
+            Some(decoded_path.to_string())
+        } else {
+            fragment
+                .as_deref()
+                .and_then(|fragment| fragment.strip_prefix('L'))
+                .and_then(source_position_from_fragment)
+                .map(|(row, column)| {
+                    if column == 0 {
+                        format!("{decoded_path}:{}", row + 1)
+                    } else {
+                        format!("{decoded_path}:{}:{}", row + 1, column + 1)
+                    }
+                })
+        }
+    } else {
+        None
+    };
+
+    if let Some(path_with_position) = path_with_position {
+        open_preview_path_with_position(
+            path_with_position,
+            decoded_path.into_owned(),
+            base_directory,
+            workspace,
+            window,
+            cx,
+        );
+        return;
+    }
 
     if let Some(workspace) = workspace.upgrade() {
         workspace.update(cx, |workspace, cx| {
@@ -1078,11 +1138,41 @@ fn open_preview_url(
     }
 }
 
-fn split_preview_url(url: &str) -> (&str, Option<&str>) {
-    match url.split_once('#') {
-        Some((path, fragment)) => (path, Some(fragment)),
-        None => (url, None),
-    }
+fn open_preview_path_with_position(
+    path_with_position: String,
+    fallback_path: String,
+    base_directory: Option<PathBuf>,
+    workspace: &WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let open_target = resolve_open_target(
+        workspace,
+        PathMatching::Exact,
+        &path_with_position,
+        base_directory.as_deref(),
+        cx,
+    );
+    let workspace = workspace.clone();
+    let workspace_for_error = workspace.clone();
+    let task = window.spawn(cx, async move |cx| {
+        let opened = if let Some(open_target) = open_target.await {
+            open_resolved_target(&workspace, &open_target, cx)
+                .await
+                .context("opening Markdown preview link")?
+        } else {
+            false
+        };
+
+        if !opened {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.open_url_or_file(&fallback_path, base_directory.as_deref(), window, cx);
+            })?;
+        }
+
+        anyhow::Ok(())
+    });
+    task.detach_and_notify_err(workspace_for_error, window, cx);
 }
 
 fn resolve_preview_image(
@@ -1284,11 +1374,17 @@ impl Render for MarkdownPreviewView {
             .map(|theme| theme.colors().editor_background)
             .unwrap_or_else(|| cx.theme().colors().editor_background);
         let preview_font_size = ThemeSettings::get_global(cx).markdown_preview_font_size(cx);
+        let hovered_url = self.hovered_url.clone();
         div()
             .image_cache(self.image_cache.clone())
             .id("MarkdownPreview")
             .key_context("MarkdownPreview")
             .track_focus(&self.focus_handle(cx))
+            .on_hover(cx.listener(|view, hovered, _window, cx| {
+                if !hovered && view.hovered_url.take().is_some() {
+                    cx.notify();
+                }
+            }))
             .on_action(cx.listener(MarkdownPreviewView::scroll_page_up))
             .on_action(cx.listener(MarkdownPreviewView::scroll_page_down))
             .on_action(cx.listener(MarkdownPreviewView::scroll_up))
@@ -1304,6 +1400,7 @@ impl Render for MarkdownPreviewView {
             .w_full()
             .flex_1()
             .min_h_0()
+            .relative()
             .bg(bg_color)
             .child(
                 WithRemSize::new(preview_font_size).size_full().child(
@@ -1381,6 +1478,17 @@ impl Render for MarkdownPreviewView {
                 ),
             )
             .vertical_scrollbar_for(&self.scroll_handle, window, cx)
+            .when_some(hovered_url, |this, hovered_url| {
+                this.child(
+                    div()
+                        .absolute()
+                        .bottom_2()
+                        .left_0()
+                        .max_w_full()
+                        .overflow_hidden()
+                        .child(LinkPreview::new(hovered_url.as_ref(), cx)),
+                )
+            })
     }
 }
 
@@ -1684,7 +1792,10 @@ mod tests {
     use crate::markdown_preview_view::resolve_preview_image;
     use buffer_diff::BufferDiff;
     use editor::Editor;
+    use fs::FakeFs;
     use gpui::{AppContext as _, Entity, Focusable as _, TestAppContext, WindowHandle};
+    use language::{Buffer, DiskState, Point};
+    use project::Project;
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -1697,7 +1808,7 @@ mod tests {
         AppState, ItemId, MultiWorkspace, SaveIntent, Workspace, WorkspaceId, open_paths,
     };
 
-    use super::MarkdownPreviewView;
+    use super::{MarkdownPreviewView, open_preview_url};
 
     #[test]
     fn resolves_workspace_absolute_preview_image_path_and_rejects_missing() {
@@ -1724,6 +1835,143 @@ mod tests {
             Some(workspace_directory),
         );
         assert!(missing.is_none());
+    }
+
+    #[gpui::test]
+    async fn opens_preview_file_links_at_positions(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                "docs": {"guide.md": "alpha\nbeta\ngamma\n"},
+                "src": {"main.rs": "first\nsecond\nthird\n"}
+            }),
+        )
+        .await;
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let workspace_weak = workspace.downgrade();
+
+        multi_workspace.update_in(cx, |_, window, cx| {
+            open_preview_url(
+                "../src/main.rs:2:4".into(),
+                None,
+                Some(PathBuf::from(path!("/project/docs"))),
+                &workspace_weak,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let editor = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_item(cx)
+                .and_then(|item| item.downcast::<Editor>())
+                .expect("file should be open in an editor")
+        });
+        editor.update_in(cx, |editor, window, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            assert_eq!(
+                editor.selections.newest::<Point>(&snapshot).head(),
+                Point::new(1, 3)
+            );
+        });
+
+        multi_workspace.update_in(cx, |_, window, cx| {
+            open_preview_url(
+                "../src/main.rs".into(),
+                Some("L3".into()),
+                Some(PathBuf::from(path!("/project/docs"))),
+                &workspace_weak,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        editor.update_in(cx, |editor, window, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            assert_eq!(
+                editor.selections.newest::<Point>(&snapshot).head(),
+                Point::new(2, 0)
+            );
+        });
+
+        // `guide.md:2` must open the sibling file at line 2 despite `guide.md:` being a valid URI scheme prefix.
+        multi_workspace.update_in(cx, |_, window, cx| {
+            open_preview_url(
+                "guide.md:2".into(),
+                None,
+                Some(PathBuf::from(path!("/project/docs"))),
+                &workspace_weak,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let guide_editor = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_item(cx)
+                .and_then(|item| item.downcast::<Editor>())
+                .expect("guide.md should be open in an editor")
+        });
+        guide_editor.update_in(cx, |editor, window, cx| {
+            let file_path = editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .and_then(|buffer| buffer.read(cx).file().map(|file| file.path().clone()))
+                .expect("opened editor should have a file");
+            assert_eq!(file_path.as_ref(), rel_path("docs/guide.md"));
+            let snapshot = editor.snapshot(window, cx);
+            assert_eq!(
+                editor.selections.newest::<Point>(&snapshot).head(),
+                Point::new(1, 0)
+            );
+        });
+
+        // An unresolved link must not open an unrelated file that merely shares its trailing path components.
+        multi_workspace.update_in(cx, |_, window, cx| {
+            open_preview_url(
+                "main.rs:2".into(),
+                None,
+                Some(PathBuf::from(path!("/project/docs"))),
+                &workspace_weak,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert_eq!(cx.opened_url().as_deref(), Some("main.rs:2"));
+        editor.update_in(cx, |editor, window, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            assert_eq!(
+                editor.selections.newest::<Point>(&snapshot).head(),
+                Point::new(2, 0),
+                "broken link must not move the cursor in a suffix-matching file"
+            );
+        });
+
+        multi_workspace.update_in(cx, |_, window, cx| {
+            open_preview_url(
+                "tel:123".into(),
+                None,
+                Some(PathBuf::from(path!("/project/docs"))),
+                &workspace_weak,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.opened_url().as_deref(), Some("tel:123"));
     }
 
     #[gpui::test]
@@ -2606,6 +2854,35 @@ mod tests {
                 "the focused pane's content must be unaffected"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn derives_remote_preview_source_directory(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let worktree = project.update(cx, |project, cx| {
+            project.add_test_remote_worktree("/remote/project", cx)
+        });
+        let file: Arc<dyn language::File> = Arc::new(project::File {
+            worktree,
+            path: rel_path("docs/readme.md").into(),
+            disk_state: DiskState::New,
+            entry_id: None,
+            is_local: false,
+            is_private: false,
+        });
+        let buffer = cx.new(|cx| {
+            let mut buffer = Buffer::local("# readme\n", cx);
+            buffer.file_updated(file, cx);
+            buffer
+        });
+        let (editor, cx) =
+            cx.add_window_view(|window, cx| Editor::for_buffer(buffer, Some(project), window, cx));
+
+        let folder = editor.read_with(cx, |editor, cx| {
+            MarkdownPreviewView::get_folder_for_active_editor(editor, cx)
+        });
+        assert_eq!(folder, Some(PathBuf::from("/remote/project/docs")));
     }
 
     fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {

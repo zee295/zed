@@ -81,40 +81,7 @@ pub struct AppCell {
     app: RefCell<App>,
 }
 
-std::thread_local! {
-    /// Weak handle to the process's main [`AppCell`], used by platform dispatchers
-    /// (especially web) to avoid running main-thread tasks while the App is borrowed.
-    static CURRENT_APP_CELL: std::cell::RefCell<Option<std::rc::Weak<AppCell>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Install `app` as the process-wide current app cell (called at launch).
-#[doc(hidden)]
-pub fn set_current_app_cell(app: &std::rc::Rc<AppCell>) {
-    CURRENT_APP_CELL.with(|slot| {
-        *slot.borrow_mut() = Some(std::rc::Rc::downgrade(app));
-    });
-}
-
-/// Returns true if the current App cell is borrowed (shared or exclusive).
-/// Platform dispatchers use this to defer main-thread work and avoid re-entrancy.
-pub fn is_app_borrowed() -> bool {
-    CURRENT_APP_CELL.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .and_then(|weak| weak.upgrade())
-            .map(|cell| cell.is_borrowed())
-            .unwrap_or(false)
-    })
-}
-
 impl AppCell {
-    /// True when the inner [`RefCell`] is already borrowed (immutably or mutably).
-    #[doc(hidden)]
-    pub fn is_borrowed(&self) -> bool {
-        self.app.try_borrow_mut().is_err()
-    }
-
     #[doc(hidden)]
     #[track_caller]
     pub fn borrow(&self) -> AppRef<'_> {
@@ -259,7 +226,6 @@ impl Application {
     where
         F: 'static + FnOnce(&mut App),
     {
-        set_current_app_cell(&self.0);
         let this = self.0.clone();
         let platform = self.0.borrow().platform.clone();
         platform.run(Box::new(move || {
@@ -281,7 +247,6 @@ impl Application {
     where
         F: 'static + FnOnce(&mut App),
     {
-        set_current_app_cell(&self.0);
         let this = self.0.clone();
         let platform = self.0.borrow().platform.clone();
         platform.run(Box::new(move || {
@@ -890,9 +855,6 @@ impl App {
             }),
         });
 
-        // So platform dispatchers (web) can detect App re-entrancy.
-        set_current_app_cell(&app);
-
         init_app_menus(platform.as_ref(), &app.borrow());
         SystemWindowTabController::init(&mut app.borrow_mut());
 
@@ -1273,7 +1235,7 @@ impl App {
                     // on windows we quite frequently lose the race and return a window that has never rendered, which leads to a crash
                     // where DispatchTree::root_node_id asserts on empty nodes
                     let clear = window.draw(cx);
-                    clear.clear();
+                    clear.clear(cx);
 
                     cx.window_handles.insert(id, window.handle);
                     cx.windows.get_mut(id).unwrap().replace(Box::new(window));
@@ -1361,6 +1323,20 @@ impl App {
     /// Returns the appearance of the application's windows.
     pub fn window_appearance(&self) -> WindowAppearance {
         self.platform.window_appearance()
+    }
+
+    /// Overrides the appearance (light/dark) applied to the app's windows, independent of
+    /// the OS-wide setting. Pass `None` to clear the override and follow the system again.
+    /// The current value is reported by [`App::window_appearance`].
+    ///
+    /// On macOS this sets the underlying `NSApplication.appearance`, which controls the
+    /// native window chrome (the window border and titlebar) of every window. Use this
+    /// when the app uses a dark theme while the system is in light mode (or vice versa)
+    /// so the window edges render to match the theme. While an appearance is forced,
+    /// windows stop tracking system light/dark changes; pass `None` to resume following
+    /// the system. On other platforms this is a no-op.
+    pub fn set_window_appearance(&self, appearance: Option<WindowAppearance>) {
+        self.platform.set_window_appearance(appearance);
     }
 
     /// Returns the window button layout configuration when supported.
@@ -1662,7 +1638,7 @@ impl App {
                     })
                     .collect::<Vec<_>>()
                 {
-                    self.update_window(window, |_, window, cx| window.draw(cx).clear())
+                    self.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
                         .unwrap();
                 }
 

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs,
     io::Write as _,
     os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _},
@@ -64,6 +64,7 @@ impl FsRpc {
             "Fs::metadata" => self.metadata(params),
             "Fs::read_link" => self.read_link(params),
             "Fs::read_dir" => self.read_dir(params),
+            "Fs::read_dir_tree" => self.read_dir_tree(params),
             "Fs::is_case_sensitive" => Ok(Value::Bool(false)),
             "Fs::git_init" => self.git_init(params),
             "Fs::git_clone" => self.git_clone(params),
@@ -357,18 +358,7 @@ impl FsRpc {
         let Ok(metadata) = fs::symlink_metadata(&path) else {
             return Ok(Value::Null);
         };
-        let mode = metadata.permissions().mode();
-        Ok(json!({
-            "inode": metadata.ino(),
-            "mtime_secs": metadata.mtime(),
-            "mtime_nanos": metadata.mtime_nsec(),
-            "is_symlink": metadata.file_type().is_symlink(),
-            "is_dir": metadata.is_dir(),
-            "len": metadata.len(),
-            "is_fifo": metadata.file_type().is_fifo(),
-            "is_executable": mode & 0o100 != 0,
-            "is_writable": mode & 0o200 != 0,
-        }))
+        Ok(metadata_value(&metadata))
     }
 
     fn read_link(&self, params: &Value) -> Result<Value> {
@@ -400,6 +390,66 @@ impl FsRpc {
                 .iter()
                 .map(|entry| self.virtualize(entry))
                 .collect::<Vec<_>>()
+        }))
+    }
+
+    fn read_dir_tree(&self, params: &Value) -> Result<Value> {
+        const MAX_ENTRIES: usize = 50_000;
+
+        let root = self.path(self.requested(params, "path"))?;
+        if !root.exists() {
+            return Ok(json!({"entries": [], "directories": {}, "metadata": {}}));
+        }
+        if !root.is_dir() {
+            bail!("not a directory: {}", root.display());
+        }
+
+        let mut pending = VecDeque::from([root.clone()]);
+        let mut root_entries = Vec::new();
+        let mut directories = serde_json::Map::new();
+        let mut metadata = serde_json::Map::new();
+        let mut entry_count = 0;
+
+        while let Some(directory) = pending.pop_front() {
+            let Ok(read_dir) = fs::read_dir(&directory) else {
+                continue;
+            };
+            let mut entries = read_dir.filter_map(|entry| entry.ok()).collect::<Vec<_>>();
+            entries.sort_by_key(|entry| entry.file_name().to_ascii_lowercase());
+
+            let mut directory_entries = Vec::with_capacity(entries.len());
+            for entry in entries {
+                if entry_count >= MAX_ENTRIES {
+                    break;
+                }
+                entry_count += 1;
+                let path = entry.path();
+                let virtual_path = self.virtualize(&path);
+                let Ok(entry_metadata) = entry.metadata() else {
+                    continue;
+                };
+                metadata.insert(virtual_path.clone(), metadata_value(&entry_metadata));
+                directory_entries.push(virtual_path);
+
+                if entry_metadata.is_dir() && should_prefetch_directory(&entry) {
+                    pending.push_back(path);
+                }
+            }
+
+            if directory == root {
+                root_entries = directory_entries;
+            } else {
+                directories.insert(self.virtualize(&directory), json!(directory_entries));
+            }
+            if entry_count >= MAX_ENTRIES {
+                break;
+            }
+        }
+
+        Ok(json!({
+            "entries": root_entries,
+            "directories": directories,
+            "metadata": metadata,
         }))
     }
 
@@ -457,6 +507,39 @@ fn ensure_parent(path: &Path) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     Ok(())
+}
+
+fn metadata_value(metadata: &fs::Metadata) -> Value {
+    let mode = metadata.permissions().mode();
+    json!({
+        "inode": metadata.ino(),
+        "mtime_secs": metadata.mtime(),
+        "mtime_nanos": metadata.mtime_nsec(),
+        "is_symlink": metadata.file_type().is_symlink(),
+        "is_dir": metadata.is_dir(),
+        "len": metadata.len(),
+        "is_fifo": metadata.file_type().is_fifo(),
+        "is_executable": mode & 0o100 != 0,
+        "is_writable": mode & 0o200 != 0,
+    })
+}
+
+fn should_prefetch_directory(entry: &fs::DirEntry) -> bool {
+    !matches!(
+        entry.file_name().to_str(),
+        Some(
+            "node_modules"
+                | ".git"
+                | "vendor"
+                | ".venv"
+                | "venv"
+                | ".next"
+                | "target"
+                | "dist"
+                | ".cache"
+                | "__pycache__"
+        )
+    )
 }
 
 fn remove_path(path: &Path) -> Result<()> {
@@ -555,6 +638,32 @@ mod tests {
         }
         let content = fs::read_to_string(root.path().join("settings.json"))?;
         assert!(content.starts_with("value-"));
+        Ok(())
+    }
+
+    #[test]
+    fn directory_tree_lists_but_does_not_prefetch_generated_directories() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::create_dir_all(root.path().join("src/nested"))?;
+        fs::create_dir_all(root.path().join("node_modules/package"))?;
+        fs::write(root.path().join("src/nested/main.rs"), "fn main() {}")?;
+        fs::write(
+            root.path().join("node_modules/package/index.js"),
+            "module.exports = {};",
+        )?;
+        let rpc = FsRpc::new(root.path().to_path_buf(), false)?;
+
+        let tree = rpc.dispatch("Fs::read_dir_tree", &json!({"path": "/workspace"}))?;
+        let entries = tree["entries"].as_array().context("missing root entries")?;
+        assert!(entries.iter().any(|entry| entry == "/workspace/src"));
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry == "/workspace/node_modules")
+        );
+        assert!(tree["directories"].get("/workspace/src").is_some());
+        assert!(tree["directories"].get("/workspace/src/nested").is_some());
+        assert!(tree["directories"].get("/workspace/node_modules").is_none());
         Ok(())
     }
 }

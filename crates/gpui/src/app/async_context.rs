@@ -62,22 +62,8 @@ impl AppContext for AsyncApp {
         update: impl FnOnce(&mut T, &mut Context<T>) -> R,
     ) -> R {
         let app = self.app();
-        // Prefer try_borrow so a re-entrant main-thread task surfaces a clear
-        // error instead of the opaque RefCell panic (common on web when RAF and
-        // timers interleave). Dispatchers should avoid calling into here while
-        // the App is borrowed; see `gpui::is_app_borrowed`.
-        match app.try_borrow_mut() {
-            Ok(mut app) => app.update_entity(handle, update),
-            Err(_) => {
-                // Last resort: if a platform task slipped through while App is
-                // borrowed, borrowing again panics with "RefCell already borrowed".
-                // Deferring cannot supply `R` to the caller, so we panic with context.
-                panic!(
-                    "AsyncApp::update_entity re-entered while App is already borrowed \
-                     (web main-thread task ran mid-update). This is a scheduling bug."
-                );
-            }
-        }
+        let mut app = app.borrow_mut();
+        app.update_entity(handle, update)
     }
 
     fn as_mut<'a, T>(&'a mut self, _handle: &Entity<T>) -> GpuiBorrow<'a, T>

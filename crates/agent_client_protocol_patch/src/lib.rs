@@ -83,7 +83,7 @@ pub mod component;
 pub mod concepts;
 /// JSON-RPC connection and handler infrastructure
 mod jsonrpc;
-/// MCP server support for providing MCP tools over ACP
+/// Runtime-agnostic MCP server support, including optional attachment to ACP sessions.
 pub mod mcp_server;
 /// Role types for ACP connections
 pub mod role;
@@ -95,14 +95,20 @@ pub mod util;
 pub use capabilities::*;
 
 pub use jsonrpc::{
-    Builder, ByteStreams, Channel, ConnectionTo, Dispatch, HandleDispatchFrom, Handled,
+    Builder, ByteStreams, Channel, ConnectionTo, Dispatch, DynamicHandlerGuard,
+    HandleConnectionClose, HandleDispatchFrom, Handled, INCOMING_TRANSPORT_CLOSED_REASON,
     IntoHandled, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, Lines,
-    NullHandler, RawJsonRpcMessage, RawJsonRpcParams, Responder, ResponseRouter, SentRequest,
-    UntypedMessage,
+    NullClose, NullHandler, RawJsonRpcMessage, RawJsonRpcParams, Responder, ResponseRouter,
+    SentRequest, TransportBatch, TransportBatchEntry, TransportFrame, UntypedMessage,
+    is_incoming_transport_closed,
     run::{ChainRun, NullRun, RunWithConnectionTo},
 };
 pub use jsonrpc::{RequestCancellation, is_cancel_request_notification};
 
+#[cfg(feature = "unstable_protocol_v2")]
+pub use role::acp::AgentProtocolRouter;
+#[cfg(feature = "unstable_protocol_v2")]
+pub use role::acp::ClientProtocolConnector;
 pub use role::{
     Role, RoleId, UntypedRole,
     acp::{Agent, Client, Conductor, Proxy},
@@ -110,7 +116,14 @@ pub use role::{
 
 pub use component::{ConnectTo, DynConnectTo};
 
-// Re-export BoxFuture for implementing Component traits
+/// Implementation details used by the derive macros.
+#[doc(hidden)]
+pub mod __private {
+    pub use serde;
+    pub use serde_json;
+}
+
+// Re-export BoxFuture for implementing SDK traits that return boxed futures.
 pub use futures::future::BoxFuture;
 
 // Re-export commonly used infrastructure types for convenience
@@ -122,10 +135,14 @@ pub use agent_client_protocol_derive::{JsonRpcNotification, JsonRpcRequest, Json
 mod session;
 pub use session::*;
 
+#[cfg(not(target_family = "wasm"))]
 mod acp_agent;
-pub use acp_agent::{AcpAgent, LineDirection};
+#[cfg(not(target_family = "wasm"))]
+pub use acp_agent::{AcpAgent, AcpAgentConfig, LineDirection};
 
+#[cfg(not(target_family = "wasm"))]
 mod stdio;
+#[cfg(not(target_family = "wasm"))]
 pub use stdio::Stdio;
 
 /// This is a hack that must be given as the final argument of

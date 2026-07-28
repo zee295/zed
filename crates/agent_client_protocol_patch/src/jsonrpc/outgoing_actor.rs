@@ -2,9 +2,8 @@
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 
-use crate::jsonrpc::ReplyMessage;
 use crate::jsonrpc::protocol_compat::ProtocolCompat;
-use crate::jsonrpc::{OutgoingMessage, RawJsonRpcMessage};
+use crate::jsonrpc::{OutgoingMessage, PendingReplies, RawJsonRpcMessage, TransportFrame};
 use crate::schema::v1::RequestId;
 
 pub type OutgoingMessageTx = mpsc::UnboundedSender<OutgoingMessage>;
@@ -21,54 +20,107 @@ pub(crate) fn send_raw_message(
 /// Outgoing protocol actor: Converts application-level OutgoingMessage to protocol-level RawJsonRpcMessage.
 ///
 /// This actor handles JSON-RPC protocol semantics:
-/// - Subscribes to reply_actor for response correlation
+/// - Verifies that outgoing requests still have pending response registrations
 /// - Converts OutgoingMessage variants to RawJsonRpcMessage
 ///
 /// This is the protocol layer - it has no knowledge of how messages are transported.
 pub(super) async fn outgoing_protocol_actor(
     mut outgoing_rx: mpsc::UnboundedReceiver<OutgoingMessage>,
-    reply_tx: mpsc::UnboundedSender<ReplyMessage>,
-    transport_tx: mpsc::UnboundedSender<Result<RawJsonRpcMessage, crate::Error>>,
+    pending_replies: PendingReplies,
+    transport_tx: mpsc::UnboundedSender<TransportFrame>,
     protocol_compat: ProtocolCompat,
 ) -> Result<(), crate::Error> {
+    let mut drain_waiters = Vec::new();
+
     while let Some(message) = outgoing_rx.next().await {
         tracing::debug!(?message, "outgoing_protocol_actor");
 
         // Create the message to be sent over the transport
-        let json_rpc_message = match message {
+        let (json_rpc_message, destination) = match message {
+            OutgoingMessage::CloseAfterDraining { done } => {
+                // Reject later sends while preserving every message that was
+                // already accepted into this receiver's buffer.
+                outgoing_rx.close();
+                drain_waiters.push(done);
+                continue;
+            }
+            OutgoingMessage::BatchDispatchComplete { completion } => {
+                if let Some(frame) = completion.complete() {
+                    transport_tx
+                        .unbounded_send(frame)
+                        .map_err(crate::Error::into_internal_error)?;
+                }
+                continue;
+            }
+            OutgoingMessage::BatchHandlerAttemptComplete { destination } => {
+                if let Some(frame) = destination.finish_handler_attempt() {
+                    transport_tx
+                        .unbounded_send(frame)
+                        .map_err(crate::Error::into_internal_error)?;
+                }
+                continue;
+            }
+            OutgoingMessage::AbandonedBatchResponse {
+                id,
+                method,
+                destination,
+            } => {
+                tracing::warn!(
+                    ?id,
+                    %method,
+                    "Completing abandoned JSON-RPC batch request with Internal Error"
+                );
+                let fallback = RawJsonRpcMessage::response(
+                    id,
+                    Err(crate::Error::internal_error().data(format!(
+                        "request handler dropped its responder for `{method}`"
+                    ))),
+                );
+                if let Some(frame) = destination.abandon(fallback) {
+                    transport_tx
+                        .unbounded_send(frame)
+                        .map_err(crate::Error::into_internal_error)?;
+                }
+                continue;
+            }
             OutgoingMessage::Request {
                 id,
-                role_id,
                 method,
                 untyped,
-                response_tx,
-                cancellation_disarm,
             } => {
+                // Requests register their response destination synchronously
+                // before entering this queue. EOF removes that registration,
+                // so skip work that can no longer receive a response.
+                if !pending_replies.contains(&id) {
+                    continue;
+                }
+
                 let request = match protocol_compat
                     .outgoing_message(untyped)
                     .and_then(|untyped| untyped.into_raw_jsonrpc_message(Some(id.clone())))
                 {
                     Ok(request) => request,
                     Err(error) => {
-                        tracing::warn!(?id, %method, ?error, "Failed to convert outgoing request");
-                        cancellation_disarm.disarm();
-                        complete_request_with_error(response_tx, error);
+                        tracing::warn!(?id, %method, ?error, "Failed to prepare outgoing request");
+                        if let Some(pending_reply) = pending_replies.remove(&id) {
+                            pending_reply.fail(error);
+                        }
                         continue;
                     }
                 };
 
-                // Record where the reply should be sent once it arrives.
-                reply_tx
-                    .unbounded_send(ReplyMessage::Subscribe {
-                        id: id.clone(),
-                        role_id,
-                        method,
-                        sender: response_tx,
-                        cancellation_disarm,
-                    })
-                    .map_err(crate::Error::into_internal_error)?;
+                if !pending_replies.contains(&id) {
+                    continue;
+                }
 
-                request
+                if let Err(error) = transport_tx.unbounded_send(TransportFrame::Single(request)) {
+                    let error = crate::Error::into_internal_error(error);
+                    if let Some(pending_reply) = pending_replies.remove(&id) {
+                        pending_reply.fail(error.clone());
+                    }
+                    return Err(error);
+                }
+                continue;
             }
             OutgoingMessage::Notification { untyped } => {
                 let messages = match protocol_compat.outgoing_notification(untyped) {
@@ -76,7 +128,7 @@ pub(super) async fn outgoing_protocol_actor(
                     Err(error) => {
                         tracing::warn!(
                             ?error,
-                            "Dropping outgoing notification after conversion failed"
+                            "Dropping outgoing notification after preparation failed"
                         );
                         continue;
                     }
@@ -94,7 +146,7 @@ pub(super) async fn outgoing_protocol_actor(
                         }
                     };
                     transport_tx
-                        .unbounded_send(Ok(message))
+                        .unbounded_send(TransportFrame::Single(message))
                         .map_err(crate::Error::into_internal_error)?;
                 }
                 continue;
@@ -103,142 +155,40 @@ pub(super) async fn outgoing_protocol_actor(
                 id,
                 method,
                 response,
+                destination,
             } => match protocol_compat.outgoing_response(&method, response) {
                 Ok(value) => {
                     tracing::debug!(?id, "Sending success response");
-                    RawJsonRpcMessage::response(id, Ok(value))
+                    (RawJsonRpcMessage::response(id, Ok(value)), destination)
                 }
                 Err(error) => {
                     tracing::warn!(?id, %method, ?error, "Sending error response");
-                    RawJsonRpcMessage::response(id, Err(error))
+                    (RawJsonRpcMessage::response(id, Err(error)), destination)
                 }
             },
-            OutgoingMessage::Error { error } => {
+            OutgoingMessage::UncorrelatedErrorResponse { error, destination } => {
                 // JSON-RPC reports parse/invalid-request errors with id null when
                 // they cannot be correlated to a specific request.
-                RawJsonRpcMessage::response(RequestId::Null, Err(error))
+                (
+                    RawJsonRpcMessage::response(RequestId::Null, Err(error)),
+                    destination,
+                )
             }
         };
 
-        // Send to transport layer (wrapped in Ok since transport expects Result)
-        transport_tx
-            .unbounded_send(Ok(json_rpc_message))
-            .map_err(crate::Error::into_internal_error)?;
+        if let Some(frame) = destination.complete(json_rpc_message) {
+            transport_tx
+                .unbounded_send(frame)
+                .map_err(crate::Error::into_internal_error)?;
+        }
+    }
+
+    // Closing the raw queue lets the transport actor finish all buffered
+    // writes. The caller separately awaits that transport future before
+    // treating the drain as complete.
+    drop(transport_tx);
+    for done in drain_waiters {
+        let _ = done.send(());
     }
     Ok(())
-}
-
-fn complete_request_with_error(
-    response_tx: futures::channel::oneshot::Sender<crate::jsonrpc::ResponsePayload>,
-    error: crate::Error,
-) {
-    if response_tx
-        .send(crate::jsonrpc::ResponsePayload {
-            result: Err(error),
-            ack_tx: None,
-        })
-        .is_err()
-    {
-        tracing::debug!("Dropped failed outgoing request because receiver was gone");
-    }
-}
-
-#[cfg(all(test, feature = "unstable_protocol_v2"))]
-mod tests {
-    use futures::StreamExt as _;
-    use futures::channel::{mpsc, oneshot};
-
-    use super::*;
-    use crate::Role as _;
-
-    fn malformed_v2_known_method() -> Result<crate::UntypedMessage, crate::Error> {
-        crate::UntypedMessage::new("session/new", serde_json::json!({}))
-    }
-
-    fn malformed_v2_known_notification() -> Result<crate::UntypedMessage, crate::Error> {
-        crate::UntypedMessage::new("session/update", serde_json::json!({}))
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn failed_request_conversion_completes_request_locally() -> Result<(), crate::Error> {
-        let (outgoing_tx, outgoing_rx) = mpsc::unbounded();
-        let (reply_tx, mut reply_rx) = mpsc::unbounded();
-        let (transport_tx, mut transport_rx) = mpsc::unbounded();
-        let (response_tx, response_rx) = oneshot::channel();
-
-        outgoing_tx
-            .unbounded_send(OutgoingMessage::Request {
-                id: RequestId::Number(1),
-                role_id: crate::Agent.role_id(),
-                method: "session/new".into(),
-                untyped: malformed_v2_known_method()?,
-                response_tx,
-                cancellation_disarm: crate::jsonrpc::SentRequestCancellationDisarm::new(),
-            })
-            .map_err(crate::Error::into_internal_error)?;
-        drop(outgoing_tx);
-
-        outgoing_protocol_actor(
-            outgoing_rx,
-            reply_tx,
-            transport_tx,
-            ProtocolCompat::new(crate::jsonrpc::protocol_compat::ProtocolMode::v2_agent()),
-        )
-        .await?;
-
-        let response = response_rx
-            .await
-            .map_err(crate::Error::into_internal_error)?;
-        assert!(
-            response.result.is_err(),
-            "conversion failure should complete the local request"
-        );
-        assert!(response.ack_tx.is_none());
-        assert!(reply_rx.next().await.is_none());
-        assert!(transport_rx.next().await.is_none());
-
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn failed_notification_conversion_does_not_stop_actor() -> Result<(), crate::Error> {
-        let (outgoing_tx, outgoing_rx) = mpsc::unbounded();
-        let (reply_tx, _reply_rx) = mpsc::unbounded();
-        let (transport_tx, mut transport_rx) = mpsc::unbounded();
-
-        outgoing_tx
-            .unbounded_send(OutgoingMessage::Notification {
-                untyped: malformed_v2_known_notification()?,
-            })
-            .map_err(crate::Error::into_internal_error)?;
-        outgoing_tx
-            .unbounded_send(OutgoingMessage::Notification {
-                untyped: crate::UntypedMessage::new(
-                    "_local/notify",
-                    serde_json::json!({ "ok": true }),
-                )?,
-            })
-            .map_err(crate::Error::into_internal_error)?;
-        drop(outgoing_tx);
-
-        outgoing_protocol_actor(
-            outgoing_rx,
-            reply_tx,
-            transport_tx,
-            ProtocolCompat::new(crate::jsonrpc::protocol_compat::ProtocolMode::v2_agent()),
-        )
-        .await?;
-
-        let message = transport_rx
-            .next()
-            .await
-            .expect("valid notification should still be sent")?;
-        let RawJsonRpcMessage::Notification(request) = message else {
-            panic!("expected outgoing notification request, got {message:?}");
-        };
-        assert_eq!(&*request.method, "_local/notify");
-        assert!(transport_rx.next().await.is_none());
-
-        Ok(())
-    }
 }

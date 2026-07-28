@@ -32,7 +32,8 @@ if grep -Fq 'memory: memory || (globalThis.__wbgSharedMemory' "${js_file}" &&
         "${js_file}"
 fi
 
-if ! grep -Fq 'globalThis.__zedCallCtors = () =>' "${js_file}"; then
+if grep -Fq 'shared:true' "${js_file}" &&
+    ! grep -Fq 'globalThis.__zedCallCtors = () =>' "${js_file}"; then
     match_count="$(grep -Fc 'wasm.__wbindgen_start(thread_stack_size);' "${js_file}" || true)"
     if [[ "${match_count}" != "1" ]]; then
         echo "expected one wasm-bindgen start call in ${js_file}, found ${match_count}" >&2

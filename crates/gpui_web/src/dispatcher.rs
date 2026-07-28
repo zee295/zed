@@ -10,7 +10,6 @@ use web_time::Instant;
 #[cfg(feature = "multithreaded")]
 const MIN_BACKGROUND_THREADS: usize = 2;
 
-#[cfg(feature = "multithreaded")]
 fn shared_memory_supported() -> bool {
     let global = js_sys::global();
     let has_shared_array_buffer =
@@ -64,21 +63,37 @@ impl MainThreadMailbox {
             log::error!("MainThreadMailbox::send failed: receiver disconnected");
         }
 
-        // TODO-Wasm: Verify this lock-free protocol
-        let view = self.signal_view();
-        js_sys::Atomics::store(&view, 0, 1).ok();
-        js_sys::Atomics::notify(&view, 0).ok();
+        if shared_memory_supported() {
+            // TODO-Wasm: Verify this lock-free protocol
+            let view = self.signal_view();
+            js_sys::Atomics::store(&view, 0, 1).ok();
+            js_sys::Atomics::notify(&view, 0).ok();
+        }
     }
 
     fn drain(&self, window: &web_sys::Window) {
+        const MAX_ITEMS_PER_DRAIN: usize = 256;
+        const MAX_DRAIN_MILLIS: f64 = 4.0;
+
+        let started_at = window.performance().map(|performance| performance.now());
         let mut receiver = self.receiver.lock();
-        loop {
+        for index in 0..MAX_ITEMS_PER_DRAIN {
             // We need these `spin` variants because we can't acquire a lock on the main thread.
             // TODO-WASM: Should we do something different?
             match receiver.spin_try_pop() {
                 Ok(Some(item)) => execute_on_main_thread(window, item),
                 Ok(None) => break,
                 Err(_) => break,
+            }
+
+            if index % 16 == 15
+                && started_at.is_some_and(|started_at| {
+                    window.performance().is_some_and(|performance| {
+                        performance.now() - started_at >= MAX_DRAIN_MILLIS
+                    })
+                })
+            {
+                break;
             }
         }
     }
@@ -101,6 +116,11 @@ impl MainThreadMailbox {
             loop {
                 js_sys::Atomics::store(&view, 0, 0).expect("Atomics.store failed");
 
+                // Items posted between the previous drain and the store above
+                // set the signal we just cleared, so their notify is lost.
+                // Drain again after re-arming to avoid missing them.
+                mailbox.drain(&window);
+
                 let result = match js_sys::Atomics::wait_async(&view, 0, 0) {
                     Ok(result) => result,
                     Err(error) => {
@@ -114,18 +134,39 @@ impl MainThreadMailbox {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
 
-                if !is_async {
-                    log::error!("Atomics.waitAsync returned synchronously; waker loop exiting");
-                    break;
+                // `async: false` means the signal changed between the store and
+                // the wait ("not-equal"): work has already arrived, so skip
+                // waiting and drain immediately.
+                if is_async {
+                    let promise: js_sys::Promise =
+                        js_sys::Reflect::get(&result, &JsValue::from_str("value"))
+                            .expect("waitAsync result missing 'value'")
+                            .unchecked_into();
+
+                    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
                 }
 
-                let promise: js_sys::Promise =
-                    js_sys::Reflect::get(&result, &JsValue::from_str("value"))
-                        .expect("waitAsync result missing 'value'")
-                        .unchecked_into();
+                mailbox.drain(&window);
+            }
+        });
+    }
 
-                let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
-
+    fn run_poll_loop(self: &Arc<Self>, window: web_sys::Window) {
+        let mailbox = Arc::clone(self);
+        wasm_bindgen_futures::spawn_local(async move {
+            loop {
+                let timeout = js_sys::Promise::new(&mut |resolve, reject| {
+                    if let Err(error) =
+                        window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 16)
+                    {
+                        if let Err(reject_error) = reject.call1(&JsValue::UNDEFINED, &error) {
+                            log::error!("failed to reject mailbox timer: {reject_error:?}");
+                        }
+                    }
+                });
+                if wasm_bindgen_futures::JsFuture::from(timeout).await.is_err() {
+                    break;
+                }
                 mailbox.drain(&window);
             }
         });
@@ -164,9 +205,13 @@ impl WebDispatcher {
         let supports_threads = false;
 
         #[cfg(feature = "multithreaded")]
-        if has_shared_memory {
+        if supports_threads {
             main_thread_mailbox.run_waker_loop(browser_window.clone());
+        } else {
+            main_thread_mailbox.run_poll_loop(browser_window.clone());
         }
+        #[cfg(not(feature = "multithreaded"))]
+        main_thread_mailbox.run_poll_loop(browser_window.clone());
 
         if allow_threads && !supports_threads {
             log::warn!(
@@ -259,9 +304,8 @@ impl PlatformDispatcher for WebDispatcher {
     fn dispatch_after(&self, duration: Duration, runnable: RunnableVariant) {
         let millis = duration.as_millis().min(i32::MAX as u128) as i32;
         if self.on_main_thread() {
-            let window = self.browser_window.clone();
             let callback = Closure::once_into_js(move || {
-                run_when_app_free(&window, runnable);
+                runnable.run();
             });
             self.browser_window
                 .set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -277,27 +321,11 @@ impl PlatformDispatcher for WebDispatcher {
 
     fn spawn_realtime(&self, function: Box<dyn FnOnce() + Send>) {
         if self.on_main_thread() {
-            let window = self.browser_window.clone();
             let callback = Closure::once_into_js(move || {
-                if gpui::is_app_borrowed() {
-                    let callback = Closure::once_into_js(move || {
-                        function();
-                    });
-                    window
-                        .set_timeout_with_callback_and_timeout_and_arguments_0(
-                            callback.unchecked_ref(),
-                            0,
-                        )
-                        .ok();
-                } else {
-                    function();
-                }
+                function();
             });
-            // Prefer setTimeout(0) over queueMicrotask so we don't run between
-            // nested microtasks while App is still borrowed.
             self.browser_window
-                .set_timeout_with_callback_and_timeout_and_arguments_0(callback.unchecked_ref(), 0)
-                .ok();
+                .queue_microtask(callback.unchecked_ref());
         } else {
             self.main_thread_mailbox
                 .post(Priority::High, MainThreadItem::RealtimeFunction(function));
@@ -312,12 +340,11 @@ impl PlatformDispatcher for WebDispatcher {
 fn execute_on_main_thread(window: &web_sys::Window, item: MainThreadItem) {
     match item {
         MainThreadItem::Runnable(runnable) => {
-            run_when_app_free(window, runnable);
+            runnable.run();
         }
         MainThreadItem::Delayed { runnable, millis } => {
-            let window_for_cb = window.clone();
             let callback = Closure::once_into_js(move || {
-                run_when_app_free(&window_for_cb, runnable);
+                runnable.run();
             });
             window
                 .set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -327,49 +354,26 @@ fn execute_on_main_thread(window: &web_sys::Window, item: MainThreadItem) {
                 .ok();
         }
         MainThreadItem::RealtimeFunction(function) => {
-            // Realtime work must not re-enter App either.
-            if gpui::is_app_borrowed() {
-                let callback = Closure::once_into_js(move || {
-                    function();
-                });
-                window
-                    .set_timeout_with_callback_and_timeout_and_arguments_0(
-                        callback.unchecked_ref(),
-                        0,
-                    )
-                    .ok();
-            } else {
-                function();
-            }
+            function();
         }
     }
 }
 
-/// Run a main-thread task only when the GPUI App `RefCell` is free.
-///
-/// On the web, RAF / ResizeObserver / timer completions can interleave. If a
-/// foreground task polls an async future that calls `AsyncApp::update_entity`
-/// while a frame already holds `App`, we panic with "RefCell already borrowed".
-/// Re-queue with `setTimeout(0)` until the outer borrow is released.
-fn run_when_app_free(window: &web_sys::Window, runnable: RunnableVariant) {
-    if gpui::is_app_borrowed() {
-        schedule_runnable(window, runnable, Priority::default());
-        return;
-    }
-    runnable.run();
-}
-
-fn schedule_runnable(window: &web_sys::Window, runnable: RunnableVariant, _priority: Priority) {
-    let window_for_cb = window.clone();
+fn schedule_runnable(window: &web_sys::Window, runnable: RunnableVariant, priority: Priority) {
     let callback = Closure::once_into_js(move || {
-        run_when_app_free(&window_for_cb, runnable);
+        runnable.run();
     });
     let callback: &js_sys::Function = callback.unchecked_ref();
 
-    // Always use setTimeout(0) (macrotask). queueMicrotask can run between
-    // nested microtasks while App is still borrowed from a parent sync stack.
-    // TODO-Wasm: enqueue so we can dequeue with proper priority
-    window
-        .set_timeout_with_callback_and_timeout_and_arguments_0(callback, 0)
-        .ok();
+    match priority {
+        Priority::RealtimeAudio => {
+            window.queue_microtask(callback);
+        }
+        _ => {
+            // TODO-Wasm: this ought to enqueue so we can dequeue with proper priority
+            window
+                .set_timeout_with_callback_and_timeout_and_arguments_0(callback, 0)
+                .ok();
+        }
+    }
 }

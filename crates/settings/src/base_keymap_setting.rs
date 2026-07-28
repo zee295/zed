@@ -7,12 +7,13 @@ use settings::{RegisterSetting, Settings};
 
 /// Base key bindings scheme. Base keymaps can be overridden with user keymaps.
 ///
-/// Default: VSCode
+/// Default: Zed
 #[derive(
     Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default, RegisterSetting,
 )]
 pub enum BaseKeymap {
     #[default]
+    Zed,
     VSCode,
     JetBrains,
     SublimeText,
@@ -26,6 +27,7 @@ pub enum BaseKeymap {
 impl From<BaseKeymapContent> for BaseKeymap {
     fn from(value: BaseKeymapContent) -> Self {
         match value {
+            BaseKeymapContent::Zed => Self::Zed,
             BaseKeymapContent::VSCode => Self::VSCode,
             BaseKeymapContent::JetBrains => Self::JetBrains,
             BaseKeymapContent::SublimeText => Self::SublimeText,
@@ -40,6 +42,7 @@ impl From<BaseKeymapContent> for BaseKeymap {
 impl Into<BaseKeymapContent> for BaseKeymap {
     fn into(self) -> BaseKeymapContent {
         match self {
+            BaseKeymap::Zed => BaseKeymapContent::Zed,
             BaseKeymap::VSCode => BaseKeymapContent::VSCode,
             BaseKeymap::JetBrains => BaseKeymapContent::JetBrains,
             BaseKeymap::SublimeText => BaseKeymapContent::SublimeText,
@@ -55,6 +58,7 @@ impl Into<BaseKeymapContent> for BaseKeymap {
 impl Display for BaseKeymap {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            BaseKeymap::Zed => write!(f, "Zed"),
             BaseKeymap::VSCode => write!(f, "VS Code"),
             BaseKeymap::JetBrains => write!(f, "JetBrains"),
             BaseKeymap::SublimeText => write!(f, "Sublime Text"),
@@ -69,8 +73,9 @@ impl Display for BaseKeymap {
 
 impl BaseKeymap {
     #[cfg(target_os = "macos")]
-    pub const OPTIONS: [(&'static str, Self); 7] = [
-        ("VS Code (Default)", Self::VSCode),
+    pub const OPTIONS: [(&'static str, Self); 8] = [
+        ("Zed (Default)", Self::Zed),
+        ("VS Code", Self::VSCode),
         ("Atom", Self::Atom),
         ("JetBrains", Self::JetBrains),
         ("Sublime Text", Self::SublimeText),
@@ -80,8 +85,9 @@ impl BaseKeymap {
     ];
 
     #[cfg(not(target_os = "macos"))]
-    pub const OPTIONS: [(&'static str, Self); 6] = [
-        ("VS Code (Default)", Self::VSCode),
+    pub const OPTIONS: [(&'static str, Self); 7] = [
+        ("Zed (Default)", Self::Zed),
+        ("VS Code", Self::VSCode),
         ("Atom", Self::Atom),
         ("JetBrains", Self::JetBrains),
         ("Sublime Text", Self::SublimeText),
@@ -91,52 +97,54 @@ impl BaseKeymap {
 
     pub fn asset_path(&self) -> Option<&'static str> {
         #[cfg(target_family = "wasm")]
-        return if gpui::operating_system() == gpui::OperatingSystem::Mac {
-            match self {
+        if gpui::operating_system() == gpui::OperatingSystem::Mac {
+            return match self {
                 BaseKeymap::JetBrains => Some("keymaps/macos/jetbrains.json"),
                 BaseKeymap::SublimeText => Some("keymaps/macos/sublime_text.json"),
                 BaseKeymap::Atom => Some("keymaps/macos/atom.json"),
                 BaseKeymap::TextMate => Some("keymaps/macos/textmate.json"),
                 BaseKeymap::Emacs => Some("keymaps/macos/emacs.json"),
                 BaseKeymap::Cursor => Some("keymaps/macos/cursor.json"),
-                BaseKeymap::VSCode | BaseKeymap::None => None,
-            }
-        } else {
-            match self {
-                BaseKeymap::JetBrains => Some("keymaps/linux/jetbrains.json"),
-                BaseKeymap::SublimeText => Some("keymaps/linux/sublime_text.json"),
-                BaseKeymap::Atom => Some("keymaps/linux/atom.json"),
-                BaseKeymap::Emacs => Some("keymaps/linux/emacs.json"),
-                BaseKeymap::Cursor => Some("keymaps/linux/cursor.json"),
-                BaseKeymap::TextMate | BaseKeymap::VSCode | BaseKeymap::None => None,
-            }
+                BaseKeymap::VSCode => Some("keymaps/macos/vscode.json"),
+                BaseKeymap::Zed | BaseKeymap::None => None,
+            };
+        }
+
+        #[cfg(target_family = "wasm")]
+        return match self {
+            BaseKeymap::JetBrains => Some("keymaps/linux/jetbrains.json"),
+            BaseKeymap::SublimeText => Some("keymaps/linux/sublime_text.json"),
+            BaseKeymap::Atom => Some("keymaps/linux/atom.json"),
+            BaseKeymap::Emacs => Some("keymaps/linux/emacs.json"),
+            BaseKeymap::Cursor => Some("keymaps/linux/cursor.json"),
+            BaseKeymap::VSCode => Some("keymaps/linux/vscode.json"),
+            BaseKeymap::TextMate | BaseKeymap::Zed | BaseKeymap::None => None,
         };
 
-        #[cfg(not(target_family = "wasm"))]
-        {
-            #[cfg(target_os = "macos")]
-            match self {
-                BaseKeymap::JetBrains => Some("keymaps/macos/jetbrains.json"),
-                BaseKeymap::SublimeText => Some("keymaps/macos/sublime_text.json"),
-                BaseKeymap::Atom => Some("keymaps/macos/atom.json"),
-                BaseKeymap::TextMate => Some("keymaps/macos/textmate.json"),
-                BaseKeymap::Emacs => Some("keymaps/macos/emacs.json"),
-                BaseKeymap::Cursor => Some("keymaps/macos/cursor.json"),
-                BaseKeymap::VSCode => None,
-                BaseKeymap::None => None,
-            }
+        #[cfg(all(not(target_family = "wasm"), target_os = "macos"))]
+        match self {
+            BaseKeymap::JetBrains => Some("keymaps/macos/jetbrains.json"),
+            BaseKeymap::SublimeText => Some("keymaps/macos/sublime_text.json"),
+            BaseKeymap::Atom => Some("keymaps/macos/atom.json"),
+            BaseKeymap::TextMate => Some("keymaps/macos/textmate.json"),
+            BaseKeymap::Emacs => Some("keymaps/macos/emacs.json"),
+            BaseKeymap::Cursor => Some("keymaps/macos/cursor.json"),
+            BaseKeymap::VSCode => Some("keymaps/macos/vscode.json"),
+            BaseKeymap::Zed => None,
+            BaseKeymap::None => None,
+        }
 
-            #[cfg(not(target_os = "macos"))]
-            match self {
-                BaseKeymap::JetBrains => Some("keymaps/linux/jetbrains.json"),
-                BaseKeymap::SublimeText => Some("keymaps/linux/sublime_text.json"),
-                BaseKeymap::Atom => Some("keymaps/linux/atom.json"),
-                BaseKeymap::Emacs => Some("keymaps/linux/emacs.json"),
-                BaseKeymap::Cursor => Some("keymaps/linux/cursor.json"),
-                BaseKeymap::TextMate => None,
-                BaseKeymap::VSCode => None,
-                BaseKeymap::None => None,
-            }
+        #[cfg(all(not(target_family = "wasm"), not(target_os = "macos")))]
+        match self {
+            BaseKeymap::JetBrains => Some("keymaps/linux/jetbrains.json"),
+            BaseKeymap::SublimeText => Some("keymaps/linux/sublime_text.json"),
+            BaseKeymap::Atom => Some("keymaps/linux/atom.json"),
+            BaseKeymap::Emacs => Some("keymaps/linux/emacs.json"),
+            BaseKeymap::Cursor => Some("keymaps/linux/cursor.json"),
+            BaseKeymap::TextMate => None,
+            BaseKeymap::VSCode => Some("keymaps/linux/vscode.json"),
+            BaseKeymap::Zed => None,
+            BaseKeymap::None => None,
         }
     }
 

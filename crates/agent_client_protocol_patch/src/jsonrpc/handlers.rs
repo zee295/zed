@@ -11,17 +11,9 @@ use std::ops::AsyncFnMut;
 #[derive(Debug)]
 pub struct NullHandler;
 
-impl NullHandler {
-    /// Creates a new null handler.
-    #[must_use]
-    pub fn new() -> Self {
-        Self
-    }
-}
-
 impl Default for NullHandler {
     fn default() -> Self {
-        Self::new()
+        Self
     }
 }
 
@@ -298,7 +290,7 @@ where
     }
 }
 
-/// Handler that handles both requests and notifications of specific types.
+/// Handler for typed requests, notifications, and matching responses.
 pub struct MessageHandler<
     Counterpart: Role,
     Peer: Role,

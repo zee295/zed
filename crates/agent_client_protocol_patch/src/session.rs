@@ -5,10 +5,9 @@ use futures::channel::{mpsc, oneshot};
 use crate::{
     Agent, Client, ConnectionTo, Dispatch, HandleDispatchFrom, Handled, Responder, Role,
     jsonrpc::{
-        DynamicHandlerRegistration,
-        run::{ChainRun, NullRun, RunWithConnectionTo},
+        DynamicHandlerGuard,
+        run::{NullRun, RunWithConnectionTo},
     },
-    mcp_server::McpServer,
     role::{HasPeer, acp::ProxySessionMessages},
     schema::v1::{
         ContentBlock, ContentChunk, NewSessionRequest, NewSessionResponse, PromptRequest,
@@ -17,6 +16,9 @@ use crate::{
     },
     util::{MatchDispatch, MatchDispatchFrom, run_until},
 };
+
+#[cfg(feature = "unstable_mcp_over_acp")]
+use crate::{jsonrpc::run::ChainRun, mcp_server::McpServer};
 
 /// Marker type indicating the session builder will block the current task.
 #[derive(Debug)]
@@ -28,7 +30,7 @@ impl SessionBlockState for Blocking {}
 pub struct NonBlocking;
 impl SessionBlockState for NonBlocking {}
 
-/// Trait for marker types that indicate blocking vs blocking API.
+/// Trait for marker types that indicate blocking vs non-blocking API.
 /// See [`SessionBuilder::block_task`].
 pub trait SessionBlockState: Send + 'static + Sync + std::fmt::Debug {}
 
@@ -75,11 +77,11 @@ where
     /// The vector `dynamic_handler_registrations` contains any dynamic
     /// handle registrations associated with this session (e.g., from MCP servers).
     /// You can simply pass `Default::default()` if not applicable.
-    pub fn attach_session<'responder>(
+    pub(crate) fn attach_session<'runner>(
         &self,
         response: NewSessionResponse,
-        mcp_handler_registrations: Vec<DynamicHandlerRegistration<Counterpart>>,
-    ) -> Result<ActiveSession<'responder, Counterpart>, crate::Error> {
+        mcp_handler_registrations: Vec<DynamicHandlerGuard<Counterpart>>,
+    ) -> Result<ActiveSession<'runner, Counterpart>, crate::Error> {
         let NewSessionResponse {
             session_id,
             modes,
@@ -100,7 +102,7 @@ where
             connection: self.clone(),
             session_handler_registration,
             mcp_handler_registrations,
-            _responder: PhantomData,
+            _runner: PhantomData,
         })
     }
 }
@@ -123,7 +125,7 @@ pub struct SessionBuilder<
 {
     connection: ConnectionTo<Counterpart>,
     request: NewSessionRequest,
-    dynamic_handler_registrations: Vec<DynamicHandlerRegistration<Counterpart>>,
+    dynamic_handler_registrations: Vec<DynamicHandlerGuard<Counterpart>>,
     run: Run,
     block_state: PhantomData<BlockState>,
 }
@@ -149,7 +151,9 @@ where
     R: RunWithConnectionTo<Counterpart>,
     BlockState: SessionBlockState,
 {
-    /// Add the MCP servers from the given registry to this session.
+    /// Attach an MCP server to this new session.
+    #[cfg(feature = "unstable_mcp_over_acp")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "unstable_mcp_over_acp")))]
     pub fn with_mcp_server<McpRun>(
         mut self,
         mcp_server: McpServer<Counterpart, McpRun>,
@@ -157,7 +161,7 @@ where
     where
         McpRun: RunWithConnectionTo<Counterpart>,
     {
-        let (handler, mcp_run) = mcp_server.into_handler_and_responder();
+        let (handler, mcp_run) = mcp_server.into_handler_and_runner();
         self.dynamic_handler_registrations
             .push(handler.into_dynamic_handler(&mut self.request, &self.connection)?);
         Ok(SessionBuilder {
@@ -175,9 +179,9 @@ where
     /// without blocking the current task. The session handshake and closure execution
     /// happen in a spawned background task.
     ///
-    /// The closure receives an `ActiveSession<'static, _>` and should return
-    /// `Result<(), Error>`. If the closure returns an error, it will propagate
-    /// to the connection's error handling.
+    /// The closure receives an `ActiveSession<'static, _>` and runs in a
+    /// spawned task. If it returns an error, the error propagates to the
+    /// connection's task handling.
     ///
     /// # Example
     ///
@@ -205,8 +209,14 @@ where
     ///
     /// # Ordering
     ///
-    /// This callback blocks the dispatch loop until the session starts and your
-    /// callback completes. See the [`ordering`](crate::concepts::ordering) module for details.
+    /// Session runners are scheduled and routing setup is installed before the
+    /// dispatch loop processes the next message when the session response is
+    /// routed during its original dispatch. No user callback code runs under
+    /// that ordering guarantee: the callback is invoked in a spawned task, so
+    /// it may wait for later session traffic without deadlocking the connection.
+    /// A response interceptor that retains the response and routes it later
+    /// cannot retroactively order session setup before messages the dispatch
+    /// loop has already processed.
     pub fn on_session_start<F, Fut>(self, op: F) -> Result<(), crate::Error>
     where
         R: 'static,
@@ -233,7 +243,7 @@ where
                     let active_session =
                         connection.attach_session(response, dynamic_handler_registrations)?;
 
-                    op(active_session).await
+                    connection.spawn(async move { op(active_session).await })
                 }
             })
     }
@@ -251,8 +261,11 @@ where
     /// immediately without blocking the current task. The session handshake, client
     /// response, and proxy setup all happen in a spawned background task.
     ///
-    /// The closure receives the `SessionId` once the session is established, allowing
-    /// you to perform any custom work with that ID (e.g., tracking, logging).
+    /// The closure receives the `SessionId` once the session is established. Use it for logging
+    /// or eventual tracking; it runs concurrently with later connection traffic. Register
+    /// ID-independent state that later handlers must observe before calling this helper. For
+    /// ID-keyed bookkeeping, install a gate or placeholder first, make later handlers await it,
+    /// and populate it from the closure.
     ///
     /// # Example
     ///
@@ -280,8 +293,13 @@ where
     ///
     /// # Ordering
     ///
-    /// This callback blocks the dispatch loop until the session starts and your
-    /// callback completes. See the [`ordering`](crate::concepts::ordering) module for details.
+    /// The client response is queued, proxy routing is installed, and session runners are
+    /// scheduled before the dispatch loop processes the next message when the session response
+    /// is routed during its original dispatch. This is a local ordering guarantee, not a
+    /// guarantee that the response reaches the client before later wire traffic. No user callback
+    /// code runs under the barrier: the callback is invoked in a spawned task, so it may wait for
+    /// later connection traffic. A response interceptor that retains the response and routes it
+    /// later cannot retroactively order this setup before messages the loop already processed.
     pub fn on_proxy_session_start<F, Fut>(
         self,
         responder: Responder<NewSessionResponse>,
@@ -316,15 +334,15 @@ where
                 // Install a dynamic handler to proxy messages from this session
                 connection
                     .add_dynamic_handler(ProxySessionMessages::new(session_id.clone()))?
-                    .run_indefinitely();
+                    .detach();
 
                 // Spawn off the run and dynamic handlers to run indefinitely
                 connection.spawn(run.run_with_connection_to(connection.clone()))?;
                 dynamic_handler_registrations
                     .into_iter()
-                    .for_each(super::jsonrpc::DynamicHandlerRegistration::run_indefinitely);
+                    .for_each(DynamicHandlerGuard::detach);
 
-                op(session_id).await
+                connection.spawn(async move { op(session_id).await })
             }
         })
     }
@@ -366,13 +384,13 @@ where
     ///
     /// The `ActiveSession` passed to `op` has a non-`'static` lifetime, which
     /// prevents calling [`ActiveSession::proxy_remaining_messages`] (since the
-    /// responders would terminate when `op` returns).
+    /// session's background runners would terminate when `op` returns).
     ///
     /// Requires calling [`block_task`](Self::block_task) first.
     pub async fn run_until<T>(
         self,
-        op: impl for<'responder> AsyncFnOnce(
-            ActiveSession<'responder, Counterpart>,
+        op: impl for<'runner> AsyncFnOnce(
+            ActiveSession<'runner, Counterpart>,
         ) -> Result<T, crate::Error>,
     ) -> Result<T, crate::Error> {
         let Self {
@@ -402,8 +420,8 @@ where
     /// drift but at the cost of requiring MCP servers that are `Send` and
     /// don't access data from the surrounding scope.
     ///
-    /// Returns an `ActiveSession<'static, _>` because responders are spawned
-    /// into background tasks that live for the connection lifetime.
+    /// Returns an `ActiveSession<'static, _>` because the session's runners are spawned into
+    /// background tasks that live for the connection lifetime.
     ///
     /// Requires calling [`block_task`](Self::block_task) first.
     pub async fn start_session(self) -> Result<ActiveSession<'static, Counterpart>, crate::Error>
@@ -478,14 +496,14 @@ where
 
 /// Active session struct that lets you send prompts and receive updates.
 ///
-/// The `'responder` lifetime represents the span during which responders
-/// (e.g., MCP server handlers) are active. When created via [`SessionBuilder::start_session`],
-/// this is `'static` because responders are spawned into background tasks.
+/// The `'runner` lifetime represents the span during which session support runners
+/// (such as MCP servers) are active. When created via [`SessionBuilder::start_session`],
+/// this is `'static` because the runners are spawned into background tasks.
 /// When created via [`SessionBuilder::run_until`], this is tied to the
 /// closure scope, preventing [`Self::proxy_remaining_messages`] from being called
-/// (since the responders would die when the closure returns).
+/// (since the runners would stop when the closure returns).
 #[derive(Debug)]
-pub struct ActiveSession<'responder, Link>
+pub struct ActiveSession<'runner, Link>
 where
     Link: HasPeer<Agent>,
 {
@@ -499,15 +517,15 @@ where
     /// Registration for the handler that routes session messages to `update_rx`.
     /// This is separate from MCP handlers so it can be dropped independently
     /// when switching to proxy mode.
-    session_handler_registration: DynamicHandlerRegistration<Link>,
+    session_handler_registration: DynamicHandlerGuard<Link>,
 
     /// Registrations for MCP server handlers.
     /// These will be dropped once the active-session struct is dropped
     /// which will cause them to be deregistered.
-    mcp_handler_registrations: Vec<DynamicHandlerRegistration<Link>>,
+    mcp_handler_registrations: Vec<DynamicHandlerGuard<Link>>,
 
-    /// Phantom lifetime representing the responder lifetime.
-    _responder: PhantomData<&'responder ()>,
+    /// Phantom lifetime representing the session-runner lifetime.
+    _runner: PhantomData<&'runner ()>,
 }
 
 /// Incoming message from the agent
@@ -536,13 +554,13 @@ where
     }
 
     /// Access modes available in this session.
-    pub fn modes(&self) -> &Option<SessionModeState> {
-        &self.modes
+    pub fn modes(&self) -> Option<&SessionModeState> {
+        self.modes.as_ref()
     }
 
     /// Access meta data from session response.
-    pub fn meta(&self) -> &Option<serde_json::Map<String, serde_json::Value>> {
-        &self.meta
+    pub fn meta(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        self.meta.as_ref()
     }
 
     /// Build a `NewSessionResponse` from the session information.
@@ -556,8 +574,8 @@ where
     }
 
     /// Access the underlying connection context used to communicate with the agent.
-    pub fn connection(&self) -> ConnectionTo<Link> {
-        self.connection.clone()
+    pub fn connection(&self) -> &ConnectionTo<Link> {
+        &self.connection
     }
 
     /// Send a prompt to the agent. You can then read messages sent in response.
@@ -631,8 +649,8 @@ where
     /// This consumes the `ActiveSession` since you're giving up active control.
     ///
     /// This method is only available on `ActiveSession<'static, _>` (from
-    /// [`SessionBuilder::start_session`]) because it requires responders to
-    /// outlive the method call.
+    /// [`SessionBuilder::start_session`]) because it requires the session's runners to outlive
+    /// the method call.
     ///
     /// # Message Ordering Guarantees
     ///
@@ -665,7 +683,7 @@ where
             // These fields are not needed for proxying
             modes: _,
             meta: _,
-            _responder,
+            _runner,
         } = self;
 
         // Step 1: Drop the session handler registration.
@@ -698,11 +716,11 @@ where
         // can take over. Any new messages will go directly through the proxy.
         connection
             .add_dynamic_handler(ProxySessionMessages::new(session_id))?
-            .run_indefinitely();
+            .detach();
 
         // Keep MCP server handlers alive for the lifetime of the proxy
         for registration in mcp_handler_registrations {
-            registration.run_indefinitely();
+            registration.detach();
         }
 
         Ok(())
@@ -739,7 +757,7 @@ where
             "ActiveSessionHandler::handle_dispatch"
         );
         MatchDispatchFrom::new(message, &cx)
-            .if_message_from(Agent, async |message| {
+            .if_dispatch_from(Agent, async |message| {
                 if let Some(session_id) = message.get_session_id()? {
                     tracing::trace!(
                         message_session_id = ?session_id,

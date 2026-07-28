@@ -6,20 +6,16 @@
 //!
 //! # Callback Return Types
 //!
-//! Almost all agent-client-protocol callbacks return `Result<_, crate::Error>`. What happens
-//! when you return an `Err` depends on the context:
-//!
-//! **Returning `Err` from a callback shuts down the connection.**
-//!
-//! This is appropriate for truly unrecoverable situations—internal bugs,
-//! resource exhaustion, or when you want to terminate the connection.
-//! But most of the time, you want to send an error *to the peer* while
-//! keeping the connection alive.
+//! Almost all agent-client-protocol callbacks return `Result<_, crate::Error>`.
+//! What happens when you return an `Err` depends on the context. An incoming
+//! request-handler error is sent to the peer as an Error Response, while an
+//! incoming notification-handler error is logged without a reply. Errors from
+//! connection-lifecycle callbacks can shut down the connection.
 //!
 //! # Sending Protocol Errors
 //!
-//! To send an error response to a request (without closing the connection),
-//! use the request context's `respond` method:
+//! To choose an error response explicitly while handling a request, use the
+//! request context's `respond` method:
 //!
 //! ```
 //! # use agent_client_protocol::{Client, Agent, ConnectTo};
@@ -42,20 +38,13 @@
 //! # }
 //! ```
 //!
-//! For sending error notifications (one-way error messages), use
-//! [`send_error_notification`][crate::ConnectionTo::send_error_notification]:
+//! JSON-RPC notifications are one-way and cannot receive success or error replies.
+//! The SDK logs notification parse and handler errors without answering them. If an
+//! application needs to report a one-way failure, define a notification method for
+//! that purpose.
 //!
-//! ```
-//! # use agent_client_protocol::{Client, Agent, ConnectTo};
-//! # async fn example(transport: impl ConnectTo<Client>) -> Result<(), agent_client_protocol::Error> {
-//! # Client.builder().connect_with(transport, async |cx| {
-//! cx.send_error_notification(agent_client_protocol::Error::internal_error()
-//!     .data("Something went wrong"))?;
-//! # Ok(())
-//! # }).await?;
-//! # Ok(())
-//! # }
-//! ```
+//! Malformed JSON and invalid request envelopes are handled at the SDK's transport
+//! boundary. Applications do not need to construct uncorrelated Error Responses.
 //!
 //! # The `into_internal_error` Helper
 //!
@@ -110,7 +99,7 @@
 //!
 //! | Situation | What to do |
 //! |-----------|------------|
-//! | Send error response to request | `responder.respond(Err(error))` then `Ok(())` |
-//! | Send error notification | `cx.send_error_notification(error)` then `Ok(())` |
-//! | Shut down connection | Return `Err(error)` from callback |
+//! | Send error response to request | `responder.respond_with_error(error)` |
+//! | Handle notification failure | Log or return the error; the SDK sends no reply |
+//! | Fail connection lifecycle work | Return `Err(error)` from a lifecycle callback |
 //! | Convert external error | `.map_err(Error::into_internal_error)?` |

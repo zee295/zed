@@ -10,19 +10,16 @@
 //!
 //! To implement a component, implement the `connect_to` method:
 //!
-//! ```rust,ignore
-//! use agent_client_protocol::{Agent, Client, Connect, Result};
+//! ```rust
+//! use agent_client_protocol::{Agent, Client, ConnectTo, Result};
 //!
-//! struct MyAgent {
-//!     // configuration fields
-//! }
+//! struct MyAgent;
 //!
 //! // An agent connects to clients
 //! impl ConnectTo<Client> for MyAgent {
 //!     async fn connect_to(self, client: impl ConnectTo<Agent>) -> Result<()> {
 //!         Agent.builder()
 //!             .name("my-agent")
-//!             // configure handlers here
 //!             .connect_to(client)
 //!             .await
 //!     }
@@ -40,11 +37,11 @@ use crate::{Channel, Result, role::Role};
 /// This trait represents anything that can communicate via JSON-RPC messages over channels -
 /// agents, proxies, in-process connections, or any ACP-speaking component.
 ///
-/// The type parameter `R` is the role that this component serves (its counterpart).
+/// The type parameter `R` is the role that this component connects to (its counterpart).
 /// For example:
-/// - An agent implements `Serve<Client>` - it serves clients
-/// - A proxy implements `Serve<Conductor>` - it serves conductors
-/// - Transports like `Channel` implement `Serve<R>` for all `R` since they're role-agnostic
+/// - An agent implements `ConnectTo<Client>` to connect to clients
+/// - A proxy implements `ConnectTo<Conductor>` to connect to conductors
+/// - Transports like `Channel` implement `ConnectTo<R>` for every `R` because they are role-agnostic
 ///
 /// # Component Types
 ///
@@ -55,35 +52,29 @@ use crate::{Channel, Result, role::Role};
 /// - **[`AcpAgent`]**: An external agent running in a separate process with stdio communication
 /// - **Custom components**: Proxies, transformers, or any ACP-aware service
 ///
-/// # Two Ways to Serve
+/// # Two Ways to Connect
 ///
 /// Components can be used in two ways:
 ///
-/// 1. **`serve(client)`** - Serve by forwarding to another component (most components implement this)
-/// 2. **`into_server()`** - Convert into a channel endpoint and server future (base cases implement this)
+/// 1. **`connect_to(client)`** - Connect directly to another component (most components implement this)
+/// 2. **`into_channel_and_future()`** - Obtain a channel endpoint and a future that drives the connection
 ///
-/// Most components only need to implement `serve(client)` - the `into_server()` method has a default
-/// implementation that creates an intermediate channel and calls `serve`.
+/// Most components only need to implement `connect_to(client)`. The
+/// `into_channel_and_future()` method has a default implementation that creates an intermediate
+/// channel and calls `connect_to`.
 ///
 /// # Implementation Example
 ///
-/// ```rust,ignore
-/// use agent_client_protocol::{Agent, Result, Serve, role::Client};
+/// ```rust
+/// use agent_client_protocol::{Agent, Client, ConnectTo, Result};
 ///
-/// struct MyAgent {
-///     config: AgentConfig,
-/// }
+/// struct MyAgent;
 ///
-/// impl Serve<Client> for MyAgent {
-///     async fn serve(self, client: impl Serve<Client::Counterpart>) -> Result<()> {
-///         // Set up connection that forwards to client
+/// impl ConnectTo<Client> for MyAgent {
+///     async fn connect_to(self, client: impl ConnectTo<Agent>) -> Result<()> {
 ///         Agent.builder()
 ///             .name("my-agent")
-///             .on_receive_request(async |req: MyRequest, cx| {
-///                 // Handle request
-///                 cx.respond(MyResponse { status: "ok".into() })
-///             })
-///             .serve(client)
+///             .connect_to(client)
 ///             .await
 ///     }
 /// }
@@ -93,45 +84,57 @@ use crate::{Channel, Result, role::Role};
 ///
 /// For storing different component types in the same collection, use [`DynConnectTo`]:
 ///
-/// ```rust,ignore
-/// use agent_client_protocol::Client;
+/// ```rust
+/// use agent_client_protocol::{Channel, Client, DynConnectTo};
 ///
+/// let (first, _first_peer) = Channel::duplex();
+/// let (second, _second_peer) = Channel::duplex();
 /// let components: Vec<DynConnectTo<Client>> = vec![
-///     DynConnectTo::new(proxy1),
-///     DynConnectTo::new(proxy2),
-///     DynConnectTo::new(agent),
+///     DynConnectTo::new(first),
+///     DynConnectTo::new(second),
 /// ];
+/// assert_eq!(components.len(), 2);
 /// ```
 ///
 /// [`ByteStreams`]: crate::ByteStreams
 /// [`AcpAgent`]: crate::AcpAgent
 /// [`Builder`]: crate::Builder
 pub trait ConnectTo<R: Role>: Send + 'static {
-    /// Serve this component by forwarding to a client component.
+    /// Connect this component to another component.
     ///
     /// Most components implement this method to set up their connection and
-    /// forward messages to the provided client.
+    /// exchange messages with the provided component.
     ///
     /// # Arguments
     ///
-    /// * `client` - The component to forward messages to (implements `Serve<R::Counterpart>`)
+    /// * `client` - The component to connect to (implements `ConnectTo<R::Counterpart>`)
     ///
     /// # Returns
     ///
-    /// A future that resolves when the component stops serving, either successfully
+    /// A future that resolves when the connection ends, either successfully
     /// or with an error. The future must be `Send`.
+    ///
+    /// A component that buffers outbound messages should not return `Ok(())`
+    /// merely because its client completed: it should first finish messages the
+    /// client already transferred to it. This lets wrappers preserve graceful
+    /// drain guarantees through to the physical transport sink. Errors may
+    /// still terminate the connection immediately.
     fn connect_to(
         self,
         client: impl ConnectTo<R::Counterpart>,
     ) -> impl Future<Output = Result<()>> + Send;
 
-    /// Convert this component into a channel endpoint and server future.
+    /// Convert this component into a channel endpoint and connection future.
+    ///
+    /// The returned [`Channel`] is the canonical frame-aware boundary. It carries
+    /// complete [`TransportFrame`](crate::TransportFrame) values so default
+    /// adapters preserve batch grouping.
     ///
     /// This method returns:
     /// - A `Channel` that can be used to communicate with this component
-    /// - A `BoxFuture` that runs the component's server logic
+    /// - A `BoxFuture` that drives the component's connection logic
     ///
-    /// The default implementation creates an intermediate channel pair and calls `serve`
+    /// The default implementation creates an intermediate channel pair and calls `connect_to`
     /// on one endpoint while returning the other endpoint for the caller to use.
     ///
     /// Base cases like `Channel` and `ByteStreams` override this to avoid unnecessary copying.
@@ -139,7 +142,7 @@ pub trait ConnectTo<R: Role>: Send + 'static {
     /// # Returns
     ///
     /// A tuple of `(Channel, BoxFuture)` where the channel is for the caller to use
-    /// and the future must be spawned to run the server.
+    /// and the future must be polled to drive the connection.
     fn into_channel_and_future(self) -> (Channel, BoxFuture<'static, Result<()>>)
     where
         Self: Sized,
@@ -156,7 +159,7 @@ pub trait ConnectTo<R: Role>: Send + 'static {
 /// [`ConnectTo`] instead, which is automatically converted to `ErasedConnectTo`
 /// via a blanket implementation.
 trait ErasedConnectTo<R: Role>: Send {
-    fn type_name(&self) -> String;
+    fn type_name(&self) -> &'static str;
 
     fn connect_to_erased(
         self: Box<Self>,
@@ -167,10 +170,10 @@ trait ErasedConnectTo<R: Role>: Send {
     -> (Channel, BoxFuture<'static, Result<()>>);
 }
 
-/// Blanket implementation: any `Serve<R>` can be type-erased.
+/// Blanket implementation: any `ConnectTo<R>` can be type-erased.
 impl<C: ConnectTo<R>, R: Role> ErasedConnectTo<R> for C {
-    fn type_name(&self) -> String {
-        std::any::type_name::<C>().to_string()
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<C>()
     }
 
     fn connect_to_erased(
@@ -200,18 +203,20 @@ impl<C: ConnectTo<R>, R: Role> ErasedConnectTo<R> for C {
 /// allowing you to store different component types in the same collection.
 ///
 /// The type parameter `R` is the role that all components in the
-/// collection serve (their counterpart).
+/// collection connect to (their counterpart).
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use agent_client_protocol::{DynConnectTo, Client};
+/// ```rust
+/// use agent_client_protocol::{Channel, Client, DynConnectTo};
 ///
+/// let (first, _first_peer) = Channel::duplex();
+/// let (second, _second_peer) = Channel::duplex();
 /// let components: Vec<DynConnectTo<Client>> = vec![
-///     DynConnectTo::new(Proxy1),
-///     DynConnectTo::new(Proxy2),
-///     DynConnectTo::new(Agent),
+///     DynConnectTo::new(first),
+///     DynConnectTo::new(second),
 /// ];
+/// assert_eq!(components.len(), 2);
 /// ```
 pub struct DynConnectTo<R: Role> {
     inner: Box<dyn ErasedConnectTo<R>>,
@@ -229,7 +234,7 @@ impl<R: Role> DynConnectTo<R> {
 
     /// Returns the type name of the wrapped component.
     #[must_use]
-    pub fn type_name(&self) -> String {
+    pub fn type_name(&self) -> &'static str {
         self.inner.type_name()
     }
 }
@@ -248,8 +253,27 @@ impl<R: Role> ConnectTo<R> for DynConnectTo<R> {
 
 impl<R: Role> Debug for DynConnectTo<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DynServe")
+        f.debug_struct("DynConnectTo")
             .field("type_name", &self.type_name())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::role::UntypedRole;
+
+    #[test]
+    fn dyn_connect_to_reports_static_type_name_and_correct_debug_label() {
+        let (channel, _other) = Channel::duplex();
+        let component = DynConnectTo::<UntypedRole>::new(channel);
+
+        let type_name: &'static str = component.type_name();
+        assert_eq!(type_name, std::any::type_name::<Channel>());
+        assert_eq!(
+            format!("{component:?}"),
+            format!("DynConnectTo {{ type_name: {type_name:?} }}")
+        );
     }
 }

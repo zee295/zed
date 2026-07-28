@@ -7,6 +7,7 @@ dist_dir="${ZED_WEB_DIST_DIR:-${web_dir}/dist}"
 static_dir="${dist_dir}/static"
 native_target="${ZED_WEB_NATIVE_TARGET:-${repo_dir}/target/web-native}"
 wasm_target="${CARGO_TARGET_DIR:-${repo_dir}/target/web-wasm}"
+wasi_sdk="${WASI_SDK_PATH:-${repo_dir}/target/wasi-sdk}"
 profile="${ZED_WEB_PROFILE:-web-release}"
 stable_toolchain="${RUST_STABLE_TOOLCHAIN:-1.95.0}"
 nightly_toolchain="${RUST_NIGHTLY_TOOLCHAIN:-nightly}"
@@ -40,6 +41,12 @@ install -m 0755 \
 
 export CARGO_TARGET_DIR="${wasm_target}"
 export RUSTFLAGS='--cfg getrandom_backend="wasm_js" -C target-feature=+atomics,+bulk-memory,+mutable-globals -C link-arg=--shared-memory -C link-arg=--import-memory -C link-arg=--max-memory=4294967296 -C link-arg=--export=__heap_base -C link-arg=--export=__stack_pointer -C link-arg=--export=__tls_size -C link-arg=--export=__tls_align -C link-arg=--export=__tls_base -C link-arg=--export=__wasm_init_tls -C link-arg=--export=__wasm_call_ctors'
+
+if [[ ! -x "${wasi_sdk}/bin/clang" ]]; then
+    "${repo_dir}/script/download-wasi-sdk"
+fi
+export CC_wasm32_unknown_unknown="${wasi_sdk}/bin/clang"
+export CFLAGS_wasm32_unknown_unknown="-isystem ${wasi_sdk}/share/wasi-sysroot/include/wasm32-wasi"
 
 rustup run "${nightly_toolchain}" cargo build \
     --manifest-path "${repo_dir}/Cargo.toml" \
