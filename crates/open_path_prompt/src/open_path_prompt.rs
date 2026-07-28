@@ -44,6 +44,7 @@ pub struct OpenPathDelegate {
         Arc<dyn Fn(&mut Window, &mut Context<Picker<Self>>) -> Option<AnyElement> + 'static>,
     hidden_entries: bool,
     directories_only: bool,
+    can_select_directories: bool,
     sort_mode: ProjectPanelSortMode,
 }
 
@@ -77,6 +78,7 @@ impl OpenPathDelegate {
             render_footer: Arc::new(|_, _| None),
             hidden_entries: false,
             directories_only: false,
+            can_select_directories: true,
             sort_mode,
         }
     }
@@ -98,6 +100,11 @@ impl OpenPathDelegate {
 
     pub fn directories_only(mut self, directories_only: bool) -> Self {
         self.directories_only = directories_only;
+        self
+    }
+
+    pub fn can_select_directories(mut self, can_select_directories: bool) -> Self {
+        self.can_select_directories = can_select_directories;
         self
     }
 
@@ -243,6 +250,7 @@ impl OpenPathPrompt {
                 false,
                 None,
                 options.directories && !options.files,
+                options.directories,
                 tx,
                 window,
                 cx,
@@ -271,6 +279,7 @@ impl OpenPathPrompt {
         creating_path: bool,
         suggested_name: Option<String>,
         directories_only: bool,
+        can_select_directories: bool,
         tx: oneshot::Sender<Option<Vec<PathBuf>>>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
@@ -278,7 +287,8 @@ impl OpenPathPrompt {
         workspace.toggle_modal(window, cx, |window, cx| {
             let delegate = OpenPathDelegate::new(tx, lister.clone(), creating_path, cx)
                 .show_hidden()
-                .directories_only(directories_only);
+                .directories_only(directories_only)
+                .can_select_directories(can_select_directories);
             let picker = Picker::uniform_list(delegate, window, cx);
             let mut query = lister.default_query(cx);
             if let Some(suggested_name) = suggested_name {
@@ -302,6 +312,7 @@ impl OpenPathPrompt {
             lister,
             true,
             suggested_name,
+            false,
             false,
             tx,
             window,
@@ -379,6 +390,7 @@ impl PickerDelegate for OpenPathDelegate {
         let parent_path_is_root = self.prompt_root == dir;
         let current_dir = self.current_dir();
         let directories_only = self.directories_only;
+        let can_select_directories = self.can_select_directories;
         let sort_mode = self.sort_mode;
         cx.spawn_in(window, async move |this, cx| {
             if let Some(query) = query {
@@ -394,7 +406,9 @@ impl PickerDelegate for OpenPathDelegate {
                             | DirectoryState::List { .. } => match paths {
                                 Ok(paths) => DirectoryState::List {
                                     entries: path_candidates(
-                                        parent_path_is_root && !directories_only,
+                                        parent_path_is_root
+                                            && can_select_directories
+                                            && !directories_only,
                                         paths,
                                         sort_mode,
                                     ),
@@ -411,7 +425,9 @@ impl PickerDelegate for OpenPathDelegate {
                             | DirectoryState::Create { .. } => match paths {
                                 Ok(paths) => {
                                     let mut entries = path_candidates(
-                                        parent_path_is_root && !directories_only,
+                                        parent_path_is_root
+                                            && can_select_directories
+                                            && !directories_only,
                                         paths,
                                         sort_mode,
                                     );
@@ -505,7 +521,7 @@ impl PickerDelegate for OpenPathDelegate {
                     .any(|entry| &entry.path.string == current_dir);
 
                 if should_prepend_with_current_dir
-                    && (!directories_only || !parent_path_is_root)
+                    && (!parent_path_is_root || (can_select_directories && !directories_only))
                     && !current_dir_in_new_entries
                 {
                     new_entries.insert(
@@ -691,11 +707,11 @@ impl PickerDelegate for OpenPathDelegate {
         _window: &mut Window,
         _cx: &mut Context<Picker<Self>>,
     ) -> Option<String> {
-        if !self.directories_only {
-            return None;
-        }
         let candidate = self.get_entry(self.selected_index)?;
         if !candidate.is_dir || candidate.path.string.is_empty() {
+            return None;
+        }
+        if !self.directories_only && self.can_select_directories {
             return None;
         }
         let DirectoryState::List { parent_path, .. } = &self.directory_state else {
@@ -841,7 +857,8 @@ impl PickerDelegate for OpenPathDelegate {
             .unwrap_or_default();
 
         let is_current_dir_candidate = candidate.path.string == self.current_dir();
-        let is_go_back_candidate = self.directories_only && is_current_dir_candidate;
+        let is_go_back_candidate =
+            (self.directories_only || !self.can_select_directories) && is_current_dir_candidate;
 
         let file_icon = maybe!({
             if !settings.file_icons {

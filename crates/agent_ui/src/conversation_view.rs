@@ -2678,6 +2678,9 @@ impl ConversationView {
                 Some(self.create_copy_button(msg.to_string()).into_any_element()),
             ),
             LoadError::Exited { status, stderr } => {
+                #[cfg(target_family = "wasm")]
+                let mut message = "Server process exited (exit code unavailable)".to_string();
+                #[cfg(not(target_family = "wasm"))]
                 let mut message = format!("Server exited with status {status}");
                 if let Some(stderr) = stderr {
                     message.push_str("\n");
