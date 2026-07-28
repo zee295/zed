@@ -40,7 +40,7 @@ use crate::agent_connection_store::AgentConnectionStore;
 use crate::completion_provider::{AgentContextSelection, AgentContextSource};
 use crate::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, compose_terminal_thread_title,
-    terminal_title_without_prefix,
+    terminal_title_without_prefix, terminal_working_directory_title,
 };
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
 use crate::{
@@ -1031,6 +1031,8 @@ impl AgentTerminal {
         let title = self.current_terminal_title(cx);
         if title.is_empty() && !self.last_known_terminal_title.is_empty() {
             SharedString::from(self.last_known_terminal_title.clone())
+        } else if title.is_empty() {
+            terminal_working_directory_title(self.working_directory.as_deref()).unwrap_or(title)
         } else {
             title
         }

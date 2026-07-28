@@ -65,11 +65,23 @@ impl TerminalThreadMetadata {
     }
 
     pub fn display_title(&self) -> SharedString {
-        compose_terminal_thread_title(
+        let title = compose_terminal_thread_title(
             self.title.as_ref(),
             self.custom_title.as_ref().map(|title| title.as_ref()),
-        )
+        );
+        if title.is_empty() {
+            terminal_working_directory_title(self.working_directory.as_deref()).unwrap_or(title)
+        } else {
+            title
+        }
     }
+}
+
+pub(crate) fn terminal_working_directory_title(path: Option<&Path>) -> Option<SharedString> {
+    let path = path?;
+    let name = path.file_name().unwrap_or_else(|| path.as_os_str());
+    let name = name.to_string_lossy();
+    (!name.trim().is_empty()).then(|| SharedString::from(name.into_owned()))
 }
 
 pub(crate) fn compose_terminal_thread_title(
@@ -657,6 +669,16 @@ mod tests {
 
         metadata.title = "Thinking".into();
         assert_eq!(metadata.display_title().as_ref(), "Fix bug");
+    }
+
+    #[test]
+    fn test_terminal_thread_display_title_uses_working_directory_as_fallback() {
+        let mut metadata = metadata("", WorktreePaths::from_folder_paths(&PathList::default()));
+        metadata.working_directory = Some(PathBuf::from("/home/dev/web/studio"));
+        assert_eq!(metadata.display_title().as_ref(), "studio");
+
+        metadata.custom_title = Some("Dev Server".into());
+        assert_eq!(metadata.display_title().as_ref(), "Dev Server");
     }
 
     #[gpui::test]
