@@ -7113,12 +7113,20 @@ async fn discover_git_paths(dot_git_abs_path: &Arc<Path>, fs: &dyn Fs) -> (Arc<P
     let mut repository_dir_abs_path = dot_git_abs_path.clone();
     let mut common_dir_abs_path = dot_git_abs_path.clone();
 
-    if let Some(path) = fs
-        .load(dot_git_abs_path)
+    let dot_git_is_file = fs
+        .metadata(dot_git_abs_path)
         .await
         .ok()
-        .as_ref()
-        .and_then(|contents| parse_gitfile(contents).log_err())
+        .flatten()
+        .is_some_and(|metadata| !metadata.is_dir);
+
+    if dot_git_is_file
+        && let Some(path) = fs
+            .load(dot_git_abs_path)
+            .await
+            .ok()
+            .as_ref()
+            .and_then(|contents| parse_gitfile(contents).log_err())
     {
         let path = resolve_gitfile_path(dot_git_abs_path, path);
         if let Some(path) = fs.canonicalize(&path).await.log_err() {
