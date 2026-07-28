@@ -161,7 +161,8 @@ impl ProcessManager {
             .filter(|program| !program.is_empty())
             .ok_or_else(|| anyhow::anyhow!("missing process program"))?;
         let root = self.fs.path("/workspace")?;
-        let rewrite = |value: &str| self.fs.rewrite_legacy_workspace_path(value);
+        let rewrite = |value: &str| rewrite_process_value(&self.fs, value);
+        let program = rewrite(program);
         let raw_args = params
             .get("args")
             .and_then(Value::as_array)
@@ -170,7 +171,7 @@ impl ProcessManager {
             .filter_map(Value::as_str)
             .map(rewrite)
             .collect::<Vec<_>>();
-        let (program, args) = crate::debug_adapter::resolve(program, raw_args)?;
+        let (program, args) = crate::debug_adapter::resolve(&program, raw_args)?;
         let sanitize_lldb = program
             .file_name()
             .and_then(|name| name.to_str())
@@ -507,7 +508,8 @@ pub fn dispatch(fs: &FsRpc, method: &str, params: &Value) -> Result<Value> {
         .filter(|program| !program.is_empty())
         .ok_or_else(|| anyhow::anyhow!("missing process program"))?;
     let root = fs.path("/workspace")?;
-    let rewrite = |value: &str| fs.rewrite_legacy_workspace_path(value);
+    let rewrite = |value: &str| rewrite_process_value(fs, value);
+    let program = rewrite(program);
     let args = params
         .get("args")
         .and_then(Value::as_array)
@@ -523,7 +525,7 @@ pub fn dispatch(fs: &FsRpc, method: &str, params: &Value) -> Result<Value> {
         .map(|path| fs.path(&path))
         .transpose()?
         .unwrap_or_else(|| root.clone());
-    let mut command = Command::new(program);
+    let mut command = Command::new(&program);
     command.args(args).current_dir(&cwd);
     for (key, value) in environment(params) {
         command.env(key, rewrite(&value));
@@ -546,6 +548,23 @@ pub fn dispatch(fs: &FsRpc, method: &str, params: &Value) -> Result<Value> {
             Ok(json!({"status_code": status.code().unwrap_or(-1)}))
         }
         _ => bail!("unknown process method: {method}"),
+    }
+}
+
+fn rewrite_process_value(fs: &FsRpc, value: &str) -> String {
+    let rewritten = fs.rewrite_legacy_workspace_path(value);
+    if rewritten != value {
+        return rewritten;
+    }
+
+    let Some((prefix, path)) = value.split_once('=') else {
+        return value.to_string();
+    };
+    let rewritten_path = fs.rewrite_legacy_workspace_path(path);
+    if rewritten_path == path {
+        value.to_string()
+    } else {
+        format!("{prefix}={rewritten_path}")
     }
 }
 
@@ -743,11 +762,14 @@ fn sanitize_lldb_frame(frame: Vec<u8>) -> Vec<u8> {
 mod tests {
     use std::sync::Arc;
 
+    use anyhow::Result;
     use axum::extract::ws::Message;
     use serde_json::json;
     use tokio::sync::mpsc;
 
-    use super::{AcpActivity, FrameRewriter, ProcessManager, sanitize_lldb_frame};
+    use super::{
+        AcpActivity, FrameRewriter, ProcessManager, rewrite_process_value, sanitize_lldb_frame,
+    };
     use crate::fs_rpc::FsRpc;
 
     #[test]
@@ -822,6 +844,27 @@ mod tests {
             chunks.concat(),
             br#"{"cwd":"/srv/project","path":"/srv/project/src"}\n"#
         );
+    }
+
+    #[test]
+    fn rewrites_virtual_process_paths_inside_option_assignments() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let fs = FsRpc::new(root.path().to_path_buf(), false)?;
+        let physical_root = root.path().canonicalize()?;
+
+        assert_eq!(
+            rewrite_process_value(&fs, "--cache=/workspace/.config/zed/node/cache"),
+            format!("--cache={}/.config/zed/node/cache", physical_root.display())
+        );
+        assert_eq!(
+            rewrite_process_value(&fs, "/workspace/.config/zed/node"),
+            format!("{}/.config/zed/node", physical_root.display())
+        );
+        assert_eq!(
+            rewrite_process_value(&fs, "/home/dev/web/workspace"),
+            "/home/dev/web/workspace"
+        );
+        Ok(())
     }
 
     #[test]
