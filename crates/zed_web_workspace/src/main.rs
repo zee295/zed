@@ -862,6 +862,38 @@ fn install_web_open_actions(cx: &mut App) {
 
     cx.observe_new(|workspace: &mut workspace::Workspace, _window, _cx| {
         workspace
+            .register_action(|workspace, _: &workspace::Open, window, cx| {
+                let app_state = workspace::AppState::global(cx);
+                workspace::prompt_for_open_path_and_open(
+                    workspace,
+                    app_state,
+                    PathPromptOptions {
+                        files: true,
+                        directories: true,
+                        multiple: true,
+                        prompt: Some("Open file or folder from server".into()),
+                    },
+                    false,
+                    window,
+                    cx,
+                );
+            })
+            .register_action(|workspace, _: &workspace::OpenFiles, window, cx| {
+                let app_state = workspace::AppState::global(cx);
+                workspace::prompt_for_open_path_and_open(
+                    workspace,
+                    app_state,
+                    PathPromptOptions {
+                        files: true,
+                        directories: false,
+                        multiple: true,
+                        prompt: Some("Open file from server".into()),
+                    },
+                    false,
+                    window,
+                    cx,
+                );
+            })
             .register_action(|workspace, _: &OpenRemoteFiles, window, cx| {
                 let app_state = workspace::AppState::global(cx);
                 workspace::prompt_for_open_path_and_open(

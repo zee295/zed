@@ -101,7 +101,7 @@ impl OpenPathDelegate {
         self
     }
 
-    fn confirm_current_directory(&mut self, cx: &mut Context<Picker<Self>>) {
+    fn confirm_directory(&mut self, cx: &mut Context<Picker<Self>>) {
         let parent_path = match &self.directory_state {
             DirectoryState::List {
                 parent_path,
@@ -112,7 +112,13 @@ impl OpenPathDelegate {
             | DirectoryState::Create { .. }
             | DirectoryState::None { .. } => return,
         };
-        let confirmed_path = PathBuf::from(self.lister.resolve_tilde(parent_path, cx).as_ref());
+        let mut confirmed_path = PathBuf::from(self.lister.resolve_tilde(parent_path, cx).as_ref());
+        if let Some(candidate) = self.get_entry(self.selected_index)
+            && candidate.is_dir
+            && candidate.path.string != self.current_dir()
+        {
+            confirmed_path.push(candidate.path.string);
+        }
         if let Some(tx) = self.tx.take() {
             tx.send(Some(vec![confirmed_path])).ok();
             cx.emit(gpui::DismissEvent);
@@ -962,7 +968,7 @@ impl PickerDelegate for OpenPathDelegate {
         self.directories_only.then(|| {
             Button::new("open-current-directory", "Open")
                 .on_click(cx.listener(|picker, _, _window, cx| {
-                    picker.delegate.confirm_current_directory(cx);
+                    picker.delegate.confirm_directory(cx);
                 }))
                 .into_any_element()
         })
