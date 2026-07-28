@@ -1,10 +1,10 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
-    sync::Arc,
     sync::Mutex as StdMutex,
     sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, UNIX_EPOCH},
+    sync::{Arc, LazyLock},
+    time::Duration,
 };
 
 #[cfg(test)]
@@ -12,6 +12,11 @@ use anyhow::Context as _;
 use anyhow::{Result, bail};
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt as _, StreamExt as _};
+use notify::{
+    Config as NotifyConfig, Event as NotifyEvent, EventKind, EventKindMask, RecommendedWatcher,
+    RecursiveMode, Watcher as _,
+    event::{ModifyKind, RenameMode},
+};
 use serde_json::{Value, json};
 #[cfg(test)]
 use std::fs;
@@ -712,87 +717,282 @@ fn start_watch(
     outgoing: mpsc::UnboundedSender<Message>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let path = key.path;
-        let mut known: Option<HashMap<PathBuf, (u64, u128)>> = None;
-        loop {
-            let scan_started = std::time::Instant::now();
-            let snapshot_path = path.clone();
-            let current = match tokio::task::spawn_blocking(move || watch_snapshot(&snapshot_path))
-                .await
-            {
-                Ok(Ok(snapshot)) => snapshot,
-                Ok(Err(error)) => {
-                    tracing::warn!(?error, path = %path.display(), "filesystem watch scan failed");
-                    tokio::time::sleep(watch_delay(key.latency, scan_started.elapsed())).await;
-                    continue;
-                }
-                Err(error) => {
-                    tracing::warn!(?error, path = %path.display(), "filesystem watch task failed");
-                    break;
-                }
-            };
-            let Some(previous) = known.as_ref() else {
-                known = Some(current);
-                tokio::time::sleep(watch_delay(key.latency, scan_started.elapsed())).await;
-                continue;
-            };
-            let mut events = Vec::new();
-            for (path, stamp) in &current {
-                let kind = match previous.get(path) {
-                    None => Some("created"),
-                    Some(old) if old != stamp => Some("changed"),
-                    Some(_) => None,
-                };
-                if let Some(kind) = kind {
-                    events.push((path.clone(), kind));
-                }
-            }
-            for path in previous.keys() {
-                if !current.contains_key(path) {
-                    events.push((path.clone(), "removed"));
-                }
-            }
-            if !events.is_empty() {
-                let subscriptions = subscription_paths
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .iter()
-                    .map(|(id, path)| (*id, path.clone()))
-                    .collect::<Vec<_>>();
-                for (subscription_id, subscription_path) in subscriptions {
-                    let subscription_events = events
-                        .iter()
-                        .filter(|(path, _)| path.starts_with(&subscription_path))
-                        .map(|(path, kind)| json!({"path": fs_rpc.virtualize(path), "kind": kind}))
-                        .collect::<Vec<_>>();
-                    if subscription_events.is_empty() {
-                        continue;
-                    }
-                    if outgoing
-                        .send(Message::Text(
-                            json!({
-                                "method": "Fs::watch_event",
-                                "params": {
-                                    "subscription_id": subscription_id,
-                                    "events": subscription_events
-                                }
-                            })
-                            .to_string(),
-                        ))
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-            }
-            known = Some(current);
-            tokio::time::sleep(watch_delay(key.latency, scan_started.elapsed())).await;
+        if let Err(error) = run_watch(fs_rpc, key.clone(), subscription_paths, outgoing).await {
+            tracing::warn!(
+                ?error,
+                path = %key.path.display(),
+                "filesystem watch stopped"
+            );
         }
     })
 }
 
-fn watch_delay(latency: Duration, scan_duration: Duration) -> Duration {
-    latency.max(scan_duration.saturating_mul(2))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatchBackendKind {
+    Native,
+    Poll,
+}
+
+trait WatchBackend: Send {
+    fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()>;
+}
+
+impl<T: notify::Watcher + Send> WatchBackend for T {
+    fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
+        notify::Watcher::watch(self, path, mode)
+    }
+}
+
+async fn run_watch(
+    fs_rpc: Arc<FsRpc>,
+    key: WatchKey,
+    subscription_paths: Arc<StdMutex<HashMap<u64, PathBuf>>>,
+    outgoing: mpsc::UnboundedSender<Message>,
+) -> Result<()> {
+    let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+    #[cfg(target_os = "linux")]
+    let (mut watcher, mut registered_paths, mut backend_kind) =
+        create_watch_backend(&key.path, event_sender.clone())?;
+    #[cfg(not(target_os = "linux"))]
+    let (_watcher, _registered_paths, _backend_kind) =
+        create_watch_backend(&key.path, event_sender.clone())?;
+
+    while let Some(first_event) = event_receiver.recv().await {
+        let mut events = Vec::new();
+        push_notify_result(first_event, &key.path, &mut events);
+
+        #[cfg(target_os = "linux")]
+        if backend_kind == WatchBackendKind::Native
+            && register_created_directories(
+                watcher.as_mut(),
+                &key.path,
+                &events,
+                &mut registered_paths,
+            )
+        {
+            (watcher, registered_paths, backend_kind) =
+                create_poll_backend(&key.path, event_sender.clone())?;
+        }
+
+        let deadline = tokio::time::Instant::now() + key.latency;
+        while let Ok(Some(event)) = tokio::time::timeout_at(deadline, event_receiver.recv()).await {
+            #[cfg(target_os = "linux")]
+            let previous_len = events.len();
+            push_notify_result(event, &key.path, &mut events);
+            #[cfg(target_os = "linux")]
+            if backend_kind == WatchBackendKind::Native
+                && register_created_directories(
+                    watcher.as_mut(),
+                    &key.path,
+                    &events[previous_len..],
+                    &mut registered_paths,
+                )
+            {
+                (watcher, registered_paths, backend_kind) =
+                    create_poll_backend(&key.path, event_sender.clone())?;
+            }
+        }
+
+        let events = normalize_notify_events(&key.path, events);
+        if events.is_empty() {
+            continue;
+        }
+        if !send_watch_events(&fs_rpc, &subscription_paths, &outgoing, &events) {
+            return Ok(());
+        }
+    }
+
+    Ok(())
+}
+
+type WatchSetup = (Box<dyn WatchBackend>, HashSet<PathBuf>, WatchBackendKind);
+
+fn create_watch_backend(
+    root: &Path,
+    event_sender: mpsc::UnboundedSender<notify::Result<NotifyEvent>>,
+) -> Result<WatchSetup> {
+    if requires_poll_watcher(root) {
+        return create_poll_backend(root, event_sender);
+    }
+
+    let config = NotifyConfig::default().with_event_kinds(EventKindMask::CORE);
+    let callback_sender = event_sender.clone();
+    let mut watcher = RecommendedWatcher::new(
+        move |event| {
+            callback_sender.send(event).ok();
+        },
+        config,
+    )?;
+
+    match register_native_initial_watches(&mut watcher, root) {
+        Ok(registered) => {
+            tracing::info!(
+                path = %root.display(),
+                directories = registered.len(),
+                "using native filesystem watcher"
+            );
+            Ok((Box::new(watcher), registered, WatchBackendKind::Native))
+        }
+        Err(error) if is_max_files_watch_error(&error) => {
+            tracing::warn!(
+                path = %root.display(),
+                "native filesystem watch limit reached; falling back to polling"
+            );
+            create_poll_backend(root, event_sender)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn create_poll_backend(
+    root: &Path,
+    event_sender: mpsc::UnboundedSender<notify::Result<NotifyEvent>>,
+) -> Result<WatchSetup> {
+    let config = NotifyConfig::default().with_poll_interval(file_watcher_poll_interval());
+    let mut watcher = notify::PollWatcher::new(
+        move |event| {
+            event_sender.send(event).ok();
+        },
+        config,
+    )?;
+    let watch_root = closest_existing_directory(root)
+        .ok_or_else(|| anyhow::anyhow!("no existing ancestor for {}", root.display()))?;
+    notify::Watcher::watch(
+        &mut watcher,
+        &watch_root,
+        if watch_root == root {
+            RecursiveMode::Recursive
+        } else {
+            RecursiveMode::NonRecursive
+        },
+    )?;
+    tracing::info!(
+        path = %root.display(),
+        interval_ms = file_watcher_poll_interval().as_millis(),
+        "using polling filesystem watcher"
+    );
+    Ok((Box::new(watcher), HashSet::new(), WatchBackendKind::Poll))
+}
+
+fn is_max_files_watch_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<notify::Error>()
+        .is_some_and(|error| matches!(error.kind, notify::ErrorKind::MaxFilesWatch))
+}
+
+static FILE_WATCHER_POLL_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
+    let milliseconds = std::env::var("ZED_FILE_WATCHER_POLL_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(2000)
+        .clamp(500, 30_000);
+    Duration::from_millis(milliseconds)
+});
+
+fn file_watcher_poll_interval() -> Duration {
+    *FILE_WATCHER_POLL_INTERVAL
+}
+
+fn push_notify_result(
+    result: notify::Result<NotifyEvent>,
+    root: &Path,
+    events: &mut Vec<NotifyEvent>,
+) {
+    match result {
+        Ok(event) => events.push(event),
+        Err(error) => {
+            tracing::warn!(?error, path = %root.display(), "native filesystem watch error");
+        }
+    }
+}
+
+fn normalize_notify_events(root: &Path, events: Vec<NotifyEvent>) -> Vec<(PathBuf, &'static str)> {
+    let mut normalized = HashMap::<PathBuf, &'static str>::new();
+    for event in events {
+        if event.paths.is_empty() {
+            if event.need_rescan() {
+                normalized.insert(root.to_path_buf(), "changed");
+            }
+            continue;
+        }
+        for (index, path) in event.paths.into_iter().enumerate() {
+            if !watch_covers_path(root, &path) {
+                continue;
+            }
+            let Some(kind) = notify_event_kind(&event.kind, index) else {
+                continue;
+            };
+            normalized
+                .entry(path)
+                .and_modify(|existing| *existing = merge_watch_event_kinds(existing, kind))
+                .or_insert(kind);
+        }
+    }
+    normalized.into_iter().collect()
+}
+
+fn notify_event_kind(kind: &EventKind, path_index: usize) -> Option<&'static str> {
+    match kind {
+        EventKind::Access(_) => None,
+        EventKind::Create(_) => Some("created"),
+        EventKind::Remove(_) => Some("removed"),
+        EventKind::Modify(ModifyKind::Name(RenameMode::From)) => Some("removed"),
+        EventKind::Modify(ModifyKind::Name(RenameMode::To)) => Some("created"),
+        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => Some(if path_index == 0 {
+            "removed"
+        } else {
+            "created"
+        }),
+        EventKind::Modify(_) | EventKind::Any | EventKind::Other => Some("changed"),
+    }
+}
+
+fn merge_watch_event_kinds(previous: &str, next: &'static str) -> &'static str {
+    match (previous, next) {
+        ("created", "changed") | ("created", "created") => "created",
+        ("removed", "created") => "changed",
+        (_, next) => next,
+    }
+}
+
+fn send_watch_events(
+    fs_rpc: &FsRpc,
+    subscription_paths: &StdMutex<HashMap<u64, PathBuf>>,
+    outgoing: &mpsc::UnboundedSender<Message>,
+    events: &[(PathBuf, &'static str)],
+) -> bool {
+    let subscriptions = subscription_paths
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+        .map(|(id, path)| (*id, path.clone()))
+        .collect::<Vec<_>>();
+    for (subscription_id, subscription_path) in subscriptions {
+        let subscription_events = events
+            .iter()
+            .filter(|(path, _)| path.starts_with(&subscription_path))
+            .map(|(path, kind)| json!({"path": fs_rpc.virtualize(path), "kind": kind}))
+            .collect::<Vec<_>>();
+        if subscription_events.is_empty() {
+            continue;
+        }
+        if outgoing
+            .send(Message::Text(
+                json!({
+                    "method": "Fs::watch_event",
+                    "params": {
+                        "subscription_id": subscription_id,
+                        "events": subscription_events
+                    }
+                })
+                .to_string(),
+            ))
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
 }
 
 const WATCH_EXCLUDED_DIRECTORIES: &[&str] = &[
@@ -826,6 +1026,7 @@ fn watch_covers_path(root: &Path, path: &Path) -> bool {
     })
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn watch_entry_is_excluded(root: &Path, entry: &walkdir::DirEntry) -> bool {
     if entry.depth() == 0 || !entry.file_type().is_dir() {
         return false;
@@ -840,43 +1041,207 @@ fn watch_entry_is_excluded(root: &Path, entry: &walkdir::DirEntry) -> bool {
             .is_ok_and(|path| path.ends_with(Path::new(".config/zed/node/cache")))
 }
 
-fn watch_snapshot(root: &Path) -> Result<HashMap<PathBuf, (u64, u128)>> {
-    let mut snapshot = HashMap::new();
-    if !root.exists() {
-        return Ok(snapshot);
+fn closest_existing_directory(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|ancestor| ancestor.is_dir())
+        .map(Path::to_path_buf)
+}
+
+fn register_native_initial_watches(
+    watcher: &mut dyn WatchBackend,
+    root: &Path,
+) -> Result<HashSet<PathBuf>> {
+    let watch_root = closest_existing_directory(root)
+        .ok_or_else(|| anyhow::anyhow!("no existing ancestor for {}", root.display()))?;
+
+    #[cfg(target_os = "linux")]
+    let directories = if watch_root == root {
+        watch_directories(root, root)
+    } else {
+        vec![watch_root]
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    let directories = vec![watch_root.clone()];
+
+    let mut registered = HashSet::new();
+    for directory in directories {
+        #[cfg(target_os = "linux")]
+        let mode = RecursiveMode::NonRecursive;
+        #[cfg(not(target_os = "linux"))]
+        let mode = if watch_root == root {
+            RecursiveMode::Recursive
+        } else {
+            RecursiveMode::NonRecursive
+        };
+        watcher.watch(&directory, mode)?;
+        registered.insert(directory);
     }
-    let walker = walkdir::WalkDir::new(root)
+    Ok(registered)
+}
+
+fn requires_poll_watcher(path: &Path) -> bool {
+    match std::env::var("ZED_FILE_WATCHER_MODE")
+        .as_deref()
+        .unwrap_or("auto")
+    {
+        "native" => return false,
+        "poll" => return true,
+        _ => {}
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        detect_requires_poll_watcher_linux(path)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn detect_requires_poll_watcher_linux(path: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let Some(existing_path) = closest_existing_directory(path) else {
+        return false;
+    };
+    let Ok(c_path) = CString::new(existing_path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return false;
+    }
+
+    const V9FS_MAGIC: u64 = 0x0102_1997;
+    const NFS_SUPER_MAGIC: u64 = 0x0000_6969;
+    const CIFS_MAGIC: u64 = 0xFF53_4D42;
+    const SMB_SUPER_MAGIC: u64 = 0x0000_517B;
+    const SMB2_MAGIC: u64 = 0xFE53_4D42;
+    const FUSE_SUPER_MAGIC: u64 = 0x6573_5546;
+
+    let filesystem_type = (stat.f_type as u64) & 0xFFFF_FFFF;
+    let requires_poll = matches!(
+        filesystem_type,
+        V9FS_MAGIC | NFS_SUPER_MAGIC | CIFS_MAGIC | SMB_SUPER_MAGIC | SMB2_MAGIC | FUSE_SUPER_MAGIC
+    ) && !(filesystem_type == FUSE_SUPER_MAGIC && is_virtiofs(path));
+    requires_poll || is_wsl_drvfs_path(path)
+}
+
+#[cfg(target_os = "linux")]
+fn is_virtiofs(path: &Path) -> bool {
+    let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    let mut best_mount = None;
+    for line in mountinfo.lines() {
+        let fields = line.split(' ').collect::<Vec<_>>();
+        let Some(separator) = fields.iter().position(|field| *field == "-") else {
+            continue;
+        };
+        let (Some(mount_point), Some(filesystem_type)) = (fields.get(4), fields.get(separator + 1))
+        else {
+            continue;
+        };
+        let mount_point = mount_point
+            .replace("\\040", " ")
+            .replace("\\011", "\t")
+            .replace("\\012", "\n")
+            .replace("\\134", "\\");
+        if path.starts_with(&mount_point)
+            && best_mount.is_none_or(|(length, _)| mount_point.len() > length)
+        {
+            best_mount = Some((mount_point.len(), *filesystem_type));
+        }
+    }
+    best_mount
+        .is_some_and(|(_, filesystem_type)| matches!(filesystem_type, "virtiofs" | "fuse.virtiofs"))
+}
+
+#[cfg(target_os = "linux")]
+fn is_wsl_drvfs_path(path: &Path) -> bool {
+    if std::env::var_os("WSL_DISTRO_NAME").is_none() {
+        let Ok(version) = std::fs::read_to_string("/proc/version") else {
+            return false;
+        };
+        let version = version.to_lowercase();
+        if !version.contains("microsoft") && !version.contains("wsl") {
+            return false;
+        }
+    }
+    let Some(path) = path.to_str() else {
+        return false;
+    };
+    let Some(after_mnt) = path.strip_prefix("/mnt/") else {
+        return false;
+    };
+    after_mnt.starts_with(|character: char| character.is_ascii_alphabetic())
+        && (after_mnt.len() == 1 || after_mnt.as_bytes()[1] == b'/')
+}
+
+// Linux's inotify backend is non-recursive. This mirrors desktop Zed: register
+// discovered directories and add new ones when create events arrive.
+#[cfg(target_os = "linux")]
+fn register_created_directories(
+    watcher: &mut dyn WatchBackend,
+    root: &Path,
+    events: &[NotifyEvent],
+    registered: &mut HashSet<PathBuf>,
+) -> bool {
+    let mut watch_limit_reached = false;
+    for event in events {
+        if !matches!(
+            event.kind,
+            EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(_))
+        ) {
+            continue;
+        }
+        for path in &event.paths {
+            if !path.is_dir() || !watch_covers_path(root, path) {
+                continue;
+            }
+            for directory in watch_directories(root, path) {
+                if !registered.insert(directory.clone()) {
+                    continue;
+                }
+                if let Err(error) = watcher.watch(&directory, RecursiveMode::NonRecursive) {
+                    registered.remove(&directory);
+                    if matches!(error.kind, notify::ErrorKind::MaxFilesWatch) {
+                        watch_limit_reached = true;
+                        break;
+                    }
+                    tracing::warn!(
+                        ?error,
+                        path = %directory.display(),
+                        "failed to watch newly created directory"
+                    );
+                }
+            }
+        }
+    }
+    watch_limit_reached
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn watch_directories(root: &Path, start: &Path) -> Vec<PathBuf> {
+    walkdir::WalkDir::new(start)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|entry| !watch_entry_is_excluded(root, entry));
-    for entry in walker {
-        let entry = match entry {
-            Ok(entry) => entry,
+        .filter_entry(|entry| !watch_entry_is_excluded(root, entry))
+        .filter_map(|entry| match entry {
+            Ok(entry) if entry.file_type().is_dir() => Some(entry.into_path()),
+            Ok(_) => None,
             Err(error) => {
                 tracing::debug!(?error, root = %root.display(), "skipping unreadable watch entry");
-                continue;
+                None
             }
-        };
-        let metadata = match entry.metadata() {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                tracing::debug!(
-                    ?error,
-                    path = %entry.path().display(),
-                    "skipping vanished watch entry"
-                );
-                continue;
-            }
-        };
-        let modified = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .map(|duration| duration.as_nanos())
-            .unwrap_or_default();
-        snapshot.insert(entry.path().to_path_buf(), (metadata.len(), modified));
-    }
-    Ok(snapshot)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -982,8 +1347,52 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn filesystem_watch_tracks_files_created_in_new_directories() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let fs_rpc = Arc::new(FsRpc::new(root.path().to_path_buf(), false)?);
+        let key = watch_key(&fs_rpc, &json!({"path": "/workspace", "latency": 0.05}))?;
+        let subscription_paths = Arc::new(StdMutex::new(HashMap::from([(8, key.path.clone())])));
+        let (outgoing, mut notifications) = mpsc::unbounded_channel();
+        let task = start_watch(fs_rpc, key, subscription_paths, outgoing);
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        fs::create_dir_all(root.path().join("new/nested"))?;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        fs::write(root.path().join("new/nested/main.rs"), "fn main() {}")?;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut received_file_event = false;
+        while let Ok(Some(message)) = tokio::time::timeout_at(deadline, notifications.recv()).await
+        {
+            let Message::Text(message) = message else {
+                continue;
+            };
+            let message: Value = serde_json::from_str(&message)?;
+            received_file_event = message["params"]["events"]
+                .as_array()
+                .is_some_and(|events| {
+                    events.iter().any(|event| {
+                        event["path"]
+                            .as_str()
+                            .is_some_and(|path| path.ends_with("/new/nested/main.rs"))
+                    })
+                });
+            if received_file_event {
+                break;
+            }
+        }
+
+        task.abort();
+        assert!(
+            received_file_event,
+            "a file created under a newly watched directory was not reported"
+        );
+        Ok(())
+    }
+
     #[test]
-    fn filesystem_watch_snapshot_skips_generated_directories() -> Result<()> {
+    fn filesystem_watch_registration_skips_generated_directories() -> Result<()> {
         let root = tempfile::tempdir()?;
         fs::create_dir_all(root.path().join("src"))?;
         fs::create_dir_all(root.path().join("node_modules/package"))?;
@@ -1000,13 +1409,53 @@ mod tests {
             "cache",
         )?;
 
-        let snapshot = watch_snapshot(root.path())?;
+        let directories = watch_directories(root.path(), root.path());
 
-        assert!(snapshot.contains_key(&root.path().join("src/main.rs")));
-        assert!(!snapshot.contains_key(&root.path().join("node_modules")));
-        assert!(!snapshot.contains_key(&root.path().join(".git")));
-        assert!(!snapshot.contains_key(&root.path().join(".config/zed/node/cache")));
+        assert!(directories.contains(&root.path().to_path_buf()));
+        assert!(directories.contains(&root.path().join("src")));
+        assert!(!directories.contains(&root.path().join("node_modules")));
+        assert!(!directories.contains(&root.path().join("node_modules/package")));
+        assert!(!directories.contains(&root.path().join(".git")));
+        assert!(!directories.contains(&root.path().join(".config/zed/node/cache")));
         Ok(())
+    }
+
+    #[test]
+    fn normalizes_rename_and_ignores_excluded_events() {
+        let root = Path::new("/workspace/project");
+        let events = normalize_notify_events(
+            root,
+            vec![
+                NotifyEvent {
+                    paths: vec![
+                        root.join("old.rs"),
+                        root.join("new.rs"),
+                        root.join("node_modules/package/index.js"),
+                    ],
+                    ..NotifyEvent::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+                },
+                NotifyEvent {
+                    paths: vec![root.join("new.rs")],
+                    ..NotifyEvent::new(EventKind::Modify(ModifyKind::Data(
+                        notify::event::DataChange::Any,
+                    )))
+                },
+            ],
+        );
+
+        assert!(normalized_contains(&events, "old.rs", "removed"));
+        assert!(normalized_contains(&events, "new.rs", "created"));
+        assert!(
+            events
+                .iter()
+                .all(|(path, _)| !path.starts_with(root.join("node_modules")))
+        );
+    }
+
+    fn normalized_contains(events: &[(PathBuf, &'static str)], suffix: &str, kind: &str) -> bool {
+        events
+            .iter()
+            .any(|(path, event_kind)| path.ends_with(suffix) && *event_kind == kind)
     }
 
     #[test]
