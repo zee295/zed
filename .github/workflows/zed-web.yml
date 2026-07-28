@@ -42,9 +42,14 @@ jobs:
           rustup toolchain install 1.95.0
           rustup toolchain install nightly --component rust-src
           rustup target add wasm32-unknown-unknown --toolchain nightly
+      - name: Install WASI SDK
+        run: ./script/download-wasi-sdk
       - name: Test Rust backend
         run: rustup run 1.95.0 cargo test -p zed_web_server --bin zed-web-server
       - name: Check WASM frontend
+        env:
+          CC_wasm32_unknown_unknown: ${{ github.workspace }}/target/wasi-sdk/bin/clang
+          CFLAGS_wasm32_unknown_unknown: -isystem ${{ github.workspace }}/target/wasi-sdk/share/wasi-sysroot/include/wasm32-wasi
         run: >-
           cargo +nightly check -p zed_web_workspace
           --target wasm32-unknown-unknown
