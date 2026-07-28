@@ -25,7 +25,10 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::{AppState, fs_rpc::FsRpc};
+use crate::{
+    AppState,
+    fs_rpc::{FsRpc, is_server_owned_workspace_path},
+};
 
 #[derive(Default)]
 pub struct SessionRegistry {
@@ -1012,10 +1015,7 @@ fn watch_covers_path(root: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return false;
     };
-    if relative
-        .ancestors()
-        .any(|ancestor| ancestor.ends_with(Path::new(".config/zed/node/cache")))
-    {
+    if is_server_owned_workspace_path(root, path) {
         return false;
     }
     !relative.components().any(|component| {
@@ -1035,10 +1035,7 @@ fn watch_entry_is_excluded(root: &Path, entry: &walkdir::DirEntry) -> bool {
         .file_name()
         .to_str()
         .is_some_and(|name| WATCH_EXCLUDED_DIRECTORIES.contains(&name))
-        || entry
-            .path()
-            .strip_prefix(root)
-            .is_ok_and(|path| path.ends_with(Path::new(".config/zed/node/cache")))
+        || is_server_owned_workspace_path(root, entry.path())
 }
 
 fn closest_existing_directory(path: &Path) -> Option<PathBuf> {
@@ -1398,7 +1395,11 @@ mod tests {
         fs::create_dir_all(root.path().join("node_modules/package"))?;
         fs::create_dir_all(root.path().join(".git/objects"))?;
         fs::create_dir_all(root.path().join(".config/zed/node/cache/package"))?;
+        fs::create_dir_all(root.path().join(".zed/extensions/example"))?;
+        fs::create_dir_all(root.path().join(".zed"))?;
         fs::write(root.path().join("src/main.rs"), "fn main() {}")?;
+        fs::write(root.path().join(".zed/settings.json"), "{}")?;
+        fs::write(root.path().join(".zed/remote.sqlite-wal"), "runtime state")?;
         fs::write(
             root.path().join("node_modules/package/index.js"),
             "module.exports = {}",
@@ -1417,6 +1418,16 @@ mod tests {
         assert!(!directories.contains(&root.path().join("node_modules/package")));
         assert!(!directories.contains(&root.path().join(".git")));
         assert!(!directories.contains(&root.path().join(".config/zed/node/cache")));
+        assert!(!directories.contains(&root.path().join(".zed/extensions")));
+        assert!(directories.contains(&root.path().join(".zed")));
+        assert!(watch_covers_path(
+            root.path(),
+            &root.path().join(".zed/settings.json")
+        ));
+        assert!(!watch_covers_path(
+            root.path(),
+            &root.path().join(".zed/remote.sqlite-wal")
+        ));
         Ok(())
     }
 
@@ -1469,6 +1480,22 @@ mod tests {
         assert!(!watch_covers_path(
             root,
             Path::new("/workspace/.config/zed/node/cache/package")
+        ));
+        assert!(!watch_covers_path(
+            root,
+            Path::new("/workspace/.config/zed/settings.json")
+        ));
+        assert!(!watch_covers_path(
+            root,
+            Path::new("/workspace/.zed/extensions/example/extension.toml")
+        ));
+        assert!(!watch_covers_path(
+            root,
+            Path::new("/workspace/.zed/remote.sqlite-wal")
+        ));
+        assert!(watch_covers_path(
+            root,
+            Path::new("/workspace/.zed/settings.json")
         ));
     }
 

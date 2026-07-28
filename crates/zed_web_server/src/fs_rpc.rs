@@ -422,8 +422,11 @@ impl FsRpc {
                 if entry_count >= MAX_ENTRIES {
                     break;
                 }
-                entry_count += 1;
                 let path = entry.path();
+                if is_server_owned_workspace_path(&root, &path) {
+                    continue;
+                }
+                entry_count += 1;
                 let virtual_path = self.virtualize(&path);
                 let Ok(entry_metadata) = entry.metadata() else {
                     continue;
@@ -542,6 +545,27 @@ fn should_prefetch_directory(entry: &fs::DirEntry) -> bool {
     )
 }
 
+pub(crate) fn is_server_owned_workspace_path(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    if relative.starts_with(Path::new(".config/zed"))
+        || relative.starts_with(Path::new(".zed/extensions"))
+    {
+        return true;
+    }
+    let Some(file_name) = relative
+        .strip_prefix(".zed")
+        .ok()
+        .filter(|path| path.components().count() == 1)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+    file_name == "web-auth-token" || file_name.starts_with("remote.sqlite")
+}
+
 fn remove_path(path: &Path) -> Result<()> {
     if path.is_dir() && !path.is_symlink() {
         fs::remove_dir_all(path)?;
@@ -646,7 +670,19 @@ mod tests {
         let root = tempfile::tempdir()?;
         fs::create_dir_all(root.path().join("src/nested"))?;
         fs::create_dir_all(root.path().join("node_modules/package"))?;
+        fs::create_dir_all(root.path().join(".zed/extensions/example"))?;
+        fs::create_dir_all(root.path().join(".config/zed/node/cache"))?;
         fs::write(root.path().join("src/nested/main.rs"), "fn main() {}")?;
+        fs::write(root.path().join(".zed/settings.json"), "{}")?;
+        fs::write(root.path().join(".zed/remote.sqlite-wal"), "runtime state")?;
+        fs::write(
+            root.path().join(".zed/extensions/example/extension.toml"),
+            "id = \"example\"",
+        )?;
+        fs::write(
+            root.path().join(".config/zed/node/cache/package.json"),
+            "{}",
+        )?;
         fs::write(
             root.path().join("node_modules/package/index.js"),
             "module.exports = {};",
@@ -664,6 +700,17 @@ mod tests {
         assert!(tree["directories"].get("/workspace/src").is_some());
         assert!(tree["directories"].get("/workspace/src/nested").is_some());
         assert!(tree["directories"].get("/workspace/node_modules").is_none());
+        assert!(
+            tree["directories"]
+                .get("/workspace/.zed")
+                .is_some_and(|entries| entries.as_array().is_some_and(|entries| entries
+                    .iter()
+                    .any(|entry| entry == "/workspace/.zed/settings.json")))
+        );
+        let serialized = tree.to_string();
+        assert!(!serialized.contains("remote.sqlite"));
+        assert!(!serialized.contains("/workspace/.zed/extensions"));
+        assert!(!serialized.contains("/workspace/.config/zed"));
         Ok(())
     }
 }
