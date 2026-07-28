@@ -9,6 +9,7 @@ ARG DEBIAN_RUNTIME_SUITE=trixie
 FROM rust:${RUST_VERSION}-bookworm AS builder
 
 ARG RUST_VERSION
+ARG TARGETARCH
 ARG WEB_REVISION=unknown
 ARG UPSTREAM_REVISION=unknown
 ARG BROTLI_QUALITY=11
@@ -25,9 +26,9 @@ RUN rustup toolchain install "${RUST_VERSION}" \
     && cargo install wasm-bindgen-cli --version 0.2.120 --locked
 
 COPY . .
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/src/target \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=zed-web-target-${TARGETARCH},target=/src/target \
     WEB_REVISION="${WEB_REVISION}" \
     UPSTREAM_REVISION="${UPSTREAM_REVISION}" \
     BROTLI_QUALITY="${BROTLI_QUALITY}" \
