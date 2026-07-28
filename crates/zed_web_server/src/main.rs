@@ -28,6 +28,7 @@ use axum::{
     routing::{any, get},
 };
 use clap::Parser;
+use rand::RngCore as _;
 use serde::Deserialize;
 use tokio::fs;
 
@@ -55,6 +56,7 @@ pub struct AppState {
     root: Arc<PathBuf>,
     static_root: Arc<PathBuf>,
     auth_token: Arc<String>,
+    server_instance_id: Arc<String>,
     secure_cookie: bool,
     restrict_paths: bool,
     login_limiter: Arc<auth::LoginLimiter>,
@@ -98,12 +100,18 @@ async fn main() -> Result<()> {
     initialize_config(&root).await?;
     let (auth_token, token_path, created) = load_auth_token(&root, args.auth_token).await?;
     let sql = Arc::new(sql_rpc::SqlRpc::new(&root)?);
+    let server_instance_id = {
+        let mut bytes = [0_u8; 32];
+        rand::rng().fill_bytes(&mut bytes);
+        hex::encode(bytes)
+    };
     let (events, _) = tokio::sync::broadcast::channel(256);
     let (shutdown, _) = tokio::sync::broadcast::channel(1);
     let state = AppState {
         root: Arc::new(root),
         static_root: Arc::new(static_root),
         auth_token: Arc::new(auth_token),
+        server_instance_id: Arc::new(server_instance_id),
         secure_cookie: args.secure_cookie,
         restrict_paths,
         login_limiter: Arc::new(auth::LoginLimiter::default()),

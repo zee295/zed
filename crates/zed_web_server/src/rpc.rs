@@ -260,6 +260,20 @@ impl Drop for RpcSession {
 pub async fn serve(socket: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = socket.split();
     let (outgoing, mut outgoing_rx) = mpsc::unbounded_channel::<Message>();
+    if outgoing
+        .send(Message::Text(
+            json!({
+                "method": "Server::hello",
+                "params": {
+                    "instance_id": state.server_instance_id.as_str()
+                }
+            })
+            .to_string(),
+        ))
+        .is_err()
+    {
+        return;
+    }
     let writer = tokio::spawn(async move {
         while let Some(message) = outgoing_rx.recv().await {
             if sender.send(message).await.is_err() {

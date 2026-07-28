@@ -37,12 +37,18 @@ export function zedRpcCreate(url, onOpen, onMessage, onClose, onError) {
     // the server process session. A project switch updates the URL without
     // replacing this socket, and a reload must attach to that same session.
     const sessionId = `workspace:${workspaceSession}`;
+    let serverInstanceStorageKey = "zed.rpc.serverInstance";
+    try {
+        serverInstanceStorageKey += `:${new URL(url, self.location.href).origin}`;
+    } catch (_) {}
     const state = {
         active: true,
         attempt: 0,
         queue: [],
+        readySocket: null,
         reconnectTimer: 0,
         sessionId,
+        serverInstanceId: null,
         socket: null,
     };
 
@@ -63,6 +69,58 @@ export function zedRpcCreate(url, onOpen, onMessage, onClose, onError) {
         }, delay);
     };
 
+    const completeOpen = socket => {
+        if (state.socket !== socket || state.readySocket === socket) return;
+        state.readySocket = socket;
+        state.attempt = 0;
+        self.__zedRpcConnectionState = "open";
+        onOpen();
+        while (state.queue.length && socket.readyState === WebSocket.OPEN) {
+            socket.send(state.queue.shift());
+        }
+    };
+
+    const handleServerHello = (socket, message) => {
+        if (typeof message !== "string") return false;
+        let envelope;
+        try {
+            envelope = JSON.parse(message);
+        } catch (_) {
+            return false;
+        }
+        if (envelope?.method !== "Server::hello" || envelope?.id != null) return false;
+        const instanceId = envelope?.params?.instance_id;
+        if (typeof instanceId !== "string" || !instanceId) {
+            onError("Server::hello did not include an instance ID");
+            socket.close(4002, "invalid server handshake");
+            return true;
+        }
+
+        let previousInstanceId = state.serverInstanceId;
+        try {
+            previousInstanceId ||= self.sessionStorage?.getItem(serverInstanceStorageKey);
+        } catch (_) {}
+
+        state.serverInstanceId = instanceId;
+        try {
+            self.sessionStorage?.setItem(serverInstanceStorageKey, instanceId);
+        } catch (_) {}
+
+        if (previousInstanceId && previousInstanceId !== instanceId) {
+            state.active = false;
+            state.readySocket = null;
+            self.__zedRpcConnectionState = "server-restarted";
+            socket.close(4001, "server restarted");
+            if (typeof self.location?.reload === "function") {
+                self.location.reload();
+            }
+            return true;
+        }
+
+        completeOpen(socket);
+        return true;
+    };
+
     const connect = () => {
         if (!state.active) return;
         if (self.navigator && !self.navigator.onLine) {
@@ -81,18 +139,22 @@ export function zedRpcCreate(url, onOpen, onMessage, onClose, onError) {
         socket.binaryType = "arraybuffer";
         socket.onopen = () => {
             if (state.socket !== socket) return;
-            state.attempt = 0;
-            self.__zedRpcConnectionState = "open";
-            onOpen();
-            while (state.queue.length && socket.readyState === WebSocket.OPEN) {
-                socket.send(state.queue.shift());
-            }
+            self.__zedRpcConnectionState = "handshaking";
         };
-        socket.onmessage = event => onMessage(event.data);
+        socket.onmessage = event => {
+            if (handleServerHello(socket, event.data)) return;
+            if (state.readySocket !== socket) {
+                onError("RPC message received before Server::hello");
+                socket.close(4002, "server handshake required");
+                return;
+            }
+            onMessage(event.data);
+        };
         socket.onerror = () => onError("WebSocket transport error");
         socket.onclose = event => {
             if (state.socket !== socket) return;
             state.socket = null;
+            state.readySocket = null;
             self.__zedRpcConnectionState = "reconnecting";
             onClose(event.code, event.reason || "connection closed");
             scheduleReconnect();
@@ -121,7 +183,7 @@ export function zedRpcCreate(url, onOpen, onMessage, onClose, onError) {
         send(message) {
             message = identify(message);
             const socket = state.socket;
-            if (socket?.readyState === WebSocket.OPEN) {
+            if (state.readySocket === socket && socket?.readyState === WebSocket.OPEN) {
                 socket.send(message);
                 return;
             }
@@ -138,6 +200,7 @@ export function zedRpcCreate(url, onOpen, onMessage, onClose, onError) {
             self.removeEventListener?.("offline", offline);
             state.socket?.close(1000, "client closed");
             state.socket = null;
+            state.readySocket = null;
             state.queue.length = 0;
         },
     };
