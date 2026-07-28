@@ -65,6 +65,7 @@ impl FsRpc {
             "Fs::metadata" => self.metadata(params),
             "Fs::read_link" => self.read_link(params),
             "Fs::read_dir" => self.read_dir(params),
+            "Fs::read_dir_with_types" => self.read_dir_with_types(params),
             "Fs::read_dir_tree" => self.read_dir_tree(params),
             "Fs::is_case_sensitive" => Ok(Value::Bool(false)),
             "Fs::git_init" => self.git_init(params),
@@ -397,6 +398,31 @@ impl FsRpc {
         }))
     }
 
+    fn read_dir_with_types(&self, params: &Value) -> Result<Value> {
+        let path = self.path(self.requested(params, "path"))?;
+        if !path.exists() {
+            return Ok(json!({"entries": []}));
+        }
+        if !path.is_dir() {
+            bail!("not a directory: {}", path.display());
+        }
+        let mut entries = fs::read_dir(path)?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let path = entry.path();
+                let is_dir = entry.metadata().ok()?.is_dir();
+                Some((self.virtualize(&path), is_dir))
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|(a, _), (b, _)| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
+        Ok(json!({
+            "entries": entries
+                .into_iter()
+                .map(|(path, is_dir)| json!({"path": path, "is_dir": is_dir}))
+                .collect::<Vec<_>>()
+        }))
+    }
+
     fn read_dir_tree(&self, params: &Value) -> Result<Value> {
         const MAX_ENTRIES: usize = 50_000;
 
@@ -693,6 +719,36 @@ mod tests {
         }
         let content = fs::read_to_string(root.path().join("settings.json"))?;
         assert!(content.starts_with("value-"));
+        Ok(())
+    }
+
+    #[test]
+    fn typed_directory_listing_is_shallow() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::create_dir_all(root.path().join("src/nested"))?;
+        fs::write(root.path().join("README.md"), "read me")?;
+        fs::write(root.path().join("src/nested/main.rs"), "fn main() {}")?;
+        let rpc = FsRpc::new(root.path().to_path_buf(), false)?;
+        let root = root.path().canonicalize()?;
+
+        let response = rpc.dispatch(
+            "Fs::read_dir_with_types",
+            &json!({"path": root.display().to_string()}),
+        )?;
+        let entries = response["entries"].as_array().context("missing entries")?;
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|entry| {
+            entry["path"] == root.join("src").display().to_string() && entry["is_dir"] == true
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry["path"] == root.join("README.md").display().to_string()
+                && entry["is_dir"] == false
+        }));
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry["path"] != root.join("src/nested").display().to_string())
+        );
         Ok(())
     }
 

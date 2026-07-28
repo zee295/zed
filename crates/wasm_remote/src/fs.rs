@@ -140,6 +140,17 @@ struct ReadDirTreeResponse {
 }
 
 #[derive(Deserialize)]
+struct ReadDirWithTypesResponse {
+    entries: Vec<ReadDirEntryResponse>,
+}
+
+#[derive(Deserialize)]
+struct ReadDirEntryResponse {
+    path: String,
+    is_dir: bool,
+}
+
+#[derive(Deserialize)]
 struct RestoreResponse {
     ok: bool,
     path: Option<String>,
@@ -515,6 +526,24 @@ impl Fs for RemoteFs {
             .map(|s| Ok(std::path::PathBuf::from(s)))
             .collect::<Vec<_>>();
         Ok(Box::pin(stream::iter(entries)))
+    }
+
+    async fn read_dir_with_types(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<Vec<(std::path::PathBuf, bool)>> {
+        let response: ReadDirWithTypesResponse = self
+            .client
+            .call(
+                "Fs::read_dir_with_types",
+                &json!({ "path": path_arg(path) }),
+            )
+            .await?;
+        Ok(response
+            .entries
+            .into_iter()
+            .map(|entry| (std::path::PathBuf::from(entry.path), entry.is_dir))
+            .collect())
     }
 
     async fn watch(

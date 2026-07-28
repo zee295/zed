@@ -1058,20 +1058,19 @@ impl DirectoryLister {
             DirectoryLister::Local(_, fs) => {
                 let fs = fs.clone();
                 cx.background_spawn(async move {
-                    let mut results = vec![];
                     let expanded = shellexpand::tilde(&path);
                     let query = Path::new(expanded.as_ref());
-                    let mut response = fs.read_dir(query).await?;
-                    while let Some(path) = response.next().await {
-                        let path = path?;
-                        if let Some(file_name) = path.file_name() {
-                            results.push(DirectoryItem {
-                                path: PathBuf::from(file_name.to_os_string()),
-                                is_dir: fs.is_dir(&path).await,
-                            });
-                        }
-                    }
-                    Ok(results)
+                    Ok(fs
+                        .read_dir_with_types(query)
+                        .await?
+                        .into_iter()
+                        .filter_map(|(path, is_dir)| {
+                            path.file_name().map(|file_name| DirectoryItem {
+                                path: PathBuf::from(file_name),
+                                is_dir,
+                            })
+                        })
+                        .collect())
                 })
             }
         }

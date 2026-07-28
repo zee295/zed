@@ -161,6 +161,16 @@ pub trait Fs: Send + Sync {
         &self,
         path: &Path,
     ) -> Result<Pin<Box<dyn Send + Stream<Item = Result<PathBuf>>>>>;
+    async fn read_dir_with_types(&self, path: &Path) -> Result<Vec<(PathBuf, bool)>> {
+        let mut entries = Vec::new();
+        let mut paths = self.read_dir(path).await?;
+        while let Some(path) = paths.next().await {
+            let path = path?;
+            let is_dir = self.is_dir(&path).await;
+            entries.push((path, is_dir));
+        }
+        Ok(entries)
+    }
 
     async fn watch(
         &self,
