@@ -150,6 +150,27 @@ impl MainThreadMailbox {
             }
         });
     }
+
+    fn run_poll_loop(self: &Arc<Self>, window: web_sys::Window) {
+        let mailbox = Arc::clone(self);
+        wasm_bindgen_futures::spawn_local(async move {
+            loop {
+                let timeout = js_sys::Promise::new(&mut |resolve, reject| {
+                    if let Err(error) =
+                        window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 16)
+                    {
+                        if let Err(reject_error) = reject.call1(&JsValue::UNDEFINED, &error) {
+                            log::error!("failed to reject mailbox timer: {reject_error:?}");
+                        }
+                    }
+                });
+                if wasm_bindgen_futures::JsFuture::from(timeout).await.is_err() {
+                    break;
+                }
+                mailbox.drain(&window);
+            }
+        });
+    }
 }
 
 pub struct WebDispatcher {
@@ -186,7 +207,11 @@ impl WebDispatcher {
         #[cfg(feature = "multithreaded")]
         if supports_threads {
             main_thread_mailbox.run_waker_loop(browser_window.clone());
+        } else {
+            main_thread_mailbox.run_poll_loop(browser_window.clone());
         }
+        #[cfg(not(feature = "multithreaded"))]
+        main_thread_mailbox.run_poll_loop(browser_window.clone());
 
         if allow_threads && !supports_threads {
             log::warn!(
