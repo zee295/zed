@@ -101,24 +101,28 @@ impl OpenPathDelegate {
         self
     }
 
-    fn confirm_directory(&mut self, cx: &mut Context<Picker<Self>>) {
-        let parent_path = match &self.directory_state {
+    fn confirm_directory(&mut self, query: &String, cx: &mut Context<Picker<Self>>) {
+        let (query_parent, query_name) = get_dir_and_suffix(query.clone(), self.path_style);
+        let query_is_directory = match &self.directory_state {
             DirectoryState::List {
                 parent_path,
+                entries,
                 error: None,
                 ..
-            } => parent_path,
+            } if parent_path == &query_parent => {
+                query_name.is_empty()
+                    || entries
+                        .iter()
+                        .any(|entry| entry.is_dir && entry.path.string == query_name)
+            }
             DirectoryState::List { .. }
             | DirectoryState::Create { .. }
-            | DirectoryState::None { .. } => return,
+            | DirectoryState::None { .. } => false,
         };
-        let mut confirmed_path = PathBuf::from(self.lister.resolve_tilde(parent_path, cx).as_ref());
-        if let Some(candidate) = self.get_entry(self.selected_index)
-            && candidate.is_dir
-            && candidate.path.string != self.current_dir()
-        {
-            confirmed_path.push(candidate.path.string);
+        if !query_is_directory {
+            return;
         }
+        let confirmed_path = PathBuf::from(self.lister.resolve_tilde(query, cx).as_ref());
         if let Some(tx) = self.tx.take() {
             tx.send(Some(vec![confirmed_path])).ok();
             cx.emit(gpui::DismissEvent);
@@ -968,7 +972,8 @@ impl PickerDelegate for OpenPathDelegate {
         self.directories_only.then(|| {
             Button::new("open-current-directory", "Open")
                 .on_click(cx.listener(|picker, _, _window, cx| {
-                    picker.delegate.confirm_directory(cx);
+                    let query = picker.query(cx);
+                    picker.delegate.confirm_directory(&query, cx);
                 }))
                 .into_any_element()
         })
