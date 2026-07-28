@@ -81,8 +81,10 @@ impl FsRpc {
         };
         let (candidate, project_relative) = if raw == VIRTUAL_ROOT {
             (self.root.as_ref().clone(), true)
-        } else if raw.starts_with(&format!("{VIRTUAL_ROOT}/")) {
-            let relative = raw.trim_start_matches(VIRTUAL_ROOT).trim_start_matches('/');
+        } else if let Some(relative) = raw
+            .strip_prefix(VIRTUAL_ROOT)
+            .and_then(|relative| relative.strip_prefix('/'))
+        {
             (self.root.join(relative), true)
         } else {
             let path = Path::new(raw);
@@ -617,6 +619,14 @@ mod tests {
         assert_eq!(
             rpc.path("/workspace")?.to_string_lossy(),
             root.path().canonicalize()?.to_string_lossy()
+        );
+        assert_eq!(
+            rpc.path("/workspace/workspace")?,
+            root.path().canonicalize()?.join("workspace")
+        );
+        assert_eq!(
+            rpc.path("/workspace/workspace/src")?,
+            root.path().canonicalize()?.join("workspace/src")
         );
         assert!(rpc.path("/workspace/../outside").is_err());
         Ok(())
