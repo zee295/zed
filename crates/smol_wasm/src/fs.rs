@@ -73,6 +73,7 @@ impl File {
 
     pub async fn open(path: impl AsRef<Path>) -> io::Result<File> {
         let path = path.as_ref().to_path_buf();
+        ensure_file(&path).await?;
         let encoded: String =
             rpc_call("Fs::load_bytes", &json!({ "path": path_str(&path) })).await?;
         let data = base64::engine::general_purpose::STANDARD
@@ -200,6 +201,7 @@ impl OpenOptions {
 }
 
 pub async fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
+    ensure_file(path.as_ref()).await?;
     let encoded: String = rpc_call(
         "Fs::load_bytes",
         &json!({ "path": path_str(path.as_ref()) }),
@@ -211,7 +213,19 @@ pub async fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
 }
 
 pub async fn read_to_string(path: impl AsRef<Path>) -> io::Result<String> {
+    ensure_file(path.as_ref()).await?;
     rpc_call("Fs::load", &json!({ "path": path_str(path.as_ref()) })).await
+}
+
+async fn ensure_file(path: &Path) -> io::Result<()> {
+    if is_file(path).await? {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("file not found: {}", path.display()),
+        ))
+    }
 }
 
 pub async fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> io::Result<()> {
