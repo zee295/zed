@@ -846,6 +846,8 @@ impl AcpConnection {
         let builder = ShellBuilder::new(&Shell::System, cfg!(windows)).non_interactive();
         let mut child = builder.build_std_command(Some(path.clone()), &args);
         child.envs(env.clone());
+        #[cfg(target_family = "wasm")]
+        child.env("ZED_WEB_PROCESS_KIND", "acp-agent");
         if let Some(cwd) = project.read_with(cx, |project, _cx| {
             if project.is_local() {
                 root_dir.as_ref()

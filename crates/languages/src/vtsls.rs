@@ -25,6 +25,10 @@ const ACTION_ALWAYS: &str = "Always";
 const ACTION_NEVER: &str = "Never";
 const UPDATE_IMPORTS_MESSAGE_PATTERN: &str = "Update imports for";
 const VTSLS_SERVER_NAME: &str = "vtsls";
+#[cfg(target_family = "wasm")]
+const MAX_TS_SERVER_MEMORY_MB: u32 = 2048;
+#[cfg(not(target_family = "wasm"))]
+const MAX_TS_SERVER_MEMORY_MB: u32 = 8192;
 
 fn typescript_server_binary_arguments(server_path: &Path) -> Vec<OsString> {
     vec![server_path.into(), "--stdio".into()]
@@ -281,7 +285,7 @@ impl LspAdapter for VtslsLspAdapter {
                 "showOnAllFunctions": true
             },
             "tsserver": {
-                "maxTsServerMemory": 8192
+                "maxTsServerMemory": MAX_TS_SERVER_MEMORY_MB
             },
         });
 

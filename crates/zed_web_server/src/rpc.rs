@@ -647,12 +647,20 @@ pub async fn serve(socket: WebSocket, state: AppState) {
             session.processes.clone()
         };
         processes.lock().await.detach_generation(generation);
+        let processes_for_cleanup = processes.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(30)).await;
             session
                 .lock()
                 .await
                 .remove_watches_for_generation(generation);
+            let reaped = processes_for_cleanup
+                .lock()
+                .await
+                .reap_orphaned_language_servers(generation);
+            if reaped > 0 {
+                tracing::info!(generation, reaped, "reaped orphaned language servers");
+            }
         });
     }
     drop(outgoing);

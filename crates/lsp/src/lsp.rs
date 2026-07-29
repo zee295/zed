@@ -454,6 +454,8 @@ impl LanguageServer {
             &binary.arguments
         );
         let mut command = util::command::new_command(&binary.path);
+        #[cfg(target_family = "wasm")]
+        command.env("ZED_WEB_PROCESS_KIND", "language-server");
         command
             .current_dir(working_dir)
             .args(&binary.arguments)

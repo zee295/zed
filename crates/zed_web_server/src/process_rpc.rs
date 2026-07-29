@@ -6,6 +6,9 @@ use std::{
     sync::{Arc, Mutex as StdMutex},
 };
 
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use anyhow::{Context as _, Result, bail};
 use axum::extract::ws::Message;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -18,6 +21,8 @@ use tokio::{
 };
 
 use crate::fs_rpc::FsRpc;
+
+const PROCESS_KIND_ENV: &str = "ZED_WEB_PROCESS_KIND";
 
 pub fn handles(method: &str) -> bool {
     matches!(method, "Process::output" | "Process::status")
@@ -46,11 +51,41 @@ pub struct ProcessManager {
 struct ProcessEntry {
     owner_generation: u64,
     disconnected: bool,
+    kind: ProcessKind,
+    identity: Option<ProcessIdentity>,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     stdin_rewriter: Mutex<FrameRewriter>,
     acp_activity: Arc<StdMutex<AcpActivity>>,
     sanitize_lldb: bool,
+    #[cfg(target_os = "linux")]
+    process_group_id: Option<u32>,
+    #[cfg(target_os = "linux")]
+    process_group_active: Arc<AtomicBool>,
     task: JoinHandle<()>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessKind {
+    AcpAgent,
+    LanguageServer,
+    Generic,
+}
+
+impl ProcessKind {
+    fn from_environment(environment: &mut HashMap<String, String>) -> Self {
+        match environment.remove(PROCESS_KIND_ENV).as_deref() {
+            Some("acp-agent") => Self::AcpAgent,
+            Some("language-server") => Self::LanguageServer,
+            _ => Self::Generic,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProcessIdentity {
+    program: PathBuf,
+    args: Vec<String>,
+    cwd: PathBuf,
 }
 
 #[derive(Default)]
@@ -161,7 +196,8 @@ impl ProcessManager {
             .filter(|program| !program.is_empty())
             .ok_or_else(|| anyhow::anyhow!("missing process program"))?;
         let root = self.fs.path("/workspace")?;
-        let rewrite = |value: &str| rewrite_process_value(&self.fs, value);
+        let rewrite_fs = self.fs.clone();
+        let rewrite = move |value: &str| rewrite_process_value(&rewrite_fs, value);
         let program = rewrite(program);
         let raw_args = params
             .get("args")
@@ -169,29 +205,43 @@ impl ProcessManager {
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
-            .map(rewrite)
+            .map(&rewrite)
             .collect::<Vec<_>>();
         let (program, args) = crate::debug_adapter::resolve(&program, raw_args)?;
         let sanitize_lldb = program
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.contains("lldb-dap"));
+        let mut process_environment = environment(params);
+        let kind = ProcessKind::from_environment(&mut process_environment);
+        let cwd = params
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(&rewrite)
+            .map(|path| self.fs.path(&path))
+            .transpose()?
+            .filter(|path| path.is_dir())
+            .unwrap_or(root);
+        let identity = (kind == ProcessKind::LanguageServer).then(|| ProcessIdentity {
+            program: program.clone(),
+            args: args.clone(),
+            cwd: cwd.clone(),
+        });
+        if let Some(identity) = identity.as_ref() {
+            self.replace_disconnected_language_server(identity);
+        }
+
         let mut command = AsyncCommand::new(&program);
         command.kill_on_drop(true);
         command.args(args);
-        command.current_dir(
-            params
-                .get("cwd")
-                .and_then(Value::as_str)
-                .map(rewrite)
-                .map(|path| self.fs.path(&path))
-                .transpose()?
-                .filter(|path| path.is_dir())
-                .unwrap_or(root),
-        );
-        let process_environment = environment(params);
+        command.current_dir(cwd);
         for (key, value) in &process_environment {
             command.env(key, rewrite(&value));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.as_std_mut().process_group(0);
         }
         #[cfg(unix)]
         if let Some(bridge) = &self.open_url_bridge {
@@ -215,6 +265,10 @@ impl ProcessManager {
         let mut child = command
             .spawn()
             .with_context(|| format!("spawning {}", program.display()))?;
+        #[cfg(target_os = "linux")]
+        let process_group_id = child.id();
+        #[cfg(target_os = "linux")]
+        let process_group_active = Arc::new(AtomicBool::new(process_group_id.is_some()));
         let stdin = Arc::new(Mutex::new(child.stdin.take()));
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -241,6 +295,8 @@ impl ProcessManager {
             ))
         });
         let completed_activity = acp_activity.clone();
+        #[cfg(target_os = "linux")]
+        let completed_process_group_active = process_group_active.clone();
         let task = tokio::spawn(async move {
             let status = child
                 .wait()
@@ -248,6 +304,8 @@ impl ProcessManager {
                 .ok()
                 .and_then(|status| status.code())
                 .unwrap_or(-1);
+            #[cfg(target_os = "linux")]
+            terminate_process_group(process_group_id, &completed_process_group_active);
             if let Some(task) = stdout_task {
                 task.await.ok();
             }
@@ -268,14 +326,20 @@ impl ProcessManager {
             ProcessEntry {
                 owner_generation,
                 disconnected: false,
+                kind,
+                identity,
                 stdin,
                 stdin_rewriter: Mutex::new(FrameRewriter::new(Vec::new(), Vec::new())),
                 acp_activity,
                 sanitize_lldb,
+                #[cfg(target_os = "linux")]
+                process_group_id,
+                #[cfg(target_os = "linux")]
+                process_group_active,
                 task,
             },
         ) {
-            previous.task.abort();
+            terminate_process(previous);
         }
         Ok(json!({"proc_id": proc_id}))
     }
@@ -284,6 +348,47 @@ impl ProcessManager {
         for entry in self.processes.values_mut() {
             if entry.owner_generation == generation {
                 entry.disconnected = true;
+            }
+        }
+    }
+
+    pub fn reap_orphaned_language_servers(&mut self, generation: u64) -> usize {
+        let proc_ids = self
+            .processes
+            .iter()
+            .filter_map(|(proc_id, entry)| {
+                (entry.owner_generation == generation
+                    && entry.disconnected
+                    && entry.kind == ProcessKind::LanguageServer)
+                    .then_some(*proc_id)
+            })
+            .collect::<Vec<_>>();
+        let count = proc_ids.len();
+        for proc_id in proc_ids {
+            if let Some(entry) = self.processes.remove(&proc_id) {
+                terminate_process(entry);
+            }
+        }
+        count
+    }
+
+    fn replace_disconnected_language_server(&mut self, identity: &ProcessIdentity) {
+        let proc_ids = self
+            .processes
+            .iter()
+            .filter_map(|(proc_id, entry)| {
+                (entry.disconnected && entry.identity.as_ref() == Some(identity))
+                    .then_some(*proc_id)
+            })
+            .collect::<Vec<_>>();
+        for proc_id in proc_ids {
+            if let Some(entry) = self.processes.remove(&proc_id) {
+                tracing::info!(
+                    proc_id,
+                    cwd = %identity.cwd.display(),
+                    "replacing orphaned language server"
+                );
+                terminate_process(entry);
             }
         }
     }
@@ -373,7 +478,7 @@ impl ProcessManager {
     fn kill(&mut self, params: &Value) -> Result<Value> {
         let proc_id = process_id(params)?;
         if let Some(entry) = self.processes.remove(&proc_id) {
-            entry.task.abort();
+            terminate_process(entry);
             notify(
                 &self.outgoing,
                 "Process::exit",
@@ -381,6 +486,24 @@ impl ProcessManager {
             );
         }
         Ok(Value::Null)
+    }
+}
+
+fn terminate_process(entry: ProcessEntry) {
+    #[cfg(target_os = "linux")]
+    terminate_process_group(entry.process_group_id, &entry.process_group_active);
+    entry.task.abort();
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_process_group(process_group_id: Option<u32>, active: &AtomicBool) {
+    let Some(process_group_id) = process_group_id else {
+        return;
+    };
+    if active.swap(false, Ordering::AcqRel) {
+        unsafe {
+            libc::kill(-(process_group_id as i32), libc::SIGKILL);
+        }
     }
 }
 
@@ -851,6 +974,81 @@ mod tests {
 
         processes
             .dispatch("Process::kill", &json!({"proc_id": proc_id}), 2)
+            .await?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reload_replaces_disconnected_language_server() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let fs = Arc::new(FsRpc::new(root.path().to_path_buf(), false)?);
+        let (outgoing, _notifications) = mpsc::unbounded_channel::<Message>();
+        let mut processes = ProcessManager::new(fs, outgoing);
+        let spawn = |proc_id| {
+            json!({
+                "proc_id": proc_id,
+                "program": "/bin/cat",
+                "cwd": "/workspace",
+                "env": [["ZED_WEB_PROCESS_KIND", "language-server"]],
+                "stdin_pipe": true,
+                "stdout_pipe": true,
+                "stderr_pipe": true,
+            })
+        };
+
+        processes.dispatch("Process::spawn", &spawn(51), 1).await?;
+        processes.detach_generation(1);
+        processes.dispatch("Process::spawn", &spawn(52), 2).await?;
+
+        assert!(!processes.processes.contains_key(&51));
+        assert!(processes.processes.contains_key(&52));
+        processes
+            .dispatch("Process::kill", &json!({"proc_id": 52}), 2)
+            .await?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn orphan_reaper_preserves_agents_and_reconnected_language_servers() -> anyhow::Result<()>
+    {
+        let root = tempfile::tempdir()?;
+        let fs = Arc::new(FsRpc::new(root.path().to_path_buf(), false)?);
+        let (outgoing, _notifications) = mpsc::unbounded_channel::<Message>();
+        let mut processes = ProcessManager::new(fs, outgoing);
+
+        for (proc_id, kind) in [(61, "language-server"), (62, "acp-agent")] {
+            processes
+                .dispatch(
+                    "Process::spawn",
+                    &json!({
+                        "proc_id": proc_id,
+                        "program": "/bin/cat",
+                        "env": [["ZED_WEB_PROCESS_KIND", kind]],
+                        "stdin_pipe": true,
+                        "stdout_pipe": true,
+                        "stderr_pipe": true,
+                    }),
+                    1,
+                )
+                .await?;
+        }
+        processes.detach_generation(1);
+        processes
+            .dispatch("Process::attach", &json!({"proc_ids": [61]}), 2)
+            .await?;
+
+        assert_eq!(processes.reap_orphaned_language_servers(1), 0);
+        assert!(processes.processes.contains_key(&61));
+        assert!(processes.processes.contains_key(&62));
+
+        processes.detach_generation(2);
+        assert_eq!(processes.reap_orphaned_language_servers(2), 1);
+        assert!(!processes.processes.contains_key(&61));
+        assert!(processes.processes.contains_key(&62));
+        processes
+            .dispatch("Process::kill", &json!({"proc_id": 62}), 1)
             .await?;
         Ok(())
     }
