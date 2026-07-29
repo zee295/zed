@@ -1,10 +1,10 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, VecDeque},
     fs,
-    io::Write as _,
+    io::{BufRead as _, BufReader, Write as _},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    sync::{Arc, Mutex},
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    sync::{Arc, LazyLock, Mutex, RwLock},
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -14,7 +14,164 @@ use serde_json::{Map, Value, json};
 use crate::fs_rpc::FsRpc;
 
 const ZED_API: &str = "https://api.zed.dev";
-static EXTENSION_WRITE_LOCK: Mutex<()> = Mutex::new(());
+const RESPONSE_PREFIX: &str = "ZED_EXTENSION_RESPONSE ";
+const STDERR_TAIL_LINES: usize = 50;
+static EXTENSION_LIFECYCLE_LOCK: RwLock<()> = RwLock::new(());
+static RUNTIME_WORKERS: LazyLock<Mutex<HashMap<RuntimeWorkerKey, Arc<Mutex<RuntimeWorker>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RuntimeWorkerKey {
+    workspace: PathBuf,
+    extension_id: String,
+}
+
+struct RuntimeProcess {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
+}
+
+struct RuntimeWorker {
+    runtime: PathBuf,
+    working_directory: PathBuf,
+    process: Option<RuntimeProcess>,
+}
+
+impl RuntimeWorker {
+    fn start(runtime: PathBuf, working_directory: PathBuf) -> Result<Self> {
+        let mut worker = Self {
+            runtime,
+            working_directory,
+            process: None,
+        };
+        worker.restart()?;
+        Ok(worker)
+    }
+
+    fn call(&mut self, request: &Value) -> Result<Value> {
+        let request = serde_json::to_string(request)?;
+        let mut first_error = None;
+        for attempt in 0..2 {
+            if self
+                .process
+                .as_mut()
+                .is_some_and(|process| process.child.try_wait().ok().flatten().is_some())
+            {
+                self.restart()?;
+            }
+            match self.call_once(&request) {
+                Ok(response) => return Ok(response),
+                Err(error) if attempt == 0 => {
+                    first_error = Some(error);
+                    self.restart()?;
+                }
+                Err(error) => {
+                    let first_error = first_error
+                        .map(|first| format!("{first:#}; retry failed: {error:#}"))
+                        .unwrap_or_else(|| format!("{error:#}"));
+                    bail!("persistent extension runtime call failed: {first_error}");
+                }
+            }
+        }
+        unreachable!("extension runtime call loop always returns")
+    }
+
+    fn call_once(&mut self, request: &str) -> Result<Value> {
+        let process = self
+            .process
+            .as_mut()
+            .context("extension runtime is not running")?;
+        writeln!(process.stdin, "{request}").context("writing extension runtime request")?;
+        process
+            .stdin
+            .flush()
+            .context("flushing extension runtime request")?;
+
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let bytes = process
+                .stdout
+                .read_line(&mut line)
+                .context("reading extension runtime response")?;
+            if bytes == 0 {
+                let stderr = stderr_tail(&process.stderr_tail);
+                bail!("extension runtime closed stdout: {stderr}");
+            }
+            if let Some(response) = line.trim_end().strip_prefix(RESPONSE_PREFIX) {
+                return serde_json::from_str(response)
+                    .context("parsing extension runtime response");
+            }
+        }
+    }
+
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "extension RPC dispatch runs on Tokio's blocking thread pool"
+    )]
+    fn restart(&mut self) -> Result<()> {
+        self.stop();
+        let mut child = Command::new(&self.runtime)
+            .current_dir(&self.working_directory)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "starting persistent extension runtime {}",
+                    self.runtime.display()
+                )
+            })?;
+        let stdin = child.stdin.take().context("extension runtime stdin")?;
+        let stdout = BufReader::new(child.stdout.take().context("extension runtime stdout")?);
+        let stderr = child.stderr.take().context("extension runtime stderr")?;
+        let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
+        let reader_tail = stderr_tail.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if let Ok(mut tail) = reader_tail.lock() {
+                    if tail.len() == STDERR_TAIL_LINES {
+                        tail.pop_front();
+                    }
+                    tail.push_back(line);
+                }
+            }
+        });
+        self.process = Some(RuntimeProcess {
+            child,
+            stdin,
+            stdout,
+            stderr_tail,
+        });
+        Ok(())
+    }
+
+    fn stop(&mut self) {
+        let Some(mut process) = self.process.take() else {
+            return;
+        };
+        drop(process.stdin);
+        if process.child.try_wait().ok().flatten().is_none() {
+            let _ = process.child.kill();
+        }
+        let _ = process.child.wait();
+    }
+}
+
+impl Drop for RuntimeWorker {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn stderr_tail(tail: &Mutex<VecDeque<String>>) -> String {
+    tail.lock()
+        .map(|tail| tail.iter().cloned().collect::<Vec<_>>().join("\n"))
+        .unwrap_or_else(|_| "stderr unavailable".to_string())
+}
 
 pub fn handles(method: &str) -> bool {
     method.starts_with("Extensions::")
@@ -62,10 +219,73 @@ pub fn dispatch(fs_rpc: &FsRpc, method: &str, params: &Value) -> Result<Value> {
 }
 
 fn with_extension_write_lock<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
-    let _guard = EXTENSION_WRITE_LOCK
-        .lock()
+    let _guard = EXTENSION_LIFECYCLE_LOCK
+        .write()
         .map_err(|_| anyhow!("extension write lock poisoned"))?;
     operation()
+}
+
+fn runtime_worker(
+    workspace: &Path,
+    extension_id: &str,
+    runtime: PathBuf,
+) -> Result<Arc<Mutex<RuntimeWorker>>> {
+    let key = RuntimeWorkerKey {
+        workspace: workspace.to_path_buf(),
+        extension_id: extension_id.to_string(),
+    };
+    let mut workers = RUNTIME_WORKERS
+        .lock()
+        .map_err(|_| anyhow!("extension runtime worker map poisoned"))?;
+    if let Some(worker) = workers.get(&key) {
+        return Ok(worker.clone());
+    }
+    let worker = Arc::new(Mutex::new(RuntimeWorker::start(
+        runtime,
+        workspace.to_path_buf(),
+    )?));
+    workers.insert(key, worker.clone());
+    Ok(worker)
+}
+
+fn stop_runtime_worker(workspace: &Path, extension_id: &str) -> Result<()> {
+    let key = RuntimeWorkerKey {
+        workspace: workspace.to_path_buf(),
+        extension_id: extension_id.to_string(),
+    };
+    let worker = RUNTIME_WORKERS
+        .lock()
+        .map_err(|_| anyhow!("extension runtime worker map poisoned"))?
+        .remove(&key);
+    if let Some(worker) = worker {
+        worker
+            .lock()
+            .map_err(|_| anyhow!("extension runtime worker poisoned"))?
+            .stop();
+    }
+    Ok(())
+}
+
+pub fn shutdown_runtime_workers() -> Result<()> {
+    let _lifecycle_guard = EXTENSION_LIFECYCLE_LOCK
+        .write()
+        .map_err(|_| anyhow!("extension lifecycle lock poisoned"))?;
+    let workers = {
+        let mut workers = RUNTIME_WORKERS
+            .lock()
+            .map_err(|_| anyhow!("extension runtime worker map poisoned"))?;
+        workers
+            .drain()
+            .map(|(_, worker)| worker)
+            .collect::<Vec<_>>()
+    };
+    for worker in workers {
+        worker
+            .lock()
+            .map_err(|_| anyhow!("extension runtime worker poisoned"))?
+            .stop();
+    }
+    Ok(())
 }
 
 async fn fetch(http: &reqwest::Client, params: &Value) -> Result<Value> {
@@ -228,10 +448,11 @@ fn install_archive(
     provides: Value,
     archive: Vec<u8>,
 ) -> Result<Value> {
-    let _guard = EXTENSION_WRITE_LOCK
-        .lock()
+    let _guard = EXTENSION_LIFECYCLE_LOCK
+        .write()
         .map_err(|_| anyhow!("extension install lock poisoned"))?;
     let host = ExtensionHost::new(workspace)?;
+    stop_runtime_worker(&host.workspace, &id)?;
     let staging = host.directory.join(format!(".staging-{id}"));
     if staging.exists() {
         fs::remove_dir_all(&staging)?;
@@ -300,6 +521,7 @@ struct ExtensionHost {
 
 impl ExtensionHost {
     fn new(workspace: PathBuf) -> Result<Self> {
+        let workspace = workspace.canonicalize().context("invalid workspace path")?;
         let directory = workspace.join(".zed/extensions");
         fs::create_dir_all(&directory)?;
         let index_path = directory.join("index.json");
@@ -458,6 +680,9 @@ impl ExtensionHost {
     }
 
     fn runtime_call(&self, params: &Value) -> Result<Value> {
+        let _lifecycle_guard = EXTENSION_LIFECYCLE_LOCK
+            .read()
+            .map_err(|_| anyhow!("extension lifecycle lock poisoned"))?;
         let id = extension_id(params);
         validate_id(id)?;
         let extension_directory = self.directory.join(id);
@@ -466,20 +691,7 @@ impl ExtensionHost {
         {
             return Ok(json!({"ok": false, "error": "extension runtime is not installed"}));
         }
-        let runtime = std::env::var_os("ZED_EXTENSION_RUNTIME")
-            .map(PathBuf::from)
-            .or_else(|| {
-                [
-                    self.workspace
-                        .parent()?
-                        .join("target-native/release/zed-extension-runtime"),
-                    self.workspace
-                        .parent()?
-                        .join("zed-repo/target/release/zed-extension-runtime"),
-                ]
-                .into_iter()
-                .find(|path| path.is_file())
-            });
+        let runtime = resolve_extension_runtime(&self.workspace);
         let Some(runtime) = runtime.filter(|path| path.is_file()) else {
             return Ok(json!({"ok": false, "error": "extension runtime is not built"}));
         };
@@ -496,34 +708,16 @@ impl ExtensionHost {
             "worktree_root".to_string(),
             json!(worktree_root.to_string_lossy()),
         );
-        let mut child = Command::new(runtime)
-            .current_dir(&worktree_root)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        child
-            .stdin
-            .take()
-            .context("extension runtime stdin")?
-            .write_all(serde_json::to_string(&request)?.as_bytes())?;
-        let output = child.wait_with_output()?;
-        let line = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .next_back()
-            .map(ToOwned::to_owned);
-        match line {
-            Some(line) => Ok(serde_json::from_str(&line)?),
-            None => Ok(json!({
-                "ok": false,
-                "error": format!("extension runtime returned no result: {}", String::from_utf8_lossy(&output.stderr).trim())
-            })),
-        }
+        let worker = runtime_worker(&self.workspace, id, runtime)?;
+        worker
+            .lock()
+            .map_err(|_| anyhow!("extension runtime worker poisoned"))?
+            .call(&request)
     }
 
     fn uninstall(&self, id: &str) -> Result<Value> {
         validate_id(id)?;
+        stop_runtime_worker(&self.workspace, id)?;
         let target = self.directory.join(id);
         if target.exists() {
             fs::remove_dir_all(target)?;
@@ -556,6 +750,7 @@ impl ExtensionHost {
             .and_then(toml::Value::as_str)
             .ok_or_else(|| anyhow!("extension.toml has no id"))?;
         validate_id(id)?;
+        stop_runtime_worker(&self.workspace, id)?;
         let target = self.directory.join(id);
         if target.exists() {
             fs::remove_dir_all(&target)?;
@@ -739,6 +934,23 @@ fn read_optional_text(path: &Path) -> Result<Option<String>> {
     }
 }
 
+fn resolve_extension_runtime(workspace: &Path) -> Option<PathBuf> {
+    std::env::var_os("ZED_EXTENSION_RUNTIME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            [
+                workspace
+                    .parent()?
+                    .join("target-native/release/zed-extension-runtime"),
+                workspace
+                    .parent()?
+                    .join("zed-repo/target/release/zed-extension-runtime"),
+            ]
+            .into_iter()
+            .find(|path| path.is_file())
+        })
+}
+
 fn runtime_worktree_root(params: &Map<String, Value>, fallback: &Path) -> Result<PathBuf> {
     let worktree_root = params
         .get("worktree_root")
@@ -838,6 +1050,16 @@ fn copy_tree(source: &Path, target: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn executable_script(directory: &Path, name: &str, contents: &str) -> Result<PathBuf> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = directory.join(name);
+        fs::write(&path, contents)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        Ok(path)
+    }
+
     #[test]
     fn language_assets_include_editor_contributions() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -924,6 +1146,64 @@ mod tests {
             runtime_worktree_root(&Map::new(), fallback.path())?,
             fallback.path().canonicalize()?
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_worker_preserves_process_state_across_calls() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let runtime = executable_script(
+            temporary.path(),
+            "persistent-runtime",
+            r#"#!/bin/sh
+count=0
+while IFS= read -r request; do
+    count=$((count + 1))
+    printf 'ZED_EXTENSION_RESPONSE {"ok":true,"result":{"count":%s,"pid":%s}}\n' "$count" "$$"
+done
+"#,
+        )?;
+        let mut worker = RuntimeWorker::start(runtime, temporary.path().to_path_buf())?;
+
+        let first = worker.call(&json!({"method": "first"}))?;
+        let second = worker.call(&json!({"method": "second"}))?;
+
+        assert_eq!(first["result"]["count"], 1);
+        assert_eq!(second["result"]["count"], 2);
+        assert_eq!(first["result"]["pid"], second["result"]["pid"]);
+        worker.stop();
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_worker_restarts_after_process_exit() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let runtime = executable_script(
+            temporary.path(),
+            "restarting-runtime",
+            r#"#!/bin/sh
+generation_file="$0.generation"
+generation=0
+if test -f "$generation_file"; then
+    generation=$(cat "$generation_file")
+fi
+generation=$((generation + 1))
+printf '%s\n' "$generation" > "$generation_file"
+IFS= read -r request || exit 0
+printf 'ZED_EXTENSION_RESPONSE {"ok":true,"result":{"generation":%s}}\n' "$generation"
+exit 1
+"#,
+        )?;
+        let mut worker = RuntimeWorker::start(runtime, temporary.path().to_path_buf())?;
+
+        let first = worker.call(&json!({"method": "first"}))?;
+        let second = worker.call(&json!({"method": "second"}))?;
+
+        assert_eq!(first["result"]["generation"], 1);
+        assert_eq!(second["result"]["generation"], 2);
+        worker.stop();
         Ok(())
     }
 }

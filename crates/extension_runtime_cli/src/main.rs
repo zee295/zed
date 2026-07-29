@@ -1,6 +1,8 @@
 use std::{
+    io::{BufRead as _, Write as _},
     path::PathBuf,
     sync::{Arc, Mutex},
+    thread,
 };
 
 use anyhow::{Context as _, Result, bail};
@@ -22,6 +24,7 @@ use serde_json::{Value, json};
 use util::rel_path::RelPath;
 
 const USER_AGENT: &str = "ZedWeb-Extension-Runtime/1.0";
+const RESPONSE_PREFIX: &str = "ZED_EXTENSION_RESPONSE ";
 
 #[derive(Deserialize)]
 struct Request {
@@ -237,7 +240,7 @@ fn code_label_json(label: extension::CodeLabel) -> Value {
     })
 }
 
-async fn execute(request: Request, cx: &mut gpui::AsyncApp) -> Result<Value> {
+async fn load_extension(request: &Request, cx: &mut gpui::AsyncApp) -> Result<WasmExtension> {
     let extension_dir = request
         .extension_dir
         .canonicalize()
@@ -271,7 +274,10 @@ async fn execute(request: Request, cx: &mut gpui::AsyncApp) -> Result<Value> {
             cx,
         )
     });
-    let extension = WasmExtension::load(&extension_dir, &manifest, wasm_host, cx).await?;
+    WasmExtension::load(&extension_dir, &manifest, wasm_host, cx).await
+}
+
+async fn execute(extension: &WasmExtension, request: Request) -> Result<Value> {
     let worktree: Arc<dyn WorktreeDelegate> = Arc::new(LocalWorktree {
         id: request.worktree_id.unwrap_or(1),
         root: request.worktree_root,
@@ -576,7 +582,57 @@ async fn execute(request: Request, cx: &mut gpui::AsyncApp) -> Result<Value> {
 
 fn main() {
     let result = (|| -> Result<()> {
-        let request: Request = serde_json::from_reader(std::io::stdin())?;
+        struct PendingRequest {
+            request: Request,
+            response: std::sync::mpsc::SyncSender<Value>,
+        }
+
+        let (request_tx, request_rx) = async_channel::unbounded::<PendingRequest>();
+        let reader = thread::spawn(move || -> Result<()> {
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines() {
+                let line = line?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let request = match serde_json::from_str::<Request>(&line) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        let response =
+                            json!({"ok": false, "error": format!("invalid request: {error:#}")});
+                        let mut stdout = std::io::stdout().lock();
+                        writeln!(
+                            stdout,
+                            "{RESPONSE_PREFIX}{}",
+                            serde_json::to_string(&response)?
+                        )?;
+                        stdout.flush()?;
+                        continue;
+                    }
+                };
+                let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
+                if request_tx
+                    .send_blocking(PendingRequest {
+                        request,
+                        response: response_tx,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                let response = response_rx
+                    .recv()
+                    .context("extension runtime response channel closed")?;
+                let mut stdout = std::io::stdout().lock();
+                writeln!(
+                    stdout,
+                    "{RESPONSE_PREFIX}{}",
+                    serde_json::to_string(&response)?
+                )?;
+                stdout.flush()?;
+            }
+            Ok(())
+        });
         let app = gpui_platform::headless()
             .with_http_client(Arc::new(ReqwestClient::user_agent(USER_AGENT)?));
         app.run(move |cx| {
@@ -584,19 +640,53 @@ fn main() {
             settings::init(cx);
             release_channel::init(semver::Version::new(0, 0, 0), cx);
             cx.spawn(async move |cx| {
-                let response = match execute(request, cx).await {
-                    Ok(result) => json!({"ok": true, "result": result}),
-                    Err(error) => json!({"ok": false, "error": format!("{error:#}")}),
-                };
-                println!("{}", serde_json::to_string(&response).unwrap());
-                let _ = cx.update(|cx| cx.quit());
+                let mut loaded_extension: Option<(PathBuf, WasmExtension)> = None;
+                while let Ok(pending) = request_rx.recv().await {
+                    let extension_dir = pending.request.extension_dir.clone();
+                    let response = async {
+                        let canonical_dir = extension_dir
+                            .canonicalize()
+                            .context("invalid extension directory")?;
+                        if loaded_extension
+                            .as_ref()
+                            .is_some_and(|(loaded_dir, _)| loaded_dir != &canonical_dir)
+                        {
+                            bail!("persistent runtime cannot switch extension directories");
+                        }
+                        if loaded_extension.is_none() {
+                            let extension = load_extension(&pending.request, cx).await?;
+                            loaded_extension = Some((canonical_dir, extension));
+                        }
+                        let extension = &loaded_extension
+                            .as_ref()
+                            .context("extension runtime did not load")?
+                            .1;
+                        execute(extension, pending.request).await
+                    }
+                    .await;
+                    let response = match response {
+                        Ok(result) => json!({"ok": true, "result": result}),
+                        Err(error) => json!({"ok": false, "error": format!("{error:#}")}),
+                    };
+                    if pending.response.send(response).is_err() {
+                        break;
+                    }
+                }
+                loaded_extension.take();
+                cx.update(|cx| cx.quit());
             })
             .detach();
         });
+        reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("extension runtime reader thread panicked"))??;
         Ok(())
     })();
     if let Err(error) = result {
-        println!("{}", json!({"ok": false, "error": format!("{error:#}")}));
+        println!(
+            "{RESPONSE_PREFIX}{}",
+            json!({"ok": false, "error": format!("{error:#}")})
+        );
         std::process::exit(1);
     }
 }

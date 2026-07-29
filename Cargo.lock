@@ -6451,6 +6451,7 @@ name = "extension_runtime_cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel 2.5.0",
  "async-trait",
  "collections",
  "dap",

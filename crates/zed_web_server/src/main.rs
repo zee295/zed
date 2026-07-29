@@ -163,6 +163,15 @@ async fn main() -> Result<()> {
                 tracing::debug!("no active RPC connections during shutdown");
             }
             shutdown_state.rpc_sessions.shutdown().await;
+            match tokio::task::spawn_blocking(extension_rpc::shutdown_runtime_workers).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(?error, "failed to stop extension runtime workers")
+                }
+                Err(error) => {
+                    tracing::warn!(?error, "extension runtime shutdown task failed")
+                }
+            }
         })
         .await?;
     Ok(())

@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+async-channel.workspace = true
 async-trait.workspace = true
 collections.workspace = true
 dap.workspace = true
