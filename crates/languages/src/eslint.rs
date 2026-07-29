@@ -1,8 +1,12 @@
-use anyhow::{Context as _, Result};
+#[cfg(not(target_family = "wasm"))]
+use anyhow::Context as _;
+use anyhow::Result;
 use async_trait::async_trait;
 use gpui::AsyncApp;
+use http_client::github::GitHubLspBinaryVersion;
+#[cfg(not(target_family = "wasm"))]
 use http_client::{
-    github::{AssetKind, GitHubLspBinaryVersion, build_asset_url},
+    github::{AssetKind, build_asset_url},
     github_download::download_server_binary,
 };
 use language::{LspAdapter, LspAdapterDelegate, LspInstaller, Toolchain};
@@ -14,6 +18,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use settings::SettingsLocation;
+#[cfg(not(target_family = "wasm"))]
 use smol::{fs, stream::StreamExt};
 use std::{
     ffi::OsString,
@@ -39,14 +44,19 @@ pub struct EsLintLspAdapter {
 
 impl EsLintLspAdapter {
     const CURRENT_VERSION: &'static str = "3.0.24";
+    #[cfg(not(target_family = "wasm"))]
     const CURRENT_VERSION_TAG_NAME: &'static str = "release/3.0.24";
 
-    #[cfg(not(windows))]
+    #[cfg(all(not(target_family = "wasm"), not(windows)))]
     const GITHUB_ASSET_KIND: AssetKind = AssetKind::TarGz;
-    #[cfg(windows)]
+    #[cfg(all(not(target_family = "wasm"), windows))]
     const GITHUB_ASSET_KIND: AssetKind = AssetKind::Zip;
 
+    #[cfg(not(target_family = "wasm"))]
     const SERVER_PATH: &'static str = "vscode-eslint/server/out/eslintServer.js";
+    #[cfg(target_family = "wasm")]
+    const SERVER_PATH: &'static str =
+        "node_modules/vscode-langservers-extracted/bin/vscode-eslint-language-server";
     const SERVER_NAME: LanguageServerName = LanguageServerName::new_static("eslint");
 
     const FLAT_CONFIG_FILE_NAMES_V8_21: &'static [&'static str] = &["eslint.config.js"];
@@ -87,12 +97,27 @@ impl LspInstaller for EsLintLspAdapter {
         _: bool,
         _: &mut AsyncApp,
     ) -> Result<GitHubLspBinaryVersion> {
+        #[cfg(target_family = "wasm")]
+        {
+            let version = self
+                .node
+                .npm_package_latest_version("vscode-langservers-extracted")
+                .await?;
+            return Ok(GitHubLspBinaryVersion {
+                name: version.to_string(),
+                digest: None,
+                url: String::new(),
+            });
+        }
+
+        #[cfg(not(target_family = "wasm"))]
         let url = build_asset_url(
             "microsoft/vscode-eslint",
             Self::CURRENT_VERSION_TAG_NAME,
             Self::GITHUB_ASSET_KIND,
         )?;
 
+        #[cfg(not(target_family = "wasm"))]
         Ok(GitHubLspBinaryVersion {
             name: Self::CURRENT_VERSION.into(),
             digest: None,
@@ -102,53 +127,64 @@ impl LspInstaller for EsLintLspAdapter {
 
     fn fetch_server_binary(
         &self,
-        version: GitHubLspBinaryVersion,
+        _version: GitHubLspBinaryVersion,
         container_dir: PathBuf,
-        delegate: &Arc<dyn LspAdapterDelegate>,
+        _delegate: &Arc<dyn LspAdapterDelegate>,
     ) -> impl Send + Future<Output = Result<LanguageServerBinary>> + use<> {
-        let delegate = delegate.clone();
+        #[cfg(not(target_family = "wasm"))]
+        let delegate = _delegate.clone();
         let node = self.node.clone();
 
         async move {
             let destination_path = Self::build_destination_path(&container_dir);
             let server_path = destination_path.join(Self::SERVER_PATH);
 
-            if fs::metadata(&server_path).await.is_err() {
+            if !crate::path_exists(&server_path).await {
                 remove_matching(&container_dir, |_| true).await;
 
-                download_server_binary(
-                    &*delegate.http_client(),
-                    &version.url,
-                    None,
+                #[cfg(target_family = "wasm")]
+                node.npm_install_latest_packages(
                     &destination_path,
-                    Self::GITHUB_ASSET_KIND,
+                    &["vscode-langservers-extracted"],
                 )
                 .await?;
 
-                let mut dir = fs::read_dir(&destination_path).await?;
-                let first = dir.next().await.context("missing first file")??;
-                let repo_root = destination_path.join("vscode-eslint");
-                fs::rename(first.path(), &repo_root).await?;
-
-                #[cfg(target_os = "windows")]
+                #[cfg(not(target_family = "wasm"))]
                 {
-                    handle_symlink(
-                        repo_root.join("$shared"),
-                        repo_root.join("client").join("src").join("shared"),
+                    download_server_binary(
+                        &*delegate.http_client(),
+                        &_version.url,
+                        None,
+                        &destination_path,
+                        Self::GITHUB_ASSET_KIND,
                     )
                     .await?;
-                    handle_symlink(
-                        repo_root.join("$shared"),
-                        repo_root.join("server").join("src").join("shared"),
-                    )
-                    .await?;
+
+                    let mut dir = fs::read_dir(&destination_path).await?;
+                    let first = dir.next().await.context("missing first file")??;
+                    let repo_root = destination_path.join("vscode-eslint");
+                    fs::rename(first.path(), &repo_root).await?;
+
+                    #[cfg(target_os = "windows")]
+                    {
+                        handle_symlink(
+                            repo_root.join("$shared"),
+                            repo_root.join("client").join("src").join("shared"),
+                        )
+                        .await?;
+                        handle_symlink(
+                            repo_root.join("$shared"),
+                            repo_root.join("server").join("src").join("shared"),
+                        )
+                        .await?;
+                    }
+
+                    node.run_npm_subcommand(Some(&repo_root), "install", &[])
+                        .await?;
+
+                    node.run_npm_subcommand(Some(&repo_root), "run-script", &["compile"])
+                        .await?;
                 }
-
-                node.run_npm_subcommand(Some(&repo_root), "install", &[])
-                    .await?;
-
-                node.run_npm_subcommand(Some(&repo_root), "run-script", &["compile"])
-                    .await?;
             }
 
             Ok(LanguageServerBinary {
@@ -166,7 +202,9 @@ impl LspInstaller for EsLintLspAdapter {
     ) -> Option<LanguageServerBinary> {
         let server_path =
             Self::build_destination_path(&container_dir).join(EsLintLspAdapter::SERVER_PATH);
-        fs::metadata(&server_path).await.ok()?;
+        if !crate::path_exists(&server_path).await {
+            return None;
+        }
         Some(LanguageServerBinary {
             path: self.node.binary_path().await.ok()?,
             env: None,

@@ -520,7 +520,9 @@ impl WebPyrightLspAdapter {
         env: Option<collections::HashMap<String, String>>,
     ) -> Option<lsp::LanguageServerBinary> {
         let server_path = container_dir.join(Self::SERVER_PATH);
-        smol::fs::metadata(&server_path).await.ok()?;
+        if !smol::fs::is_file(&server_path).await.unwrap_or(false) {
+            return None;
+        }
         Some(lsp::LanguageServerBinary {
             path: self.node.binary_path().await.ok()?,
             arguments: vec![server_path.into(), "--stdio".into()],
