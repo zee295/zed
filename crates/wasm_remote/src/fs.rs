@@ -9,7 +9,7 @@ use futures::{Stream, StreamExt, channel::mpsc, io::AsyncReadExt, stream};
 use gpui::BackgroundExecutor;
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::pin::Pin;
 #[cfg(target_family = "wasm")]
@@ -43,6 +43,8 @@ pub struct RemoteFs {
     executor: BackgroundExecutor,
     watch_subscriptions: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Vec<PathEvent>>>>>,
     prefetched_metadata: Arc<Mutex<HashMap<std::path::PathBuf, MetadataResponse>>>,
+    prefetched_directories: Arc<Mutex<HashMap<std::path::PathBuf, Vec<std::path::PathBuf>>>>,
+    tree_prefetch_roots: Arc<Mutex<HashSet<std::path::PathBuf>>>,
 }
 
 impl RemoteFs {
@@ -50,6 +52,8 @@ impl RemoteFs {
         let subscriptions: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Vec<PathEvent>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let prefetched_metadata = Arc::new(Mutex::new(HashMap::new()));
+        let prefetched_directories = Arc::new(Mutex::new(HashMap::new()));
+        let tree_prefetch_roots = Arc::new(Mutex::new(HashSet::new()));
 
         // Register a single notification handler that routes remote file-system
         // events to the active watch subscriptions.
@@ -110,7 +114,46 @@ impl RemoteFs {
             executor,
             watch_subscriptions: subscriptions,
             prefetched_metadata,
+            prefetched_directories,
+            tree_prefetch_roots,
         }
+    }
+
+    /// Marks a worktree root for one bulk server-side directory enumeration.
+    ///
+    /// The normal Zed worktree scanner still owns the resulting snapshot, but
+    /// its initial `read_dir` calls are served from this cache rather than
+    /// making one network round trip per directory.
+    pub fn prefetch_tree_on_first_read(&self, root: std::path::PathBuf) {
+        lock_shared(&self.tree_prefetch_roots).insert(root);
+    }
+
+    fn install_prefetched_tree(&self, root: &std::path::Path, response: ReadDirTreeResponse) {
+        let mut directories = lock_shared(&self.prefetched_directories);
+        if response.root_complete {
+            directories.insert(
+                root.to_path_buf(),
+                response
+                    .entries
+                    .into_iter()
+                    .map(std::path::PathBuf::from)
+                    .collect(),
+            );
+        }
+        directories.extend(response.directories.into_iter().map(|(path, entries)| {
+            (
+                std::path::PathBuf::from(path),
+                entries.into_iter().map(std::path::PathBuf::from).collect(),
+            )
+        }));
+        drop(directories);
+
+        lock_shared(&self.prefetched_metadata).extend(
+            response
+                .metadata
+                .into_iter()
+                .map(|(path, metadata)| (std::path::PathBuf::from(path), metadata)),
+        );
     }
 }
 
@@ -137,6 +180,17 @@ struct ReadDirResponse {
 #[derive(Deserialize)]
 struct ReadDirWithTypesResponse {
     entries: Vec<ReadDirEntryResponse>,
+}
+
+#[derive(Deserialize)]
+struct ReadDirTreeResponse {
+    entries: Vec<String>,
+    #[serde(default)]
+    root_complete: bool,
+    #[serde(default)]
+    directories: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    metadata: HashMap<String, MetadataResponse>,
 }
 
 #[derive(Deserialize)]
@@ -493,6 +547,35 @@ impl Fs for RemoteFs {
         &self,
         path: &std::path::Path,
     ) -> Result<Pin<Box<dyn Send + Stream<Item = Result<std::path::PathBuf>>>>> {
+        if let Some(entries) = lock_shared(&self.prefetched_directories).remove(path) {
+            return Ok(Box::pin(stream::iter(entries.into_iter().map(Ok))));
+        }
+
+        let should_prefetch = lock_shared(&self.tree_prefetch_roots).remove(path);
+        if should_prefetch {
+            match self
+                .client
+                .call::<_, ReadDirTreeResponse>(
+                    "Fs::read_dir_tree",
+                    &json!({ "path": path_arg(path) }),
+                )
+                .await
+            {
+                Ok(response) => {
+                    self.install_prefetched_tree(path, response);
+                    if let Some(entries) = lock_shared(&self.prefetched_directories).remove(path) {
+                        return Ok(Box::pin(stream::iter(entries.into_iter().map(Ok))));
+                    }
+                }
+                Err(error) => {
+                    log::warn!(
+                        "server-side worktree prefetch failed for {}: {error:#}",
+                        path.display()
+                    );
+                }
+            }
+        }
+
         let response: ReadDirResponse = self
             .client
             .call("Fs::read_dir", &json!({ "path": path_arg(path) }))

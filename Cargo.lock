@@ -20749,6 +20749,7 @@ dependencies = [
  "futures 0.3.32",
  "git",
  "gpui",
+ "log",
  "rope",
  "serde",
  "serde_json",

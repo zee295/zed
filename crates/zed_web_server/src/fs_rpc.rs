@@ -437,7 +437,12 @@ impl FsRpc {
 
         let root = self.path(self.requested(params, "path"))?;
         if !root.exists() {
-            return Ok(json!({"entries": [], "directories": {}, "metadata": {}}));
+            return Ok(json!({
+                "entries": [],
+                "root_complete": true,
+                "directories": {},
+                "metadata": {}
+            }));
         }
         if !root.is_dir() {
             bail!("not a directory: {}", root.display());
@@ -445,6 +450,7 @@ impl FsRpc {
 
         let mut pending = VecDeque::from([root.clone()]);
         let mut root_entries = Vec::new();
+        let mut root_complete = false;
         let mut directories = serde_json::Map::new();
         let mut metadata = serde_json::Map::new();
         let mut entry_count = 0;
@@ -457,8 +463,10 @@ impl FsRpc {
             entries.sort_by_key(|entry| entry.file_name().to_ascii_lowercase());
 
             let mut directory_entries = Vec::with_capacity(entries.len());
+            let mut directory_complete = true;
             for entry in entries {
                 if entry_count >= MAX_ENTRIES {
+                    directory_complete = false;
                     break;
                 }
                 let path = entry.path();
@@ -479,8 +487,11 @@ impl FsRpc {
             }
 
             if directory == root {
-                root_entries = directory_entries;
-            } else {
+                root_complete = directory_complete;
+                if directory_complete {
+                    root_entries = directory_entries;
+                }
+            } else if directory_complete {
                 directories.insert(self.virtualize(&directory), json!(directory_entries));
             }
             if entry_count >= MAX_ENTRIES {
@@ -490,6 +501,7 @@ impl FsRpc {
 
         Ok(json!({
             "entries": root_entries,
+            "root_complete": root_complete,
             "directories": directories,
             "metadata": metadata,
         }))
@@ -816,6 +828,7 @@ mod tests {
 
         let tree = rpc.dispatch("Fs::read_dir_tree", &json!({"path": "/workspace"}))?;
         let entries = tree["entries"].as_array().context("missing root entries")?;
+        assert_eq!(tree["root_complete"], true);
         assert!(entries.iter().any(|entry| entry == &path("src")));
         assert!(entries.iter().any(|entry| entry == &path("node_modules")));
         assert!(tree["directories"].get(path("src")).is_some());

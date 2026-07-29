@@ -1148,6 +1148,7 @@ fn init_app_state(
     cx: &mut App,
     extension_assets: Arc<RwLock<BTreeMap<String, Vec<u8>>>>,
     remote_client: wasm_remote::RemoteClient,
+    workspace_roots: &[std::path::PathBuf],
 ) -> Arc<workspace::AppState> {
     use client::Client;
     use clock::RealSystemClock;
@@ -1189,10 +1190,14 @@ fn init_app_state(
     sqlez::remote_sql::set_sql_rpc_endpoint(rpc_url.clone());
     sqlez::remote_sql::set_async_sql_client(remote_client.clone());
 
-    let fs: Arc<dyn Fs> = Arc::new(RemoteFs::new(
+    let remote_fs = Arc::new(RemoteFs::new(
         remote_client.clone(),
         cx.background_executor().clone(),
     ));
+    for root in workspace_roots {
+        remote_fs.prefetch_tree_on_first_read(root.clone());
+    }
+    let fs: Arc<dyn Fs> = remote_fs;
     <dyn Fs>::set_global(fs.clone(), cx);
     load_user_settings(fs.clone(), cx);
 
@@ -2090,6 +2095,10 @@ fn launch(
     workspace_root: std::path::PathBuf,
 ) {
     gpui_platform::web_init();
+    let mut paths = workspace_paths_from_url();
+    if paths.is_empty() {
+        paths.push(workspace_root);
+    }
     // Bundle fonts/icons/themes so SVG icons and keymaps assets resolve.
     let extension_assets = Arc::new(RwLock::new(BTreeMap::new()));
     let web_assets = WebAssets {
@@ -2098,12 +2107,8 @@ fn launch(
     let handle = gpui_platform::single_threaded_web()
         .with_assets(web_assets)
         .run_embedded(move |cx: &mut App| {
-            let app_state = init_app_state(cx, extension_assets.clone(), remote_client.clone());
-
-            let mut paths = workspace_paths_from_url();
-            if paths.is_empty() {
-                paths.push(workspace_root);
-            }
+            let app_state =
+                init_app_state(cx, extension_assets.clone(), remote_client.clone(), &paths);
             let legacy_project_groups = workspace_project_groups_from_url();
             let persisted_project_groups = ui_state
                 .project_groups
