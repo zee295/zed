@@ -116,7 +116,6 @@ struct RpcSession {
     processes: Arc<Mutex<crate::process_rpc::ProcessManager>>,
     terminals: crate::terminal_rpc::TerminalManager,
     agents: crate::agent_rpc::AgentManager,
-    workspace_ui: WorkspaceUiState,
     watches: HashMap<u64, WatchHandle>,
     watch_groups: HashMap<WatchKey, WatchGroup>,
     next_subscription_id: u64,
@@ -124,11 +123,6 @@ struct RpcSession {
     notification_target: Arc<Mutex<NotificationTarget>>,
     notification_forwarder: JoinHandle<()>,
     event_forwarder: JoinHandle<()>,
-}
-
-#[derive(Default)]
-struct WorkspaceUiState {
-    sidebar_open: bool,
 }
 
 struct WatchHandle {
@@ -198,7 +192,6 @@ impl RpcSession {
                 state.http.clone(),
                 notifications.clone(),
             ),
-            workspace_ui: WorkspaceUiState::default(),
             watches: HashMap::new(),
             watch_groups: HashMap::new(),
             next_subscription_id: 1,
@@ -511,13 +504,30 @@ pub async fn serve(socket: WebSocket, state: AppState) {
             .map(|(_, _, generation)| *generation)
             .unwrap_or_default();
         let result = if method == "Workspace::ui_state" {
-            Ok(json!({"sidebar_open": session.workspace_ui.sidebar_open}))
+            serde_json::to_value(state.workspace_state.snapshot()).map_err(Into::into)
         } else if method == "Workspace::set_sidebar_open" {
-            session.workspace_ui.sidebar_open = params
+            let open = params
                 .get("open")
                 .and_then(Value::as_bool)
                 .unwrap_or_default();
-            Ok(Value::Null)
+            state
+                .workspace_state
+                .set_sidebar_open(open)
+                .map(|_| Value::Null)
+        } else if method == "Workspace::set_project_groups" {
+            params
+                .get("groups")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing groups"))
+                .and_then(|groups| {
+                    serde_json::from_value::<Vec<Vec<String>>>(groups).map_err(Into::into)
+                })
+                .and_then(|groups| {
+                    state
+                        .workspace_state
+                        .set_project_groups(groups)
+                        .map(|_| Value::Null)
+                })
         } else if crate::terminal_rpc::handles(&method) {
             session.terminals.dispatch(&method, &params)
         } else if method == "Fs::watch" {

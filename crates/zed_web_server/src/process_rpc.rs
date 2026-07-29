@@ -552,19 +552,38 @@ pub fn dispatch(fs: &FsRpc, method: &str, params: &Value) -> Result<Value> {
 }
 
 fn rewrite_process_value(fs: &FsRpc, value: &str) -> String {
-    let rewritten = fs.rewrite_legacy_workspace_path(value);
-    if rewritten != value {
-        return rewritten;
-    }
-
-    let Some((prefix, path)) = value.split_once('=') else {
-        return value.to_string();
-    };
-    let rewritten_path = fs.rewrite_legacy_workspace_path(path);
-    if rewritten_path == path {
+    const LEGACY_ROOT: &str = "/workspace";
+    let physical_root = fs.rewrite_legacy_workspace_path(LEGACY_ROOT);
+    if physical_root == LEGACY_ROOT || !value.contains(LEGACY_ROOT) {
         value.to_string()
     } else {
-        format!("{prefix}={rewritten_path}")
+        let mut rewritten = String::with_capacity(value.len() + physical_root.len());
+        let mut cursor = 0;
+        while let Some(relative_index) = value[cursor..].find(LEGACY_ROOT) {
+            let index = cursor + relative_index;
+            let end = index + LEGACY_ROOT.len();
+            let before = value[..index].chars().next_back();
+            let after = value[end..].chars().next();
+            let starts_path_token = before.is_none_or(|character| {
+                character.is_whitespace()
+                    || matches!(character, '\'' | '"' | '=' | ':' | '(' | '[' | '{')
+            });
+            let ends_root_token = after.is_none_or(|character| {
+                character == '/'
+                    || character.is_whitespace()
+                    || matches!(character, '\'' | '"' | ',' | ')' | ']' | '}')
+            });
+
+            rewritten.push_str(&value[cursor..index]);
+            if starts_path_token && ends_root_token {
+                rewritten.push_str(&physical_root);
+            } else {
+                rewritten.push_str(LEGACY_ROOT);
+            }
+            cursor = end;
+        }
+        rewritten.push_str(&value[cursor..]);
+        rewritten
     }
 }
 
@@ -863,6 +882,16 @@ mod tests {
         assert_eq!(
             rewrite_process_value(&fs, "/home/dev/web/workspace"),
             "/home/dev/web/workspace"
+        );
+        assert_eq!(
+            rewrite_process_value(
+                &fs,
+                "'npm' '--prefix' '/workspace/.config/zed/external_agents/registry'"
+            ),
+            format!(
+                "'npm' '--prefix' '{}/.config/zed/external_agents/registry'",
+                physical_root.display()
+            )
         );
         Ok(())
     }

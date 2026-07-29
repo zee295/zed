@@ -14,6 +14,7 @@ use rusqlite::{
 use serde_json::{Value, json};
 
 pub struct SqlRpc {
+    root: PathBuf,
     path: PathBuf,
     state: Mutex<SqlState>,
     transaction_available: Condvar,
@@ -33,11 +34,12 @@ impl SqlRpc {
         let path = directory.join("remote.sqlite");
         Ok(Self {
             state: Mutex::new(SqlState {
-                connection: open_connection(&path)?,
+                connection: open_connection(&path, root)?,
                 savepoint_depth: 0,
                 explicit_transaction: false,
                 transaction_owner: None,
             }),
+            root: root.to_path_buf(),
             path,
             transaction_available: Condvar::new(),
         })
@@ -119,7 +121,7 @@ impl SqlRpc {
                 std::fs::remove_file(candidate)?;
             }
         }
-        state.connection = open_connection(&self.path)?;
+        state.connection = open_connection(&self.path, &self.root)?;
         state.savepoint_depth = 0;
         state.explicit_transaction = false;
         state.transaction_owner = None;
@@ -127,13 +129,79 @@ impl SqlRpc {
     }
 }
 
-fn open_connection(path: &Path) -> Result<Connection> {
+fn open_connection(path: &Path, root: &Path) -> Result<Connection> {
     let connection = Connection::open(path)?;
     connection.execute_batch(
         "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
     )?;
     repair_orphaned_editor_items(&connection)?;
+    migrate_legacy_workspace_paths(&connection, root)?;
     Ok(connection)
+}
+
+fn migrate_legacy_workspace_paths(connection: &Connection, root: &Path) -> Result<()> {
+    const PATH_COLUMNS: &[(&str, &[&str])] = &[
+        ("sidebar_threads", &["folder_paths", "main_worktree_paths"]),
+        (
+            "sidebar_terminal_threads",
+            &["working_directory", "folder_paths", "main_worktree_paths"],
+        ),
+    ];
+
+    for (table, columns) in PATH_COLUMNS {
+        let table_exists = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [table],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !table_exists {
+            continue;
+        }
+
+        let existing_columns = connection
+            .prepare(&format!("PRAGMA table_info({table})"))?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<HashSet<_>>>()?;
+        for column in *columns {
+            if !existing_columns.contains(*column) {
+                continue;
+            }
+            let rows = connection
+                .prepare(&format!(
+                    "SELECT rowid, {column} FROM {table} WHERE {column} IS NOT NULL"
+                ))?
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for (rowid, value) in rows {
+                let rewritten = rewrite_legacy_path_list(&value, root);
+                if rewritten != value {
+                    connection.execute(
+                        &format!("UPDATE {table} SET {column} = ?1 WHERE rowid = ?2"),
+                        (&rewritten, rowid),
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_legacy_path_list(value: &str, root: &Path) -> String {
+    value
+        .split('\n')
+        .map(|path| {
+            if path == "/workspace" {
+                root.display().to_string()
+            } else if let Some(relative) = path.strip_prefix("/workspace/") {
+                root.join(relative).display().to_string()
+            } else {
+                path.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn repair_orphaned_editor_items(connection: &Connection) -> Result<()> {
@@ -630,6 +698,74 @@ mod tests {
             .query_map([], |row| row.get::<_, i64>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         assert_eq!(remaining, vec![2, 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn startup_migrates_legacy_sidebar_workspace_paths() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let database_dir = root.path().join(".zed");
+        std::fs::create_dir_all(&database_dir)?;
+        let path = database_dir.join("remote.sqlite");
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "CREATE TABLE sidebar_threads (
+                folder_paths TEXT,
+                main_worktree_paths TEXT
+            );
+            CREATE TABLE sidebar_terminal_threads (
+                working_directory TEXT,
+                folder_paths TEXT,
+                main_worktree_paths TEXT
+            );
+            INSERT INTO sidebar_threads VALUES (
+                '/workspace/project-a
+/workspace/project-b',
+                '/workspace/project-a'
+            );
+            INSERT INTO sidebar_terminal_threads VALUES (
+                '/workspace/project-a',
+                '/workspace/project-a',
+                '/home/dev/web/workspace'
+            );",
+        )?;
+        drop(connection);
+
+        let _sql = SqlRpc::new(root.path())?;
+        let connection = Connection::open(path)?;
+        let root = root.path();
+        let thread_paths = connection.query_row(
+            "SELECT folder_paths, main_worktree_paths FROM sidebar_threads",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        assert_eq!(
+            thread_paths,
+            (
+                format!("{}/project-a\n{}/project-b", root.display(), root.display()),
+                format!("{}/project-a", root.display())
+            )
+        );
+        let terminal_paths = connection.query_row(
+            "SELECT working_directory, folder_paths, main_worktree_paths
+             FROM sidebar_terminal_threads",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?;
+        assert_eq!(
+            terminal_paths,
+            (
+                format!("{}/project-a", root.display()),
+                format!("{}/project-a", root.display()),
+                "/home/dev/web/workspace".to_string()
+            )
+        );
         Ok(())
     }
 }

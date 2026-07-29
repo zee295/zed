@@ -1368,7 +1368,7 @@ impl AgentPanel {
                     }) {
                         Ok(Some((store, reload_task))) => {
                             reload_task.await;
-                            let thread_id = store.read_with(cx, |store, _cx| {
+                            let thread = store.read_with(cx, |store, _cx| {
                                 let primary = info.thread_id.and_then(|tid| store.entry(tid));
                                 let fallback = info.session_id.as_ref().and_then(|sid| {
                                     store.entry_by_session(&acp::SessionId::new(sid.clone()))
@@ -1376,10 +1376,14 @@ impl AgentPanel {
                                 primary
                                     .or(fallback)
                                     .filter(|entry| !entry.archived)
-                                    .map(|entry| entry.thread_id)
+                                    .map(|entry| {
+                                        (entry.thread_id, entry.folder_paths().clone())
+                                    })
                             });
-                            match thread_id {
-                                Some(thread_id) => Some((info, thread_id)),
+                            match thread {
+                                Some((thread_id, work_dirs)) => {
+                                    Some((info, thread_id, work_dirs))
+                                }
                                 None => {
                                     log::info!(
                                         "last active thread is archived or missing, skipping restoration"
@@ -1436,7 +1440,7 @@ impl AgentPanel {
                     // backend; otherwise fall back to the serialized
                     // selection, then the global last-used agent.
                     let initial_agent = match &thread_to_restore {
-                        Some((info, _)) => Some(clamp(info.agent_type.clone())),
+                        Some((info, _, _)) => Some(clamp(info.agent_type.clone())),
                         None => serialized_panel
                             .as_ref()
                             .and_then(|p| p.selected_agent.clone())
@@ -1456,12 +1460,12 @@ impl AgentPanel {
                             window,
                             cx,
                         );
-                    } else if let Some((info, thread_id)) = thread_to_restore {
+                    } else if let Some((info, thread_id, work_dirs)) = thread_to_restore {
                         let agent = panel.selected_agent.clone();
                         panel.load_agent_thread(
                             agent,
                             thread_id,
-                            info.work_dirs.as_ref().map(PathList::deserialize),
+                            Some(work_dirs),
                             info.title.clone().map(Into::into),
                             false,
                             AgentThreadSource::AgentPanel,

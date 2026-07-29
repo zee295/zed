@@ -10,6 +10,7 @@ mod process_rpc;
 mod rpc;
 mod sql_rpc;
 mod terminal_rpc;
+mod workspace_state;
 
 use std::{
     net::SocketAddr,
@@ -64,6 +65,7 @@ pub struct AppState {
     shutdown: tokio::sync::broadcast::Sender<()>,
     rpc_sessions: Arc<rpc::SessionRegistry>,
     sql: Arc<sql_rpc::SqlRpc>,
+    workspace_state: Arc<workspace_state::WorkspaceState>,
     http: reqwest::Client,
 }
 
@@ -100,6 +102,7 @@ async fn main() -> Result<()> {
     initialize_config(&root).await?;
     let (auth_token, token_path, created) = load_auth_token(&root, args.auth_token).await?;
     let sql = Arc::new(sql_rpc::SqlRpc::new(&root)?);
+    let workspace_state = Arc::new(workspace_state::WorkspaceState::load(&root)?);
     let server_instance_id = {
         let mut bytes = [0_u8; 32];
         rand::rng().fill_bytes(&mut bytes);
@@ -119,6 +122,7 @@ async fn main() -> Result<()> {
         shutdown,
         rpc_sessions: Arc::new(rpc::SessionRegistry::default()),
         sql,
+        workspace_state,
         http: reqwest::Client::builder()
             .user_agent("ZedRemoteRust/0.1")
             .build()?,

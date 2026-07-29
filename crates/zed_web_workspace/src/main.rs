@@ -78,12 +78,14 @@ export function zedSyncWorkspacePaths(pathsJson) {
 }
 
 export function zedSyncWorkspaceProjectGroups(groupsJson) {
-    const groups = JSON.parse(groupsJson);
-    if (!Array.isArray(groups) || !groups.length) return;
+    const changed = self.__zedWorkspaceProjectGroups !== groupsJson;
+    self.__zedWorkspaceProjectGroups = groupsJson;
     const url = new URL(self.location.href);
-    if (url.searchParams.get("projects") === groupsJson) return;
-    url.searchParams.set("projects", groupsJson);
-    self.history.replaceState(self.history.state, "", url);
+    if (url.searchParams.has("projects")) {
+        url.searchParams.delete("projects");
+        self.history.replaceState(self.history.state, "", url);
+    }
+    return changed;
 }
 
 export function zedOpenExternalUrl(url) {
@@ -104,16 +106,18 @@ extern "C" {
     fn sync_workspace_paths_json(paths: &str);
 
     #[wasm_bindgen(js_name = zedSyncWorkspaceProjectGroups)]
-    fn sync_workspace_project_groups_json(groups: &str);
+    fn sync_workspace_project_groups_json(groups: &str) -> bool;
 
     #[wasm_bindgen(js_name = zedOpenExternalUrl)]
     fn open_external_url(url: &str) -> bool;
 }
 
 #[cfg(target_family = "wasm")]
-#[derive(Clone, Copy, Default, serde::Deserialize)]
+#[derive(Clone, Default, serde::Deserialize)]
 struct WebWorkspaceUiState {
     sidebar_open: bool,
+    #[serde(default)]
+    project_groups: Vec<Vec<String>>,
 }
 
 #[cfg(target_family = "wasm")]
@@ -192,9 +196,24 @@ fn sync_project_groups_url(groups: &[project::ProjectGroupKey]) {
         })
         .filter(|paths| !paths.is_empty())
         .collect::<Vec<_>>();
-    if let Ok(groups) = serde_json::to_string(&groups) {
-        sync_workspace_project_groups_json(&groups);
+    let Ok(groups_json) = serde_json::to_string(&groups) else {
+        return;
+    };
+    if !sync_workspace_project_groups_json(&groups_json) {
+        return;
     }
+    let Some(client) = wasm_remote::remote_client() else {
+        return;
+    };
+    wasm_bindgen_futures::spawn_local(async move {
+        client
+            .call_void(
+                "Workspace::set_project_groups",
+                &serde_json::json!({"groups": groups}),
+            )
+            .await
+            .log_err();
+    });
 }
 
 #[cfg(target_family = "wasm")]
@@ -1967,7 +1986,23 @@ fn launch(
             if paths.is_empty() {
                 paths.push(workspace_root);
             }
-            let project_groups = workspace_project_groups_from_url();
+            let legacy_project_groups = workspace_project_groups_from_url();
+            let project_groups = if legacy_project_groups.is_empty() {
+                ui_state
+                    .project_groups
+                    .iter()
+                    .map(|paths| {
+                        paths
+                            .iter()
+                            .filter(|path| !path.is_empty())
+                            .map(std::path::PathBuf::from)
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|paths| !paths.is_empty())
+                    .collect()
+            } else {
+                legacy_project_groups
+            };
             let open_task =
                 workspace::open_paths(&paths, app_state, workspace::OpenOptions::default(), cx);
             log_open_result(open_task, project_groups, ui_state, cx);
