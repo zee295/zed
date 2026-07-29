@@ -1194,9 +1194,9 @@ fn init_app_state(
     <dyn Fs>::set_global(fs.clone(), cx);
     load_user_settings(fs.clone(), cx);
 
-    let languages = Arc::new(language::LanguageRegistry::new(
-        cx.background_executor().clone(),
-    ));
+    let mut languages = language::LanguageRegistry::new(cx.background_executor().clone());
+    languages.set_language_server_download_dir(paths::languages_dir().clone());
+    let languages = Arc::new(languages);
 
     let clock: Arc<dyn clock::SystemClock> = Arc::new(RealSystemClock);
     // Model providers (Anthropic / OpenAI) call cx.http_client() directly.
