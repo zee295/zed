@@ -884,13 +884,13 @@ async fn get_cached_ts_server_binary(
     maybe!(async {
         let old_server_path = container_dir.join(TypeScriptLspAdapter::OLD_SERVER_PATH);
         let new_server_path = container_dir.join(TypeScriptLspAdapter::NEW_SERVER_PATH);
-        if new_server_path.exists() {
+        if crate::path_exists(&new_server_path).await {
             Ok(LanguageServerBinary {
                 path: node.binary_path().await?,
                 env: None,
                 arguments: typescript_server_binary_arguments(&new_server_path),
             })
-        } else if old_server_path.exists() {
+        } else if crate::path_exists(&old_server_path).await {
             Ok(LanguageServerBinary {
                 path: node.binary_path().await?,
                 env: None,

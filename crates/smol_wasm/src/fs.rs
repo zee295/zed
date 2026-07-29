@@ -317,6 +317,10 @@ pub async fn metadata(_path: impl AsRef<Path>) -> io::Result<std::fs::Metadata> 
     unsupported_metadata()
 }
 
+pub async fn is_file(path: impl AsRef<Path>) -> io::Result<bool> {
+    rpc_call("Fs::is_file", &json!({ "path": path_str(path.as_ref()) })).await
+}
+
 pub async fn symlink_metadata(path: impl AsRef<Path>) -> io::Result<std::fs::Metadata> {
     metadata(path).await
 }

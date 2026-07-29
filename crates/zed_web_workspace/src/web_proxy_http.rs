@@ -25,6 +25,16 @@ fn provider_for_host(host: &str) -> Option<&'static str> {
         Some("openai")
     } else if host.eq_ignore_ascii_case("cdn.agentclientprotocol.com") {
         Some("acp-registry")
+    } else if host.eq_ignore_ascii_case("api.github.com") {
+        Some("github-api")
+    } else if host.eq_ignore_ascii_case("github.com") {
+        Some("github")
+    } else if host.eq_ignore_ascii_case("codeload.github.com") {
+        Some("github-codeload")
+    } else if host.eq_ignore_ascii_case("raw.githubusercontent.com") {
+        Some("github-raw")
+    } else if host.eq_ignore_ascii_case("objects.githubusercontent.com") {
+        Some("github-objects")
     } else {
         None
     }

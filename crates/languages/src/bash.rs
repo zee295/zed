@@ -48,7 +48,7 @@ impl BashLspAdapter {
                 .join("node_modules")
                 .join(Self::NODE_MODULE_RELATIVE_SERVER_PATH);
             anyhow::ensure!(
-                server_path.exists(),
+                crate::path_exists(&server_path).await,
                 "missing executable in directory {server_path:?}"
             );
             Ok(LanguageServerBinary {

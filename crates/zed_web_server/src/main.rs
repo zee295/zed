@@ -405,6 +405,11 @@ async fn proxy_http(
             "authorization",
         ),
         "acp-registry" => ("https://cdn.agentclientprotocol.com", &[][..], ""),
+        "github-api" => ("https://api.github.com", &[][..], ""),
+        "github" => ("https://github.com", &[][..], ""),
+        "github-codeload" => ("https://codeload.github.com", &[][..], ""),
+        "github-raw" => ("https://raw.githubusercontent.com", &[][..], ""),
+        "github-objects" => ("https://objects.githubusercontent.com", &[][..], ""),
         _ => {
             return (
                 StatusCode::NOT_FOUND,

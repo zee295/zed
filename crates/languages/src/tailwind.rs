@@ -219,7 +219,7 @@ async fn get_cached_server_binary(
     maybe!(async {
         let server_path = container_dir.join(SERVER_PATH);
         anyhow::ensure!(
-            server_path.exists(),
+            crate::path_exists(&server_path).await,
             "missing executable in directory {server_path:?}"
         );
         Ok(LanguageServerBinary {

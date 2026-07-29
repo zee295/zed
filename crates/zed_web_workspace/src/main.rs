@@ -1150,7 +1150,7 @@ fn init_app_state(
     use client::Client;
     use clock::RealSystemClock;
     use fs::Fs;
-    use http_client::{BlockedHttpClient, HttpClientWithUrl};
+    use http_client::HttpClientWithUrl;
     use settings::SettingsStore;
     use wasm_remote::RemoteFs;
     use workspace::{AppState, WorkspaceStore};
@@ -1213,7 +1213,7 @@ fn init_app_state(
     ));
     cx.set_http_client(proxy_http.clone());
     let http_client = Arc::new(HttpClientWithUrl::new(
-        Arc::new(BlockedHttpClient::new()),
+        proxy_http.clone(),
         &server_origin,
         None,
     ));

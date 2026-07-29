@@ -1,10 +1,5 @@
 mod async_body;
-#[cfg(not(target_family = "wasm"))]
 pub mod github;
-#[cfg(target_family = "wasm")]
-pub mod github {
-    include!("github_wasm.rs");
-}
 #[cfg(all(not(target_family = "wasm"), feature = "github-download"))]
 pub mod github_download;
 #[cfg(all(target_family = "wasm", feature = "github-download"))]

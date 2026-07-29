@@ -9,7 +9,7 @@ use python::PyprojectTomlManifestProvider;
 use rust::CargoManifestProvider;
 use settings::{SemanticTokenRules, SettingsStore};
 use smol::stream::StreamExt;
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 use util::ResultExt;
 
 pub use language::*;
@@ -40,6 +40,17 @@ mod vtsls;
 mod yaml;
 
 pub(crate) use package_json::{PackageJson, PackageJsonData};
+
+pub(crate) async fn path_exists(path: &Path) -> bool {
+    #[cfg(target_family = "wasm")]
+    {
+        smol::fs::is_file(path).await.unwrap_or(false)
+    }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        path.exists()
+    }
+}
 
 /// A shared grammar for plain text, exposed for reuse by downstream crates.
 #[cfg(feature = "tree-sitter-gitcommit")]

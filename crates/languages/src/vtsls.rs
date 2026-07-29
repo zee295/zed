@@ -378,7 +378,7 @@ async fn get_cached_ts_server_binary(
     maybe!(async {
         let server_path = container_dir.join(VtslsLspAdapter::SERVER_PATH);
         anyhow::ensure!(
-            server_path.exists(),
+            crate::path_exists(&server_path).await,
             "missing executable in directory {container_dir:?}"
         );
         Ok(LanguageServerBinary {
