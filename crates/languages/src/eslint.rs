@@ -45,7 +45,6 @@ pub struct EsLintLspAdapter {
 
 impl EsLintLspAdapter {
     const CURRENT_VERSION: &'static str = "3.0.24";
-    #[cfg(not(target_family = "wasm"))]
     const CURRENT_VERSION_TAG_NAME: &'static str = "release/3.0.24";
 
     #[cfg(all(not(target_family = "wasm"), not(windows)))]
@@ -53,10 +52,7 @@ impl EsLintLspAdapter {
     #[cfg(all(not(target_family = "wasm"), windows))]
     const GITHUB_ASSET_KIND: AssetKind = AssetKind::Zip;
 
-    #[cfg(not(target_family = "wasm"))]
     const SERVER_PATH: &'static str = "vscode-eslint/server/out/eslintServer.js";
-    #[cfg(target_family = "wasm")]
-    const SERVER_PATH: &'static str = "node_modules/@zed-industries/vscode-langservers-extracted/bin/vscode-eslint-language-server";
     const SERVER_NAME: LanguageServerName = LanguageServerName::new_static("eslint");
 
     const FLAT_CONFIG_FILE_NAMES_V8_21: &'static [&'static str] = &["eslint.config.js"];
@@ -99,12 +95,8 @@ impl LspInstaller for EsLintLspAdapter {
     ) -> Result<GitHubLspBinaryVersion> {
         #[cfg(target_family = "wasm")]
         {
-            let version = self
-                .node
-                .npm_package_latest_version("@zed-industries/vscode-langservers-extracted")
-                .await?;
             return Ok(GitHubLspBinaryVersion {
-                name: version.to_string(),
+                name: Self::CURRENT_VERSION.into(),
                 digest: None,
                 url: String::new(),
             });
@@ -145,11 +137,28 @@ impl LspInstaller for EsLintLspAdapter {
                 #[cfg(target_family = "wasm")]
                 {
                     fs::create_dir_all(&destination_path).await?;
-                    node.npm_install_latest_packages(
-                        &destination_path,
-                        &["@zed-industries/vscode-langservers-extracted"],
-                    )
-                    .await?;
+                    let repo_root = destination_path.join("vscode-eslint");
+                    let output = smol::process::Command::new("git")
+                        .args([
+                            "clone",
+                            "--depth",
+                            "1",
+                            "--branch",
+                            Self::CURRENT_VERSION_TAG_NAME,
+                            "https://github.com/microsoft/vscode-eslint.git",
+                        ])
+                        .arg(&repo_root)
+                        .output()
+                        .await?;
+                    anyhow::ensure!(
+                        output.status.success(),
+                        "cloning vscode-eslint failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    node.run_npm_subcommand(Some(&repo_root), "install", &[])
+                        .await?;
+                    node.run_npm_subcommand(Some(&repo_root), "run-script", &["compile"])
+                        .await?;
                 }
 
                 #[cfg(not(target_family = "wasm"))]
