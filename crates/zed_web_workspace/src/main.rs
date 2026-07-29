@@ -1539,10 +1539,17 @@ fn install_workspace_chrome(cx: &mut App) {
                 },
             )
             .detach();
-            let sidebar = cx.new(|cx| sidebar::Sidebar::new(multi_workspace.clone(), window, cx));
-            multi_workspace.update(cx, |mw, cx| {
-                mw.register_sidebar(sidebar, cx);
-            });
+            // The sidebar belongs to the platform window, not to an individual
+            // workspace. Every workspace runs this initializer, so replacing
+            // the registered sidebar here would release the entity that may
+            // still be completing a cross-project activation.
+            if multi_workspace.read(cx).sidebar().is_none() {
+                let sidebar =
+                    cx.new(|cx| sidebar::Sidebar::new(multi_workspace.clone(), window, cx));
+                multi_workspace.update(cx, |mw, cx| {
+                    mw.register_sidebar(sidebar, cx);
+                });
+            }
         }
 
         // Pane chrome
@@ -1868,8 +1875,8 @@ fn load_core_panels(
     use terminal_view::terminal_panel::TerminalPanel;
 
     cx.spawn_in(window, async move |workspace_handle, cx| {
-        async fn add_panel_when_ready(
-            panel_task: impl Future<Output = anyhow::Result<Entity<impl workspace::Panel>>> + 'static,
+        async fn add_panel_when_ready<P: workspace::Panel>(
+            panel_task: impl Future<Output = anyhow::Result<Entity<P>>> + 'static,
             workspace_handle: WeakEntity<workspace::Workspace>,
             mut cx: gpui::AsyncWindowContext,
             name: &'static str,
@@ -1878,12 +1885,20 @@ fn load_core_panels(
                 Ok(panel) => {
                     let attached = workspace_handle
                         .update_in(&mut cx, |workspace, window, cx| {
-                            workspace.add_panel(panel, window, cx);
+                            if workspace.panel::<P>(cx).is_none() {
+                                workspace.add_panel(panel, window, cx);
+                            }
                         })
                         .is_ok();
-                    web_sys::console::log_1(
-                        &format!("zed_web_workspace: {name} panel attached").into(),
-                    );
+                    if attached {
+                        web_sys::console::log_1(
+                            &format!("zed_web_workspace: {name} panel attached").into(),
+                        );
+                    } else {
+                        web_sys::console::warn_1(
+                            &format!("zed_web_workspace: {name} panel owner released").into(),
+                        );
+                    }
                     attached
                 }
                 Err(err) => {

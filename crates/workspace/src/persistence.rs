@@ -61,6 +61,169 @@ use self::model::{DockStructure, SerializedWorkspaceLocation, SessionWorkspace};
 // > which defaults to <..> 32766 for SQLite versions after 3.32.0.
 const MAX_QUERY_PLACEHOLDERS: usize = 32000;
 
+fn workspace_for_roots_query() -> &'static str {
+    sql!(
+        SELECT
+            workspace_id,
+            paths,
+            paths_order,
+            identity_paths,
+            identity_paths_order,
+            window_state,
+            window_x,
+            window_y,
+            window_width,
+            window_height,
+            display,
+            centered_layout,
+            left_dock_visible,
+            left_dock_active_panel,
+            left_dock_zoom,
+            right_dock_visible,
+            right_dock_active_panel,
+            right_dock_zoom,
+            bottom_dock_visible,
+            bottom_dock_active_panel,
+            bottom_dock_zoom,
+            window_id
+        FROM workspaces
+        WHERE
+            paths IS ? AND
+            remote_connection_id IS ?
+        LIMIT 1
+    )
+}
+
+fn pane_group_query() -> &'static str {
+    sql!(
+        SELECT group_id, axis, pane_id, active, pinned_count, flexes
+            FROM (SELECT
+                    group_id,
+                    axis,
+                    NULL as pane_id,
+                    NULL as active,
+                    NULL as pinned_count,
+                    position,
+                    parent_group_id,
+                    workspace_id,
+                    flexes
+                  FROM pane_groups
+                UNION
+                  SELECT
+                    NULL,
+                    NULL,
+                    center_panes.pane_id,
+                    panes.active as active,
+                    pinned_count,
+                    position,
+                    parent_group_id,
+                    panes.workspace_id as workspace_id,
+                    NULL
+                  FROM center_panes
+                  JOIN panes ON center_panes.pane_id = panes.pane_id)
+            WHERE parent_group_id IS ? AND workspace_id = ?
+            ORDER BY position
+    )
+}
+
+fn pane_items_query() -> &'static str {
+    sql!(
+        SELECT kind, item_id, active, preview FROM items
+        WHERE pane_id = ?
+            ORDER BY position
+    )
+}
+
+fn bookmarks_query() -> &'static str {
+    sql!(
+        SELECT path, row, label
+        FROM bookmarks
+        WHERE workspace_id = ?
+        ORDER BY path, row
+    )
+}
+
+fn breakpoints_query() -> &'static str {
+    sql!(
+        SELECT path, breakpoint_location, log_message, condition, hit_condition, state
+        FROM breakpoints
+        WHERE workspace_id = ?
+    )
+}
+
+fn user_toolchains_query() -> &'static str {
+    sql!(
+        SELECT workspace_id, worktree_root_path, relative_worktree_path,
+        language_name, name, path, raw_json
+        FROM user_toolchains WHERE remote_connection_id IS ?1 AND (
+              workspace_id IN (0, ?2)
+        )
+    )
+}
+
+fn toolchains_query() -> &'static str {
+    sql!(
+        SELECT
+            name, path, worktree_root_path, relative_worktree_path, language_name, raw_json
+        FROM toolchains
+        WHERE workspace_id = ?
+    )
+}
+
+#[cfg(target_family = "wasm")]
+fn sql_cell_i64(cell: &sqlez::remote_sql::SqlCell) -> Option<i64> {
+    use sqlez::remote_sql::SqlCell;
+
+    match cell {
+        SqlCell::Int(value) => Some(*value),
+        SqlCell::Float(value) => Some(*value as i64),
+        SqlCell::Text(value) => value.parse().ok(),
+        SqlCell::Null | SqlCell::Blob(_) => None,
+    }
+}
+
+#[cfg(target_family = "wasm")]
+async fn prefetch_workspace_pane_tree(workspace_id: i64) -> Result<()> {
+    use sqlez::remote_sql::{SqlParam, prefetch_query, prefetch_query_result};
+
+    let mut parent_group_ids = vec![None];
+    while !parent_group_ids.is_empty() {
+        let group_queries = parent_group_ids
+            .drain(..)
+            .map(|parent_group_id| {
+                let params = [
+                    parent_group_id
+                        .map(SqlParam::int)
+                        .unwrap_or_else(SqlParam::null),
+                    SqlParam::int(workspace_id),
+                ];
+                async move { prefetch_query_result(pane_group_query(), &params).await }
+            })
+            .collect::<Vec<_>>();
+        let group_results = futures::future::try_join_all(group_queries).await?;
+
+        let mut pane_ids = Vec::new();
+        for result in group_results {
+            for row in result.rows {
+                if let Some(group_id) = row.first().and_then(sql_cell_i64) {
+                    parent_group_ids.push(Some(group_id));
+                }
+                if let Some(pane_id) = row.get(2).and_then(sql_cell_i64) {
+                    pane_ids.push(pane_id);
+                }
+            }
+        }
+
+        futures::future::try_join_all(pane_ids.into_iter().map(|pane_id| {
+            let params = [SqlParam::int(pane_id)];
+            async move { prefetch_query(pane_items_query(), &params).await }
+        }))
+        .await?;
+    }
+
+    Ok(())
+}
+
 fn parse_timestamp(text: &str) -> DateTime<Utc> {
     NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
         .map(|naive| naive.and_utc())
@@ -317,6 +480,24 @@ pub async fn write_multi_workspace_state(
     state: model::MultiWorkspaceState,
 ) {
     if let Ok(json_str) = serde_json::to_string(&state) {
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = kvp;
+            use sqlez::remote_sql::{SqlParam, execute_async};
+
+            execute_async(
+                "INSERT OR REPLACE INTO scoped_kv_store(namespace, key, value) VALUES ((?), (?), (?))",
+                &[
+                    SqlParam::text("multi_workspace_state"),
+                    SqlParam::text(window_id.as_u64().to_string()),
+                    SqlParam::text(json_str),
+                ],
+            )
+            .await
+            .log_err();
+        }
+
+        #[cfg(not(target_family = "wasm"))]
         kvp.scoped("multi_workspace_state")
             .write(window_id.as_u64().to_string(), json_str)
             .await
@@ -1122,36 +1303,7 @@ impl WorkspaceDb {
             DockStructure,
             Option<u64>,
         ) = self
-            .select_row_bound(sql! {
-                SELECT
-                    workspace_id,
-                    paths,
-                    paths_order,
-                    identity_paths,
-                    identity_paths_order,
-                    window_state,
-                    window_x,
-                    window_y,
-                    window_width,
-                    window_height,
-                    display,
-                    centered_layout,
-                    left_dock_visible,
-                    left_dock_active_panel,
-                    left_dock_zoom,
-                    right_dock_visible,
-                    right_dock_active_panel,
-                    right_dock_zoom,
-                    bottom_dock_visible,
-                    bottom_dock_active_panel,
-                    bottom_dock_zoom,
-                    window_id
-                FROM workspaces
-                WHERE
-                    paths IS ? AND
-                    remote_connection_id IS ?
-                LIMIT 1
-            })
+            .select_row_bound(workspace_for_roots_query())
             .and_then(|mut prepared_statement| {
                 (prepared_statement)((
                     root_paths.serialize().paths,
@@ -1203,6 +1355,50 @@ impl WorkspaceDb {
             window_id,
             user_toolchains: self.user_toolchains(workspace_id, remote_connection_id),
         })
+    }
+
+    /// Prefetch all local workspace metadata over the asynchronous RPC
+    /// transport. `workspace_for_roots` and item deserializers can then use
+    /// their existing synchronous sqlez APIs without blocking the WASM UI.
+    #[cfg(target_family = "wasm")]
+    pub(crate) async fn prefetch_workspace_for_roots<P: AsRef<Path>>(
+        &self,
+        worktree_roots: &[P],
+    ) -> Result<()> {
+        use sqlez::remote_sql::{SqlParam, prefetch_query, prefetch_query_result};
+
+        let root_paths = PathList::new(worktree_roots);
+        if root_paths.is_empty() {
+            return Ok(());
+        }
+
+        let params = [
+            SqlParam::text(root_paths.serialize().paths),
+            SqlParam::null(),
+        ];
+        let workspace = prefetch_query_result(workspace_for_roots_query(), &params).await?;
+        let Some(workspace_id) = workspace
+            .rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(sql_cell_i64)
+        else {
+            return Ok(());
+        };
+
+        let workspace_id_param = SqlParam::int(workspace_id);
+        let bookmarks_params = [workspace_id_param.clone()];
+        let breakpoints_params = [workspace_id_param.clone()];
+        let user_toolchains_params = [SqlParam::null(), workspace_id_param.clone()];
+        let toolchains_params = [workspace_id_param];
+        futures::try_join!(
+            prefetch_workspace_pane_tree(workspace_id),
+            prefetch_query(bookmarks_query(), &bookmarks_params),
+            prefetch_query(breakpoints_query(), &breakpoints_params),
+            prefetch_query(user_toolchains_query(), &user_toolchains_params),
+            prefetch_query(toolchains_query(), &toolchains_params),
+        )?;
+        Ok(())
     }
 
     /// Returns the workspace with the given ID, loading all associated data.
@@ -1311,12 +1507,7 @@ impl WorkspaceDb {
 
     fn bookmarks(&self, workspace_id: WorkspaceId) -> BTreeMap<Arc<Path>, Vec<SerializedBookmark>> {
         let bookmarks: Result<Vec<(PathBuf, Bookmark)>> = self
-            .select_bound(sql! {
-                SELECT path, row, label
-                FROM bookmarks
-                WHERE workspace_id = ?
-                ORDER BY path, row
-            })
+            .select_bound(bookmarks_query())
             .and_then(|mut prepared_statement| (prepared_statement)(workspace_id));
 
         match bookmarks {
@@ -1348,11 +1539,7 @@ impl WorkspaceDb {
 
     fn breakpoints(&self, workspace_id: WorkspaceId) -> BTreeMap<Arc<Path>, Vec<SourceBreakpoint>> {
         let breakpoints: Result<Vec<(PathBuf, Breakpoint)>> = self
-            .select_bound(sql! {
-                SELECT path, breakpoint_location, log_message, condition, hit_condition, state
-                FROM breakpoints
-                WHERE workspace_id = ?
-            })
+            .select_bound(breakpoints_query())
             .and_then(|mut prepared_statement| (prepared_statement)(workspace_id));
 
         match breakpoints {
@@ -1400,13 +1587,7 @@ impl WorkspaceDb {
         type RowKind = (WorkspaceId, String, String, String, String, String, String);
 
         let toolchains: Vec<RowKind> = self
-            .select_bound(sql! {
-                SELECT workspace_id, worktree_root_path, relative_worktree_path,
-                language_name, name, path, raw_json
-                FROM user_toolchains WHERE remote_connection_id IS ?1 AND (
-                      workspace_id IN (0, ?2)
-                )
-            })
+            .select_bound(user_toolchains_query())
             .and_then(|mut statement| {
                 (statement)((remote_connection_id.map(|id| id.0), workspace_id))
             })
@@ -2279,65 +2460,37 @@ impl WorkspaceDb {
             Option<usize>,
             Option<String>,
         );
-        self.select_bound::<GroupKey, GroupOrPane>(sql!(
-            SELECT group_id, axis, pane_id, active, pinned_count, flexes
-                FROM (SELECT
-                        group_id,
-                        axis,
-                        NULL as pane_id,
-                        NULL as active,
-                        NULL as pinned_count,
-                        position,
-                        parent_group_id,
-                        workspace_id,
-                        flexes
-                      FROM pane_groups
-                    UNION
-                      SELECT
-                        NULL,
-                        NULL,
-                        center_panes.pane_id,
-                        panes.active as active,
-                        pinned_count,
-                        position,
-                        parent_group_id,
-                        panes.workspace_id as workspace_id,
-                        NULL
-                      FROM center_panes
-                      JOIN panes ON center_panes.pane_id = panes.pane_id)
-                WHERE parent_group_id IS ? AND workspace_id = ?
-                ORDER BY position
-        ))?((group_id, workspace_id))?
-        .into_iter()
-        .map(|(group_id, axis, pane_id, active, pinned_count, flexes)| {
-            let maybe_pane = maybe!({ Some((pane_id?, active?, pinned_count?)) });
-            if let Some((group_id, axis)) = group_id.zip(axis) {
-                let flexes = flexes
-                    .map(|flexes: String| serde_json::from_str::<Vec<f32>>(&flexes))
-                    .transpose()?;
+        self.select_bound::<GroupKey, GroupOrPane>(pane_group_query())?((group_id, workspace_id))?
+            .into_iter()
+            .map(|(group_id, axis, pane_id, active, pinned_count, flexes)| {
+                let maybe_pane = maybe!({ Some((pane_id?, active?, pinned_count?)) });
+                if let Some((group_id, axis)) = group_id.zip(axis) {
+                    let flexes = flexes
+                        .map(|flexes: String| serde_json::from_str::<Vec<f32>>(&flexes))
+                        .transpose()?;
 
-                Ok(SerializedPaneGroup::Group {
-                    axis,
-                    children: self.get_pane_group(workspace_id, Some(group_id))?,
-                    flexes,
-                })
-            } else if let Some((pane_id, active, pinned_count)) = maybe_pane {
-                Ok(SerializedPaneGroup::Pane(SerializedPane::new(
-                    self.get_items(pane_id)?,
-                    active,
-                    pinned_count,
-                )))
-            } else {
-                bail!("Pane Group Child was neither a pane group or a pane");
-            }
-        })
-        // Filter out panes and pane groups which don't have any children or items
-        .filter(|pane_group| match pane_group {
-            Ok(SerializedPaneGroup::Group { children, .. }) => !children.is_empty(),
-            Ok(SerializedPaneGroup::Pane(pane)) => !pane.children.is_empty(),
-            _ => true,
-        })
-        .collect::<Result<_>>()
+                    Ok(SerializedPaneGroup::Group {
+                        axis,
+                        children: self.get_pane_group(workspace_id, Some(group_id))?,
+                        flexes,
+                    })
+                } else if let Some((pane_id, active, pinned_count)) = maybe_pane {
+                    Ok(SerializedPaneGroup::Pane(SerializedPane::new(
+                        self.get_items(pane_id)?,
+                        active,
+                        pinned_count,
+                    )))
+                } else {
+                    bail!("Pane Group Child was neither a pane group or a pane");
+                }
+            })
+            // Filter out panes and pane groups which don't have any children or items
+            .filter(|pane_group| match pane_group {
+                Ok(SerializedPaneGroup::Group { children, .. }) => !children.is_empty(),
+                Ok(SerializedPaneGroup::Pane(pane)) => !pane.children.is_empty(),
+                _ => true,
+            })
+            .collect::<Result<_>>()
     }
 
     fn save_pane_group(
@@ -2418,11 +2571,7 @@ impl WorkspaceDb {
     }
 
     fn get_items(&self, pane_id: PaneId) -> Result<Vec<SerializedItem>> {
-        self.select_bound(sql!(
-            SELECT kind, item_id, active, preview FROM items
-            WHERE pane_id = ?
-                ORDER BY position
-        ))?(pane_id)
+        self.select_bound(pane_items_query())?(pane_id)
     }
 
     fn save_items(
@@ -2501,12 +2650,7 @@ impl WorkspaceDb {
     ) -> Result<Vec<(Toolchain, Arc<Path>, Arc<RelPath>)>> {
         self.write(move |this| {
             let mut select = this
-                .select_bound(sql!(
-                    SELECT
-                        name, path, worktree_root_path, relative_worktree_path, language_name, raw_json
-                    FROM toolchains
-                    WHERE workspace_id = ?
-                ))
+                .select_bound(toolchains_query())
                 .context("select toolchains")?;
 
             let toolchain: Vec<(String, String, String, String, String, String)> =
@@ -2523,8 +2667,10 @@ impl WorkspaceDb {
                                 language_name: LanguageName::new(&language),
                                 as_json: serde_json::Value::from_str(&json).ok()?,
                             },
-                           Arc::from(worktree_root_path.as_ref()),
-                            RelPath::from_unix_str(&relative_worktree_path).log_err()?.into(),
+                            Arc::from(worktree_root_path.as_ref()),
+                            RelPath::from_unix_str(&relative_worktree_path)
+                                .log_err()?
+                                .into(),
                         ))
                     },
                 )

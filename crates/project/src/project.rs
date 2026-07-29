@@ -4135,6 +4135,17 @@ impl Project {
             .detach_and_log_err(cx);
     }
 
+    pub fn stop_all_language_servers(&mut self, cx: &mut Context<Self>) {
+        self.lsp_store
+            .update(cx, |lsp_store, cx| lsp_store.stop_all_language_servers(cx));
+    }
+
+    pub fn restart_all_language_servers(&mut self, cx: &mut Context<Self>) {
+        self.lsp_store.update(cx, |lsp_store, cx| {
+            lsp_store.restart_all_language_servers(cx)
+        });
+    }
+
     pub fn cancel_language_server_work_for_buffers(
         &mut self,
         buffers: impl IntoIterator<Item = Entity<Buffer>>,

@@ -1930,6 +1930,11 @@ impl Workspace {
                 }
             }
 
+            #[cfg(target_family = "wasm")]
+            db.prefetch_workspace_for_roots(paths_to_open.as_slice())
+                .await
+                .log_err();
+
             let serialized_workspace = db.workspace_for_roots(paths_to_open.as_slice());
 
             if let Some(paths) = serialized_workspace.as_ref().map(|ws| &ws.paths) {

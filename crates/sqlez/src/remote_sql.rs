@@ -228,6 +228,15 @@ fn run_query(sql: &str, params_json: Vec<Value>) -> Result<SqlQueryResult> {
 /// statement cache. The subsequent sqlez statement performs no blocking RPC.
 #[cfg(target_family = "wasm")]
 pub async fn prefetch_query(sql: &str, params: &[SqlParam]) -> Result<()> {
+    prefetch_query_result(sql, params).await?;
+    Ok(())
+}
+
+/// Fetch a SELECT through the normal async WebSocket, seed the synchronous
+/// statement cache, and return the decoded result to callers that need values
+/// to prefetch dependent queries.
+#[cfg(target_family = "wasm")]
+pub async fn prefetch_query_result(sql: &str, params: &[SqlParam]) -> Result<SqlQueryResult> {
     let params_json: Vec<Value> = params.iter().map(SqlParam::to_json).collect();
     let client = ASYNC_SQL_CLIENT
         .get()
@@ -245,7 +254,33 @@ pub async fn prefetch_query(sql: &str, params: &[SqlParam]) -> Result<()> {
     let value: Value = client.call("Sql::query", &rpc_params).await?;
     let result = parse_query_result(value)?;
     read_cache_put(sql, &params_json, &result);
-    Ok(())
+    Ok(result)
+}
+
+/// Execute a write through the asynchronous WebSocket transport. This is used
+/// for UI-state persistence where synchronous HTTP would block the renderer.
+#[cfg(target_family = "wasm")]
+pub async fn execute_async(sql: &str, params: &[SqlParam]) -> Result<SqlQueryResult> {
+    let params_json: Vec<Value> = params.iter().map(SqlParam::to_json).collect();
+    let value = async_call(
+        "Sql::query",
+        request_with_client_id(&json!({
+            "params": {
+                "sql": sql,
+                "params": params_json,
+            }
+        }))
+        .get("params")
+        .cloned()
+        .context("build asynchronous SQL parameters")?,
+    )
+    .await?;
+    let result = parse_query_result(value)?;
+    read_cache_clear();
+    if touches_common_store(sql) {
+        read_cache::apply_common_write(sql, &params_json);
+    }
+    Ok(result)
 }
 
 #[cfg(target_family = "wasm")]

@@ -1504,6 +1504,22 @@ impl MultiWorkspace {
             }
         }
 
+        #[cfg(target_family = "wasm")]
+        {
+            let old_project = old_active_workspace.read(cx).project().clone();
+            let new_project = workspace.read(cx).project().clone();
+            if old_project != new_project {
+                old_project.update(cx, |project, cx| {
+                    project.stop_all_language_servers(cx);
+                });
+                if workspace_was_retained {
+                    new_project.update(cx, |project, cx| {
+                        project.restart_all_language_servers(cx);
+                    });
+                }
+            }
+        }
+
         self.active_workspace = workspace;
         // Publish the new active workspace before anyone reads the shared cell
         // to decide who owns the window chrome.
