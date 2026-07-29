@@ -61,9 +61,10 @@ use std::{
 };
 use theme_settings::ThemeSettings;
 use ui::{
-    ContextMenu, DecoratedIcon, IconDecoration, IconDecorationKind, IndentGuideColors,
-    IndentGuideLayout, Indicator, KeyBinding, ListItem, ListItemSpacing, ProjectEmptyState,
-    ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, Tooltip, WithScrollbar, prelude::*,
+    CommonAnimationExt, ContextMenu, DecoratedIcon, IconDecoration, IconDecorationKind,
+    IndentGuideColors, IndentGuideLayout, Indicator, KeyBinding, ListItem, ListItemSpacing,
+    ProjectEmptyState, ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, Tooltip,
+    WithScrollbar, prelude::*,
 };
 use util::{
     ResultExt, TakeUntilExt, TryFutureExt,
@@ -166,6 +167,7 @@ pub struct ProjectPanel {
     last_reported_update: Instant,
     update_visible_entries_task: UpdateVisibleEntriesTask,
     undo_manager: UndoManager,
+    refreshing: bool,
     state: State,
 }
 
@@ -347,6 +349,8 @@ actions!(
         CollapseAllEntries,
         /// Expands all entries in the project tree.
         ExpandAllEntries,
+        /// Refreshes the selected directory in the project tree.
+        Refresh,
         /// Creates a new directory.
         NewDirectory,
         /// Creates a new file.
@@ -882,6 +886,7 @@ impl ProjectPanel {
                     project.read(cx).is_via_collab(),
                     &cx,
                 ),
+                refreshing: false,
             };
             this.update_visible_entries(None, false, false, window, cx);
 
@@ -1093,6 +1098,7 @@ impl ProjectPanel {
             let is_remote = project.is_remote();
             let is_collab = project.is_via_collab();
             let is_local = project.is_local() || project.is_via_wsl_with_host_interop(cx);
+            let can_refresh = is_dir && worktree.as_local().is_some();
             let is_markdown = !is_dir && MarkdownPreviewView::is_markdown_path(&*entry.path);
 
             let settings = ProjectPanelSettings::get_global(cx);
@@ -1125,6 +1131,9 @@ impl ProjectPanel {
                         menu.when(is_markdown, |menu| {
                             menu.action("Open Markdown Preview", Box::new(OpenMarkdownPreview))
                         })
+                        .when(can_refresh, |menu| {
+                            menu.action("Refresh", Box::new(Refresh))
+                        })
                         .when(is_dir, |menu| {
                             menu.action("Search Inside", Box::new(NewSearchInDirectory))
                         })
@@ -1148,6 +1157,9 @@ impl ProjectPanel {
                             .when(is_dir, |menu| {
                                 menu.separator()
                                     .action("Find in Folder…", Box::new(NewSearchInDirectory))
+                            })
+                            .when(can_refresh, |menu| {
+                                menu.action("Refresh", Box::new(Refresh))
                             })
                             .when(is_unfoldable, |menu| {
                                 menu.action("Unfold Directory", Box::new(UnfoldDirectory))
@@ -1486,6 +1498,36 @@ impl ProjectPanel {
     ) {
         let roots = self.all_worktree_roots(cx);
         self.expand_worktree_roots(roots, window, cx);
+    }
+
+    fn refresh(&mut self, _: &Refresh, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((worktree, entry)) = self.selected_sub_entry(cx) else {
+            return;
+        };
+        let path = if entry.is_dir() {
+            entry.path.clone()
+        } else {
+            entry.path.parent().unwrap_or(RelPath::empty()).into()
+        };
+        let Some(refresh) = worktree.update(cx, |worktree, cx| {
+            worktree
+                .as_local_mut()
+                .map(|worktree| worktree.refresh_entry(path, None, cx))
+        }) else {
+            return;
+        };
+
+        self.refreshing = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            refresh.await.log_err();
+            this.update(cx, |this, cx| {
+                this.refreshing = false;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn expand_all_for_entry_and_refresh(
@@ -6869,6 +6911,8 @@ impl Render for ProjectPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let has_worktree = !self.state.visible_entries.is_empty();
         let project = self.project.read(cx);
+        let worktree_store = project.worktree_store();
+        let is_scanning = self.refreshing || !worktree_store.read(cx).initial_scan_completed();
         let panel_settings = ProjectPanelSettings::get_global(cx);
         let indent_size = panel_settings.indent_size;
         let show_indent_guides = panel_settings.indent_guides.show == ShowIndentGuides::Always;
@@ -7009,6 +7053,7 @@ impl Render for ProjectPanel {
                 .on_action(cx.listener(Self::collapse_selected_entry))
                 .on_action(cx.listener(Self::collapse_all_entries))
                 .on_action(cx.listener(Self::expand_all_entries))
+                .on_action(cx.listener(Self::refresh))
                 .on_action(cx.listener(Self::collapse_selected_entry_and_children))
                 .on_action(cx.listener(Self::expand_selected_entry_and_children))
                 .on_action(cx.listener(Self::open))
@@ -7056,6 +7101,22 @@ impl Render for ProjectPanel {
                         .on_action(cx.listener(Self::download_from_remote))
                 })
                 .track_focus(&self.focus_handle(cx))
+                .when(is_scanning, |panel| {
+                    panel.child(
+                        h_flex()
+                            .id("project-panel-scan-indicator")
+                            .absolute()
+                            .top_1()
+                            .right_1()
+                            .tooltip(Tooltip::text("Project Scan in Progress…"))
+                            .child(
+                                Icon::new(IconName::LoadCircle)
+                                    .color(Color::Accent)
+                                    .size(IconSize::Small)
+                                    .with_rotate_animation(2),
+                            ),
+                    )
+                })
                 .child(
                     v_flex()
                         .child(

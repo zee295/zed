@@ -8962,6 +8962,54 @@ async fn test_context_menu_new_file_in_empty_hidden_root(cx: &mut gpui::TestAppC
     );
 }
 
+#[gpui::test]
+async fn test_refresh_discovers_entries_without_watcher_events(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/root"), json!({"existing.txt": ""}))
+        .await;
+
+    let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, |workspace, window, cx| {
+        let panel = ProjectPanel::new(workspace, window, cx);
+        workspace.add_panel(panel.clone(), window, cx);
+        panel
+    });
+    cx.run_until_parked();
+
+    fs.pause_events();
+    fs.insert_file(path!("/root/created-while-disconnected.txt"), Vec::new())
+        .await;
+
+    panel.update_in(cx, |panel, window, cx| {
+        let (worktree_id, entry_id) = panel
+            .all_worktree_roots(cx)
+            .into_iter()
+            .next()
+            .expect("project root");
+        panel.selection = Some(SelectedEntry {
+            worktree_id,
+            entry_id,
+        });
+        panel.refresh(&Refresh, window, cx);
+        assert!(panel.refreshing);
+    });
+    cx.run_until_parked();
+
+    assert!(
+        visible_entries_as_strings(&panel, 0..20, cx)
+            .iter()
+            .any(|entry| entry.contains("created-while-disconnected.txt"))
+    );
+    panel.read_with(cx, |panel, _| assert!(!panel.refreshing));
+}
+
 #[cfg(windows)]
 #[gpui::test]
 async fn test_create_entry_with_trailing_dot_windows(cx: &mut gpui::TestAppContext) {
