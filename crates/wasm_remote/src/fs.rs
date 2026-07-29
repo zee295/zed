@@ -42,7 +42,6 @@ pub struct RemoteFs {
     client: RemoteClient,
     executor: BackgroundExecutor,
     watch_subscriptions: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Vec<PathEvent>>>>>,
-    prefetched_directories: Arc<Mutex<HashMap<std::path::PathBuf, Vec<std::path::PathBuf>>>>,
     prefetched_metadata: Arc<Mutex<HashMap<std::path::PathBuf, MetadataResponse>>>,
 }
 
@@ -50,19 +49,16 @@ impl RemoteFs {
     pub fn new(client: RemoteClient, executor: BackgroundExecutor) -> Self {
         let subscriptions: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Vec<PathEvent>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let prefetched_directories = Arc::new(Mutex::new(HashMap::new()));
         let prefetched_metadata = Arc::new(Mutex::new(HashMap::new()));
 
         // Register a single notification handler that routes remote file-system
         // events to the active watch subscriptions.
         let subs_for_handler = subscriptions.clone();
-        let directories_for_handler = prefetched_directories.clone();
         let metadata_for_handler = prefetched_metadata.clone();
         client.on_notification("Fs::watch_event", move |params| {
             let Ok(payload) = serde_json::from_value::<WatchNotification>(params) else {
                 return;
             };
-            lock_shared(&directories_for_handler).clear();
             lock_shared(&metadata_for_handler).clear();
             let events: Vec<PathEvent> = payload
                 .events
@@ -113,7 +109,6 @@ impl RemoteFs {
             client,
             executor,
             watch_subscriptions: subscriptions,
-            prefetched_directories,
             prefetched_metadata,
         }
     }
@@ -133,9 +128,9 @@ struct MetadataResponse {
 }
 
 #[derive(Deserialize)]
-struct ReadDirTreeResponse {
+struct ReadDirResponse {
     entries: Vec<String>,
-    directories: HashMap<String, Vec<String>>,
+    #[serde(default)]
     metadata: HashMap<String, MetadataResponse>,
 }
 
@@ -498,22 +493,10 @@ impl Fs for RemoteFs {
         &self,
         path: &std::path::Path,
     ) -> Result<Pin<Box<dyn Send + Stream<Item = Result<std::path::PathBuf>>>>> {
-        if let Some(entries) = lock_shared(&self.prefetched_directories).remove(path) {
-            return Ok(Box::pin(stream::iter(entries.into_iter().map(Ok))));
-        }
-
-        let response: ReadDirTreeResponse = self
+        let response: ReadDirResponse = self
             .client
-            .call("Fs::read_dir_tree", &json!({ "path": path_arg(path) }))
+            .call("Fs::read_dir", &json!({ "path": path_arg(path) }))
             .await?;
-        lock_shared(&self.prefetched_directories).extend(response.directories.into_iter().map(
-            |(directory, entries)| {
-                (
-                    std::path::PathBuf::from(directory),
-                    entries.into_iter().map(std::path::PathBuf::from).collect(),
-                )
-            },
-        ));
         lock_shared(&self.prefetched_metadata).extend(
             response
                 .metadata
