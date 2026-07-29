@@ -1987,21 +1987,22 @@ fn launch(
                 paths.push(workspace_root);
             }
             let legacy_project_groups = workspace_project_groups_from_url();
-            let project_groups = if legacy_project_groups.is_empty() {
-                ui_state
-                    .project_groups
-                    .iter()
-                    .map(|paths| {
-                        paths
-                            .iter()
-                            .filter(|path| !path.is_empty())
-                            .map(std::path::PathBuf::from)
-                            .collect::<Vec<_>>()
-                    })
-                    .filter(|paths| !paths.is_empty())
-                    .collect()
-            } else {
+            let persisted_project_groups = ui_state
+                .project_groups
+                .iter()
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .filter(|path| !path.is_empty())
+                        .map(std::path::PathBuf::from)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|paths| !paths.is_empty())
+                .collect::<Vec<_>>();
+            let project_groups = if persisted_project_groups.is_empty() {
                 legacy_project_groups
+            } else {
+                persisted_project_groups
             };
             let open_task =
                 workspace::open_paths(&paths, app_state, workspace::OpenOptions::default(), cx);
