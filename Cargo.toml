@@ -397,7 +397,7 @@ language_models_cloud = { path = "crates/language_models_cloud" }
 language_onboarding = { path = "crates/language_onboarding" }
 language_selector = { path = "crates/language_selector" }
 language_tools = { path = "crates/language_tools" }
-languages = { path = "crates/languages" }
+languages = { path = "crates/languages", default-features = false }
 line_ending_selector = { path = "crates/line_ending_selector" }
 livekit_api = { path = "crates/livekit_api" }
 livekit_client = { path = "crates/livekit_client" }

@@ -23844,6 +23844,7 @@ dependencies = [
  "language_models",
  "language_selector",
  "language_tools",
+ "languages",
  "line_ending_selector",
  "log",
  "lsp",

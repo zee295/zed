@@ -9,11 +9,26 @@ license = "GPL-3.0-or-later"
 workspace = true
 
 [features]
+default = ["native-adapters", "python-support"]
+native-adapters = []
+python-support = [
+    "native-adapters",
+    "dep:pet",
+    "dep:pet-conda",
+    "dep:pet-core",
+    "dep:pet-fs",
+    "dep:pet-poetry",
+    "dep:pet-reporter",
+    "dep:pet-virtualenv",
+]
 test-support = [
-    "load-grammars"
+    "load-grammars",
+    "python-support",
 ]
 load-grammars = [
     "grammars/load-grammars",
+    "native-adapters",
+    "python-support",
     "tree-sitter",
     "tree-sitter-gitcommit",
 ]
@@ -38,13 +53,13 @@ log.workspace = true
 lsp.workspace = true
 node_runtime.workspace = true
 parking_lot.workspace = true
-pet-conda.workspace = true
-pet-core.workspace = true
-pet-fs.workspace = true
-pet-poetry.workspace = true
-pet-reporter.workspace = true
-pet-virtualenv.workspace = true
-pet.workspace = true
+pet-conda = { workspace = true, optional = true }
+pet-core = { workspace = true, optional = true }
+pet-fs = { workspace = true, optional = true }
+pet-poetry = { workspace = true, optional = true }
+pet-reporter = { workspace = true, optional = true }
+pet-virtualenv = { workspace = true, optional = true }
+pet = { workspace = true, optional = true }
 project.workspace = true
 regex.workspace = true
 rope.workspace = true

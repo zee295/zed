@@ -22,6 +22,9 @@ use theme::ActiveTheme;
 use util::ResultExt as _;
 
 #[cfg(target_family = "wasm")]
+use node_runtime::NodeRuntime;
+
+#[cfg(target_family = "wasm")]
 mod remote_highlight;
 
 #[cfg(target_family = "wasm")]
@@ -338,13 +341,11 @@ fn web_window_options(_display: Option<uuid::Uuid>, cx: &mut App) -> WindowOptio
     }
 }
 
-/// Register common languages without native tree-sitter grammars so file-type
-/// detection, comment toggles, and language selectors work in the browser.
-///
-/// LSP adapters are host-process shims: binaries run on the server via
-/// `Process::*` (same stack LanguageServer uses for stdio JSON-RPC).
+/// Register supplemental languages that are not part of Zed's built-in
+/// `languages` crate. Built-in languages and their desktop LSP adapters are
+/// registered through `languages::init`.
 #[cfg(target_family = "wasm")]
-fn register_plain_languages(languages: &language::LanguageRegistry) {
+fn register_plain_languages(languages: &language::LanguageRegistry, node_runtime: NodeRuntime) {
     use language::{LanguageConfig, LanguageMatcher, LanguageName, LoadedLanguage};
     use std::sync::Arc;
 
@@ -352,23 +353,13 @@ fn register_plain_languages(languages: &language::LanguageRegistry) {
     // (e.g. BufferSearchBar uses language_for_name("regex")).
     let specs: &[(&str, &[&str], &[&str])] = &[
         ("Plain Text", &[], &[]),
-        ("regex", &[], &[]),
-        ("jsdoc", &[], &[]),
-        ("Git Commit", &[], &["#"]),
         ("Rust", &["rs"], &["//", "///"]),
         ("Python", &["py", "pyi"], &["#"]),
-        ("JavaScript", &["js", "mjs", "cjs", "jsx"], &["//"]),
-        ("TypeScript", &["ts", "tsx", "mts", "cts"], &["//"]),
-        ("JSON", &["json", "jsonc"], &[]),
-        ("Markdown", &["md", "mdx", "markdown"], &[]),
-        ("TOML", &["toml"], &["#"]),
-        ("YAML", &["yml", "yaml"], &["#"]),
-        ("HTML", &["html", "htm"], &[]),
-        ("CSS", &["css", "scss", "sass", "less"], &["//"]),
         ("Go", &["go"], &["//"]),
         ("C", &["c", "h"], &["//"]),
         ("C++", &["cpp", "cc", "cxx", "hpp", "hxx"], &["//"]),
-        ("Shell Script", &["sh", "bash", "zsh"], &["#"]),
+        ("TOML", &["toml"], &["#"]),
+        ("HTML", &["html", "htm"], &[]),
         ("SQL", &["sql"], &["--"]),
         ("Ruby", &["rb"], &["#"]),
         ("Java", &["java"], &["//"]),
@@ -411,40 +402,44 @@ fn register_plain_languages(languages: &language::LanguageRegistry) {
         );
     }
 
-    // Host-side language servers (spawned on the remote via Process::spawn).
+    let clangd = Arc::new(HostLspAdapter::new("clangd", "clangd"));
+    languages.register_lsp_adapter(LanguageName::new("C"), clangd.clone());
+    languages.register_lsp_adapter(LanguageName::new("C++"), clangd);
+    languages.register_lsp_adapter(
+        LanguageName::new("Go"),
+        Arc::new(HostLspAdapter::new("gopls", "gopls")),
+    );
     languages.register_lsp_adapter(
         LanguageName::new("Rust"),
-        Arc::new(HostLspAdapter::rust_analyzer()),
+        Arc::new(HostLspAdapter::new("rust-analyzer", "rust-analyzer")),
+    );
+    languages.register_lsp_adapter(
+        LanguageName::new("Python"),
+        Arc::new(WebPyrightLspAdapter::new(node_runtime)),
     );
 
     web_sys::console::log_1(
         &format!(
-            "zed_web_workspace: registered {} plain languages + host LSP (rust-analyzer)",
+            "zed_web_workspace: registered desktop language adapters + {} supplemental languages",
             specs.len()
         )
         .into(),
     );
 }
 
-/// Minimal LSP adapter: use a binary already installed on the server host.
-/// No download path — Process::spawn runs the binary server-side.
+/// Adapter for language servers installed on the Rust server. The bare
+/// executable is retained as a fallback because both `which` and process
+/// spawning are RPC-backed in the browser build.
 #[cfg(target_family = "wasm")]
 struct HostLspAdapter {
     name: &'static str,
     program: &'static str,
-    disk_based_diagnostics_sources: Vec<String>,
-    disk_based_diagnostics_progress_token: Option<String>,
 }
 
 #[cfg(target_family = "wasm")]
 impl HostLspAdapter {
-    fn rust_analyzer() -> Self {
-        Self {
-            name: "rust-analyzer",
-            program: "rust-analyzer",
-            disk_based_diagnostics_sources: vec!["rustc".into()],
-            disk_based_diagnostics_progress_token: Some("rust-analyzer/flycheck".into()),
-        }
+    fn new(name: &'static str, program: &'static str) -> Self {
+        Self { name, program }
     }
 }
 
@@ -458,17 +453,14 @@ impl language::LspInstaller for HostLspAdapter {
         _: Option<language::Toolchain>,
         _: &gpui::AsyncApp,
     ) -> Option<lsp::LanguageServerBinary> {
-        // Prefer remote `which` if the delegate can resolve it; otherwise pass
-        // the bare program name so the server Process::spawn PATH lookup runs.
         let path = delegate
             .which(std::ffi::OsStr::new(self.program))
             .await
             .unwrap_or_else(|| std::path::PathBuf::from(self.program));
-        let env = delegate.shell_env().await;
         Some(lsp::LanguageServerBinary {
             path,
             arguments: Vec::new(),
-            env: Some(env),
+            env: Some(delegate.shell_env().await),
         })
     }
 
@@ -478,11 +470,7 @@ impl language::LspInstaller for HostLspAdapter {
         _: bool,
         _: &mut gpui::AsyncApp,
     ) -> anyhow::Result<Self::BinaryVersion> {
-        anyhow::bail!(
-            "host LSP adapter for {} does not download binaries; install {} on the server",
-            self.name,
-            self.program
-        )
+        anyhow::bail!("{} must be installed on the server PATH", self.program)
     }
 
     fn fetch_server_binary(
@@ -492,13 +480,8 @@ impl language::LspInstaller for HostLspAdapter {
         _: &Arc<dyn language::LspAdapterDelegate>,
     ) -> impl std::future::Future<Output = anyhow::Result<lsp::LanguageServerBinary>> + Send + use<>
     {
-        let name = self.name;
         let program = self.program;
-        async move {
-            anyhow::bail!(
-                "host LSP adapter for {name} does not download binaries; install {program} on the server"
-            )
-        }
+        async move { anyhow::bail!("{program} must be installed on the server PATH") }
     }
 
     async fn cached_server_binary(
@@ -516,13 +499,144 @@ impl language::LspAdapter for HostLspAdapter {
     fn name(&self) -> lsp::LanguageServerName {
         lsp::LanguageServerName::new_static(self.name)
     }
+}
 
-    fn disk_based_diagnostic_sources(&self) -> Vec<String> {
-        self.disk_based_diagnostics_sources.clone()
+#[cfg(target_family = "wasm")]
+struct WebPyrightLspAdapter {
+    node: NodeRuntime,
+}
+
+#[cfg(target_family = "wasm")]
+impl WebPyrightLspAdapter {
+    const SERVER_PATH: &'static str = "node_modules/pyright/langserver.index.js";
+
+    fn new(node: NodeRuntime) -> Self {
+        Self { node }
     }
 
-    fn disk_based_diagnostics_progress_token(&self) -> Option<String> {
-        self.disk_based_diagnostics_progress_token.clone()
+    async fn binary(
+        &self,
+        container_dir: std::path::PathBuf,
+        env: Option<collections::HashMap<String, String>>,
+    ) -> Option<lsp::LanguageServerBinary> {
+        let server_path = container_dir.join(Self::SERVER_PATH);
+        smol::fs::metadata(&server_path).await.ok()?;
+        Some(lsp::LanguageServerBinary {
+            path: self.node.binary_path().await.ok()?,
+            arguments: vec![server_path.into(), "--stdio".into()],
+            env,
+        })
+    }
+}
+
+#[cfg(target_family = "wasm")]
+impl language::LspInstaller for WebPyrightLspAdapter {
+    type BinaryVersion = semver::Version;
+
+    async fn fetch_latest_server_version(
+        &self,
+        _: &Arc<dyn language::LspAdapterDelegate>,
+        _: bool,
+        _: &mut gpui::AsyncApp,
+    ) -> anyhow::Result<Self::BinaryVersion> {
+        self.node.npm_package_latest_version("pyright").await
+    }
+
+    async fn check_if_user_installed(
+        &self,
+        delegate: &Arc<dyn language::LspAdapterDelegate>,
+        _: Option<language::Toolchain>,
+        _: &gpui::AsyncApp,
+    ) -> Option<lsp::LanguageServerBinary> {
+        if let Some(path) = delegate.which("pyright-langserver".as_ref()).await {
+            return Some(lsp::LanguageServerBinary {
+                path,
+                arguments: vec!["--stdio".into()],
+                env: Some(delegate.shell_env().await),
+            });
+        }
+        None
+    }
+
+    fn check_if_version_installed(
+        &self,
+        version: &Self::BinaryVersion,
+        container_dir: &std::path::PathBuf,
+        delegate: &Arc<dyn language::LspAdapterDelegate>,
+    ) -> impl std::future::Future<Output = Option<lsp::LanguageServerBinary>> + Send + use<> {
+        let node = self.node.clone();
+        let version = version.clone();
+        let container_dir = container_dir.clone();
+        let delegate = delegate.clone();
+        async move {
+            let server_path = container_dir.join(Self::SERVER_PATH);
+            if node
+                .should_install_npm_package(
+                    "pyright",
+                    &server_path,
+                    &container_dir,
+                    node_runtime::VersionStrategy::Latest(&version),
+                )
+                .await
+            {
+                return None;
+            }
+            WebPyrightLspAdapter { node }
+                .binary(container_dir, Some(delegate.shell_env().await))
+                .await
+        }
+    }
+
+    fn fetch_server_binary(
+        &self,
+        _: Self::BinaryVersion,
+        container_dir: std::path::PathBuf,
+        delegate: &Arc<dyn language::LspAdapterDelegate>,
+    ) -> impl std::future::Future<Output = anyhow::Result<lsp::LanguageServerBinary>> + Send + use<>
+    {
+        let node = self.node.clone();
+        let delegate = delegate.clone();
+        async move {
+            node.npm_install_latest_packages(&container_dir, &["pyright"])
+                .await?;
+            WebPyrightLspAdapter { node }
+                .binary(container_dir, Some(delegate.shell_env().await))
+                .await
+                .ok_or_else(|| anyhow::anyhow!("pyright installed without its language server"))
+        }
+    }
+
+    async fn cached_server_binary(
+        &self,
+        container_dir: std::path::PathBuf,
+        delegate: &dyn language::LspAdapterDelegate,
+    ) -> Option<lsp::LanguageServerBinary> {
+        self.binary(container_dir, Some(delegate.shell_env().await))
+            .await
+    }
+}
+
+#[cfg(target_family = "wasm")]
+#[async_trait::async_trait(?Send)]
+impl language::LspAdapter for WebPyrightLspAdapter {
+    fn name(&self) -> lsp::LanguageServerName {
+        lsp::LanguageServerName::new_static("pyright")
+    }
+
+    async fn initialization_options(
+        self: Arc<Self>,
+        _: &Arc<dyn language::LspAdapterDelegate>,
+        _: &mut gpui::AsyncApp,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        Ok(Some(serde_json::json!({
+            "python": {
+                "analysis": {
+                    "autoSearchPaths": true,
+                    "useLibraryCodeForTypes": true,
+                    "autoImportCompletions": true
+                }
+            }
+        })))
     }
 }
 
@@ -1037,7 +1151,6 @@ fn init_app_state(
     use clock::RealSystemClock;
     use fs::Fs;
     use http_client::{BlockedHttpClient, HttpClientWithUrl};
-    use node_runtime::NodeRuntime;
     use settings::SettingsStore;
     use wasm_remote::RemoteFs;
     use workspace::{AppState, WorkspaceStore};
@@ -1084,7 +1197,6 @@ fn init_app_state(
     let languages = Arc::new(language::LanguageRegistry::new(
         cx.background_executor().clone(),
     ));
-    register_plain_languages(&languages);
 
     let clock: Arc<dyn clock::SystemClock> = Arc::new(RealSystemClock);
     // Model providers (Anthropic / OpenAI) call cx.http_client() directly.
@@ -1116,6 +1228,19 @@ fn init_app_state(
     let user_store = cx.new(|cx| client::UserStore::new(client.clone(), cx));
     let workspace_store = cx.new(|cx| WorkspaceStore::new(client.clone(), cx));
 
+    let node_runtime = NodeRuntime::new(
+        proxy_http.clone(),
+        None,
+        watch::channel(Some(node_runtime::NodeBinaryOptions {
+            allow_path_lookup: true,
+            allow_binary_download: true,
+            use_paths: None,
+        }))
+        .1,
+    );
+    languages::init(languages.clone(), fs.clone(), node_runtime.clone(), cx);
+    register_plain_languages(&languages, node_runtime.clone());
+
     let app_state = Arc::new(AppState {
         client: client.clone(),
         fs: fs.clone(),
@@ -1126,16 +1251,7 @@ fn init_app_state(
         // via the remote process bridge. `detect()` (wasm path) uses bare
         // `node`/`npm` resolved against the server's PATH (nvm / homebrew).
         // allow_path_lookup=true lets it use the host's system Node.js.
-        node_runtime: NodeRuntime::new(
-            proxy_http.clone(),
-            None,
-            watch::channel(Some(node_runtime::NodeBinaryOptions {
-                allow_path_lookup: true,
-                allow_binary_download: false,
-                use_paths: None,
-            }))
-            .1,
-        ),
+        node_runtime,
         build_window_options: web_window_options,
         session,
     });

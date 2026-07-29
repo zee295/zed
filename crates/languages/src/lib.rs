@@ -1,7 +1,11 @@
-use gpui::{App, SharedString, UpdateGlobal};
+#[cfg(any(feature = "native-adapters", feature = "python-support"))]
+use gpui::SharedString;
+use gpui::{App, UpdateGlobal};
 use node_runtime::NodeRuntime;
 use project::Fs;
+#[cfg(feature = "python-support")]
 use python::PyprojectTomlManifestProvider;
+#[cfg(feature = "native-adapters")]
 use rust::CargoManifestProvider;
 use settings::{SemanticTokenRules, SettingsStore};
 use smol::stream::StreamExt;
@@ -10,20 +14,24 @@ use util::ResultExt;
 
 pub use language::*;
 
-use crate::{
-    json::JsonTaskProvider,
-    python::{BasedPyrightLspAdapter, RuffLspAdapter},
-};
+use crate::json::JsonTaskProvider;
+#[cfg(feature = "python-support")]
+use crate::python::{BasedPyrightLspAdapter, RuffLspAdapter};
 
 mod bash;
+#[cfg(feature = "native-adapters")]
 mod c;
+#[cfg(feature = "native-adapters")]
 mod cpp;
 mod css;
 mod eslint;
+#[cfg(feature = "native-adapters")]
 mod go;
 mod json;
 mod package_json;
+#[cfg(feature = "python-support")]
 mod python;
+#[cfg(feature = "native-adapters")]
 mod rust;
 mod tailwind;
 mod tailwindcss;
@@ -59,22 +67,34 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
     languages.register_native_grammars(grammars::native_grammars());
 
     let bash_lsp_adapter = Arc::new(bash::BashLspAdapter::new(node.clone()));
+    #[cfg(feature = "native-adapters")]
     let c_lsp_adapter = Arc::new(c::CLspAdapter);
     let css_lsp_adapter = Arc::new(css::CssLspAdapter::new(node.clone()));
     let eslint_adapter = Arc::new(eslint::EsLintLspAdapter::new(node.clone(), fs.clone()));
+    #[cfg(feature = "native-adapters")]
     let go_context_provider = Arc::new(go::GoContextProvider);
+    #[cfg(feature = "native-adapters")]
     let go_lsp_adapter = Arc::new(go::GoLspAdapter);
     let json_context_provider = Arc::new(JsonTaskProvider);
     let json_lsp_adapter = Arc::new(json::JsonLspAdapter::new(languages.clone(), node.clone()));
     let node_version_lsp_adapter = Arc::new(json::NodeVersionAdapter);
+    #[cfg(feature = "python-support")]
     let py_lsp_adapter = Arc::new(python::PyLspAdapter::new());
+    #[cfg(feature = "python-support")]
     let ty_lsp_adapter = Arc::new(python::TyLspAdapter::new(fs.clone()));
+    #[cfg(feature = "python-support")]
     let python_context_provider = Arc::new(python::PythonContextProvider);
+    #[cfg(feature = "python-support")]
     let python_lsp_adapter = Arc::new(python::PyrightLspAdapter::new(node.clone()));
+    #[cfg(feature = "python-support")]
     let basedpyright_lsp_adapter = Arc::new(BasedPyrightLspAdapter::new(node.clone()));
+    #[cfg(feature = "python-support")]
     let ruff_lsp_adapter = Arc::new(RuffLspAdapter::new(fs.clone()));
+    #[cfg(feature = "python-support")]
     let python_toolchain_provider = Arc::new(python::PythonToolchainProvider::new(fs.clone()));
+    #[cfg(feature = "native-adapters")]
     let rust_context_provider = Arc::new(rust::RustContextProvider);
+    #[cfg(feature = "native-adapters")]
     let rust_lsp_adapter = Arc::new(rust::RustLspAdapter);
     let tailwind_adapter = Arc::new(tailwind::TailwindLspAdapter::new(node.clone()));
     let tailwindcss_adapter = Arc::new(tailwindcss::TailwindCssLspAdapter::new(node.clone()));
@@ -93,11 +113,13 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
             adapters: vec![bash_lsp_adapter],
             ..Default::default()
         },
+        #[cfg(feature = "native-adapters")]
         LanguageInfo {
             name: "c",
             adapters: vec![c_lsp_adapter.clone()],
             ..Default::default()
         },
+        #[cfg(feature = "native-adapters")]
         LanguageInfo {
             name: "cpp",
             adapters: vec![c_lsp_adapter],
@@ -114,6 +136,7 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
             adapters: vec![],
             ..Default::default()
         },
+        #[cfg(feature = "native-adapters")]
         LanguageInfo {
             name: "go",
             adapters: vec![go_lsp_adapter.clone()],
@@ -121,12 +144,14 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
             semantic_token_rules: Some(go::semantic_token_rules()),
             ..Default::default()
         },
+        #[cfg(feature = "native-adapters")]
         LanguageInfo {
             name: "gomod",
             adapters: vec![go_lsp_adapter.clone()],
             context: Some(go_context_provider.clone()),
             ..Default::default()
         },
+        #[cfg(feature = "native-adapters")]
         LanguageInfo {
             name: "gowork",
             adapters: vec![go_lsp_adapter],
@@ -155,6 +180,7 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
             adapters: vec![],
             ..Default::default()
         },
+        #[cfg(feature = "python-support")]
         LanguageInfo {
             name: "python",
             adapters: vec![
@@ -169,6 +195,7 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
             manifest_name: Some(SharedString::new_static("pyproject.toml").into()),
             semantic_token_rules: Some(python::semantic_token_rules()),
         },
+        #[cfg(feature = "native-adapters")]
         LanguageInfo {
             name: "rust",
             adapters: vec![rust_lsp_adapter],
@@ -318,10 +345,15 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
         anyhow::Ok(())
     })
     .detach();
-    let manifest_providers: [Arc<dyn ManifestProvider>; 2] = [
+    #[cfg(feature = "python-support")]
+    let manifest_providers: Vec<Arc<dyn ManifestProvider>> = vec![
         Arc::from(CargoManifestProvider),
         Arc::from(PyprojectTomlManifestProvider),
     ];
+    #[cfg(all(feature = "native-adapters", not(feature = "python-support")))]
+    let manifest_providers: Vec<Arc<dyn ManifestProvider>> = vec![Arc::from(CargoManifestProvider)];
+    #[cfg(not(feature = "native-adapters"))]
+    let manifest_providers: Vec<Arc<dyn ManifestProvider>> = Vec::new();
     for provider in manifest_providers {
         project::ManifestProvidersStore::global(cx).register(provider);
     }
