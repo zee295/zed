@@ -18,8 +18,9 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use settings::SettingsLocation;
+use smol::fs;
 #[cfg(not(target_family = "wasm"))]
-use smol::{fs, stream::StreamExt};
+use smol::stream::StreamExt;
 use std::{
     ffi::OsString,
     future::Future,
@@ -143,11 +144,14 @@ impl LspInstaller for EsLintLspAdapter {
                 remove_matching(&container_dir, |_| true).await;
 
                 #[cfg(target_family = "wasm")]
-                node.npm_install_latest_packages(
-                    &destination_path,
-                    &["vscode-langservers-extracted"],
-                )
-                .await?;
+                {
+                    fs::create_dir_all(&destination_path).await?;
+                    node.npm_install_latest_packages(
+                        &destination_path,
+                        &["vscode-langservers-extracted"],
+                    )
+                    .await?;
+                }
 
                 #[cfg(not(target_family = "wasm"))]
                 {
