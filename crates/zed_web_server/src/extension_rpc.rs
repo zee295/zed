@@ -397,12 +397,13 @@ impl ExtensionHost {
             let manifest = fs::read_to_string(directory.join("extension.toml"))
                 .ok()
                 .and_then(|text| text.parse::<toml::Value>().ok());
-            let themes = text_assets(&directory, "themes", "json")?;
-            let icon_themes = text_assets(&directory, "icon_themes", "json")?;
+            let themes = manifest_text_assets(&directory, manifest.as_ref(), "themes")?;
+            let icon_themes = manifest_text_assets(&directory, manifest.as_ref(), "icon_themes")?;
             let icon_assets = text_assets(&directory, ".", "svg")?;
-            let languages = language_assets(&directory)?;
+            let languages = language_assets(&directory, manifest.as_ref())?;
             let snippets = snippet_assets(&directory, manifest.as_ref())?;
             let grammars = grammar_assets(&directory, manifest.as_ref())?;
+            let debug_adapters = debug_adapter_assets(&directory, manifest.as_ref())?;
             let language_servers =
                 table_entries(manifest.as_ref(), "language_servers", |id, entry| {
                     let languages = entry
@@ -444,10 +445,7 @@ impl ExtensionHost {
                     "description": entry.get("description").and_then(toml::Value::as_str).unwrap_or_default(),
                     "requires_argument": entry.get("requires_argument").and_then(toml::Value::as_bool).unwrap_or(false),
                 })),
-                "debug_adapters": table_entries(manifest.as_ref(), "debug_adapters", |adapter_id, _| json!({
-                    "id": adapter_id,
-                    "schema": {}
-                })),
+                "debug_adapters": debug_adapters,
                 "debug_locators": table_keys(manifest.as_ref(), "debug_locators"),
                 "language_model_providers": table_entries(manifest.as_ref(), "language_model_providers", |provider_id, entry| json!({
                     "id": provider_id,
@@ -493,12 +491,13 @@ impl ExtensionHost {
             "extension_dir".to_string(),
             json!(extension_directory.to_string_lossy()),
         );
+        let worktree_root = runtime_worktree_root(request_object, &self.workspace)?;
         request_object.insert(
             "worktree_root".to_string(),
-            json!(self.workspace.to_string_lossy()),
+            json!(worktree_root.to_string_lossy()),
         );
         let mut child = Command::new(runtime)
-            .current_dir(&self.workspace)
+            .current_dir(&worktree_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -628,17 +627,31 @@ fn text_assets(root: &Path, subdirectory: &str, extension: &str) -> Result<Vec<V
         .collect()
 }
 
-fn language_assets(root: &Path) -> Result<Vec<Value>> {
-    let directory = root.join("languages");
-    if !directory.is_dir() {
-        return Ok(Vec::new());
-    }
-    fs::read_dir(directory)?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().join("config.toml").is_file())
-        .map(|entry| {
-            let directory = entry.path();
+fn manifest_text_assets(
+    root: &Path,
+    manifest: Option<&toml::Value>,
+    key: &str,
+) -> Result<Vec<Value>> {
+    manifest_paths(manifest, key)
+        .map(|relative_path| {
+            let path = checked_extension_path(root, &relative_path)?;
+            Ok(json!({
+                "relative_path": relative_path,
+                "content": fs::read_to_string(path)?,
+            }))
+        })
+        .collect()
+}
+
+fn language_assets(root: &Path, manifest: Option<&toml::Value>) -> Result<Vec<Value>> {
+    manifest_paths(manifest, "languages")
+        .map(|relative_path| {
+            let directory = checked_extension_path(root, &relative_path)?;
             let config = directory.join("config.toml");
+            let relative_config = PathBuf::from(&relative_path).join("config.toml");
+            let tasks = read_optional_text(&directory.join("tasks.json"))?;
+            let semantic_token_rules =
+                read_optional_text(&directory.join("semantic_token_rules.json"))?;
             let queries = fs::read_dir(&directory)?
                 .filter_map(|entry| entry.ok())
                 .filter(|entry| {
@@ -652,12 +665,93 @@ fn language_assets(root: &Path) -> Result<Vec<Value>> {
                 })
                 .collect::<Result<Map<_, _>>>()?;
             Ok(json!({
-                "relative_path": config.strip_prefix(root)?.to_string_lossy(),
+                "relative_path": relative_config.to_string_lossy(),
                 "config": fs::read_to_string(config)?,
                 "queries": queries,
+                "tasks": tasks,
+                "semantic_token_rules": semantic_token_rules,
             }))
         })
         .collect()
+}
+
+fn manifest_paths<'a>(
+    manifest: Option<&'a toml::Value>,
+    key: &str,
+) -> impl Iterator<Item = String> + 'a {
+    manifest
+        .and_then(|value| value.get(key))
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn checked_extension_path(root: &Path, relative_path: &str) -> Result<PathBuf> {
+    let path = root.join(relative_path).canonicalize()?;
+    let root = root.canonicalize()?;
+    if !path.starts_with(&root) {
+        bail!("extension asset path escapes extension directory");
+    }
+    Ok(path)
+}
+
+fn debug_adapter_assets(root: &Path, manifest: Option<&toml::Value>) -> Result<Vec<Value>> {
+    let Some(adapters) = manifest
+        .and_then(|value| value.get("debug_adapters"))
+        .and_then(toml::Value::as_table)
+    else {
+        return Ok(Vec::new());
+    };
+
+    adapters
+        .iter()
+        .filter_map(|(adapter_id, value)| Some((adapter_id, value.as_table()?)))
+        .map(|(adapter_id, entry)| {
+            let relative_path = entry
+                .get("schema_path")
+                .and_then(toml::Value::as_str)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    PathBuf::from("debug_adapter_schemas").join(format!("{adapter_id}.json"))
+                });
+            let schema_path = root.join(relative_path);
+            let schema = match fs::read_to_string(&schema_path) {
+                Ok(content) => serde_json::from_str(&content)
+                    .with_context(|| format!("parsing debug adapter schema {schema_path:?}"))?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("reading debug adapter schema {schema_path:?}"));
+                }
+            };
+            Ok(json!({"id": adapter_id, "schema": schema}))
+        })
+        .collect()
+}
+
+fn read_optional_text(path: &Path) -> Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(content) => Ok(Some(content)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("reading extension asset {path:?}")),
+    }
+}
+
+fn runtime_worktree_root(params: &Map<String, Value>, fallback: &Path) -> Result<PathBuf> {
+    let worktree_root = params
+        .get("worktree_root")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| fallback.to_path_buf())
+        .canonicalize()
+        .context("invalid extension worktree root")?;
+    if !worktree_root.is_dir() {
+        bail!("extension worktree root is not a directory");
+    }
+    Ok(worktree_root)
 }
 
 fn grammar_assets(root: &Path, manifest: Option<&toml::Value>) -> Result<Vec<Value>> {
@@ -738,4 +832,98 @@ fn copy_tree(source: &Path, target: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn language_assets_include_editor_contributions() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let language = temporary.path().join("languages/example");
+        fs::create_dir_all(&language)?;
+        fs::write(
+            language.join("config.toml"),
+            "name = \"Example\"\ngrammar = \"example\"\n",
+        )?;
+        fs::write(language.join("highlights.scm"), "(identifier) @variable")?;
+        fs::write(language.join("tasks.json"), "[{\"label\":\"Run\"}]")?;
+        fs::write(
+            language.join("semantic_token_rules.json"),
+            "[{\"token_type\":\"variable\",\"style\":[\"italic\"]}]",
+        )?;
+        let manifest = r#"languages = ["languages/example"]"#.parse::<toml::Value>()?;
+
+        let assets = language_assets(temporary.path(), Some(&manifest))?;
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0]["tasks"], "[{\"label\":\"Run\"}]");
+        assert_eq!(
+            assets[0]["semantic_token_rules"],
+            "[{\"token_type\":\"variable\",\"style\":[\"italic\"]}]"
+        );
+        assert_eq!(
+            assets[0]["queries"]["highlights.scm"],
+            "(identifier) @variable"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn text_assets_follow_manifest_paths() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        fs::create_dir_all(temporary.path().join("custom"))?;
+        fs::write(
+            temporary.path().join("custom/theme.json"),
+            "{\"name\":\"Example\"}",
+        )?;
+        let manifest = r#"themes = ["custom/theme.json"]"#.parse::<toml::Value>()?;
+
+        let assets = manifest_text_assets(temporary.path(), Some(&manifest), "themes")?;
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0]["relative_path"], "custom/theme.json");
+        assert_eq!(assets[0]["content"], "{\"name\":\"Example\"}");
+        Ok(())
+    }
+
+    #[test]
+    fn debug_adapter_assets_include_schema() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        fs::create_dir_all(temporary.path().join("schemas"))?;
+        fs::write(
+            temporary.path().join("schemas/example.json"),
+            "{\"type\":\"object\",\"required\":[\"program\"]}",
+        )?;
+        let manifest = r#"
+            [debug_adapters.example]
+            schema_path = "schemas/example.json"
+        "#
+        .parse::<toml::Value>()?;
+
+        let assets = debug_adapter_assets(temporary.path(), Some(&manifest))?;
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0]["id"], "example");
+        assert_eq!(assets[0]["schema"]["type"], "object");
+        assert_eq!(assets[0]["schema"]["required"][0], "program");
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_uses_requested_worktree_root() -> Result<()> {
+        let fallback = tempfile::tempdir()?;
+        let requested = tempfile::tempdir()?;
+        let params = serde_json::from_value::<Map<String, Value>>(json!({
+            "worktree_root": requested.path()
+        }))?;
+
+        assert_eq!(
+            runtime_worktree_root(&params, fallback.path())?,
+            requested.path().canonicalize()?
+        );
+        assert_eq!(
+            runtime_worktree_root(&Map::new(), fallback.path())?,
+            fallback.path().canonicalize()?
+        );
+        Ok(())
+    }
 }

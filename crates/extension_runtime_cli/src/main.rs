@@ -28,6 +28,8 @@ struct Request {
     method: String,
     extension_dir: PathBuf,
     worktree_root: PathBuf,
+    worktree_id: Option<u64>,
+    worktree_env: Option<collections::HashMap<String, String>>,
     language_server_id: Option<String>,
     target_language_server_id: Option<String>,
     language_name: Option<String>,
@@ -93,7 +95,9 @@ struct ResolvedBuildTaskRequest {
 }
 
 struct LocalWorktree {
+    id: u64,
     root: PathBuf,
+    env: collections::HashMap<String, String>,
 }
 
 struct LocalProject {
@@ -121,7 +125,7 @@ impl KeyValueStoreDelegate for LocalKeyValueStore {
 #[async_trait]
 impl WorktreeDelegate for LocalWorktree {
     fn id(&self) -> u64 {
-        1
+        self.id
     }
 
     fn root_path(&self) -> String {
@@ -133,13 +137,17 @@ impl WorktreeDelegate for LocalWorktree {
     }
 
     async fn which(&self, binary_name: String) -> Option<String> {
-        which::which(binary_name)
+        let path = self.env.get("PATH").map(std::ffi::OsStr::new);
+        which::which_in(binary_name, path, &self.root)
             .ok()
             .map(|path| path.to_string_lossy().into_owned())
     }
 
     async fn shell_env(&self) -> Vec<(String, String)> {
-        std::env::vars().collect()
+        self.env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
     }
 }
 
@@ -265,7 +273,11 @@ async fn execute(request: Request, cx: &mut gpui::AsyncApp) -> Result<Value> {
     });
     let extension = WasmExtension::load(&extension_dir, &manifest, wasm_host, cx).await?;
     let worktree: Arc<dyn WorktreeDelegate> = Arc::new(LocalWorktree {
+        id: request.worktree_id.unwrap_or(1),
         root: request.worktree_root,
+        env: request
+            .worktree_env
+            .unwrap_or_else(|| std::env::vars().collect()),
     });
     let server_id = request
         .language_server_id

@@ -30,7 +30,7 @@ mod remote {
     use futures::{FutureExt as _, StreamExt as _, channel::mpsc, lock::OwnedMutexGuard};
     use gpui::{
         App, AppContext as _, AsyncApp, BackgroundExecutor, Context, Entity, EventEmitter, Global,
-        SharedString, Task, TaskExt as _,
+        SharedString, Task, TaskExt as _, UpdateGlobal as _,
     };
     use language::{
         CodeLabel, DynLspInstaller, HighlightId, Language, LanguageConfig, LanguageName,
@@ -42,6 +42,7 @@ mod remote {
         CodeActionKind, LanguageServerBinary, LanguageServerBinaryOptions, LanguageServerName, Uri,
     };
     use project::{
+        ContextProviderWithTasks,
         context_server_store::registry::{
             ContextServerDescriptor, ContextServerDescriptorRegistry,
         },
@@ -50,6 +51,8 @@ mod remote {
     use release_channel::ReleaseChannel;
     use serde::{Deserialize, Serialize};
     use serde_json::json;
+    use settings::{SemanticTokenRules, SettingsStore};
+    use task::TaskTemplates;
     use wasm_remote::RemoteClient;
 
     pub type ExtensionAssetMap = Arc<RwLock<StdBTreeMap<String, Vec<u8>>>>;
@@ -207,6 +210,10 @@ mod remote {
         config: String,
         #[serde(default)]
         queries: HashMap<String, String>,
+        #[serde(default)]
+        tasks: Option<String>,
+        #[serde(default)]
+        semantic_token_rules: Option<String>,
     }
 
     #[derive(Deserialize)]
@@ -534,33 +541,31 @@ mod remote {
             Ok(response.result)
         }
 
-        async fn call<T: serde::de::DeserializeOwned>(
+        async fn call_for_worktree<T: serde::de::DeserializeOwned>(
             &self,
             method: &str,
             target_language_server_id: Option<&LanguageServerName>,
+            delegate: &Arc<dyn LspAdapterDelegate>,
         ) -> Result<Option<T>> {
+            let worktree_env = delegate.shell_env().await;
             self.call_payload(
                 method,
-                json!({ "target_language_server_id": target_language_server_id }),
+                json!({
+                    "target_language_server_id": target_language_server_id,
+                    "worktree_id": delegate.worktree_id().to_proto(),
+                    "worktree_root": delegate.worktree_root_path(),
+                    "worktree_env": worktree_env,
+                }),
             )
             .await
         }
+    }
 
-        async fn json_call(&self, method: &str) -> Result<Option<serde_json::Value>> {
-            self.json_call_target(method, None).await
-        }
-
-        async fn json_call_target(
-            &self,
-            method: &str,
-            target: Option<&LanguageServerName>,
-        ) -> Result<Option<serde_json::Value>> {
-            let value = self.call::<serde_json::Value>(method, target).await?;
-            match value {
-                Some(serde_json::Value::String(json)) => Ok(Some(serde_json::from_str(&json)?)),
-                Some(serde_json::Value::Null) | None => Ok(None),
-                value => Ok(value),
-            }
+    fn parse_optional_json(value: Option<serde_json::Value>) -> Result<Option<serde_json::Value>> {
+        match value {
+            Some(serde_json::Value::String(json)) => Ok(Some(serde_json::from_str(&json)?)),
+            Some(serde_json::Value::Null) | None => Ok(None),
+            value => Ok(value),
         }
     }
 
@@ -568,7 +573,7 @@ mod remote {
     impl DynLspInstaller for RemoteExtensionLspAdapter {
         fn get_language_server_command(
             self: Arc<Self>,
-            _: Arc<dyn LspAdapterDelegate>,
+            delegate: Arc<dyn LspAdapterDelegate>,
             _: Option<Toolchain>,
             _: LanguageServerBinaryOptions,
             _: OwnedMutexGuard<Option<(bool, LanguageServerBinary)>>,
@@ -576,7 +581,11 @@ mod remote {
         ) -> LanguageServerBinaryLocations {
             async move {
                 let result = self
-                    .call::<LanguageServerCommandResponse>("language_server_command", None)
+                    .call_for_worktree::<LanguageServerCommandResponse>(
+                        "language_server_command",
+                        None,
+                        &delegate,
+                    )
                     .await
                     .and_then(|command| {
                         let command =
@@ -687,73 +696,99 @@ mod remote {
 
         async fn initialization_options(
             self: Arc<Self>,
-            _: &Arc<dyn LspAdapterDelegate>,
+            delegate: &Arc<dyn LspAdapterDelegate>,
             _: &mut gpui::AsyncApp,
         ) -> Result<Option<serde_json::Value>> {
-            self.json_call("language_server_initialization_options")
-                .await
+            let value = self
+                .call_for_worktree::<serde_json::Value>(
+                    "language_server_initialization_options",
+                    None,
+                    delegate,
+                )
+                .await?;
+            parse_optional_json(value)
         }
 
         async fn workspace_configuration(
             self: Arc<Self>,
-            _: &Arc<dyn LspAdapterDelegate>,
+            delegate: &Arc<dyn LspAdapterDelegate>,
             _: Option<Toolchain>,
             _: Option<Uri>,
             _: &mut gpui::AsyncApp,
         ) -> Result<serde_json::Value> {
-            Ok(self
-                .json_call("language_server_workspace_configuration")
-                .await?
-                .unwrap_or_else(|| json!({})))
+            let value = self
+                .call_for_worktree::<serde_json::Value>(
+                    "language_server_workspace_configuration",
+                    None,
+                    delegate,
+                )
+                .await?;
+            Ok(parse_optional_json(value)?.unwrap_or_else(|| json!({})))
         }
 
         async fn initialization_options_schema(
             self: Arc<Self>,
-            _: &Arc<dyn LspAdapterDelegate>,
+            delegate: &Arc<dyn LspAdapterDelegate>,
             _: OwnedMutexGuard<Option<(bool, LanguageServerBinary)>>,
             _: &mut gpui::AsyncApp,
         ) -> Option<serde_json::Value> {
-            self.json_call("language_server_initialization_options_schema")
-                .await
-                .ok()
-                .flatten()
+            self.call_for_worktree::<serde_json::Value>(
+                "language_server_initialization_options_schema",
+                None,
+                delegate,
+            )
+            .await
+            .and_then(parse_optional_json)
+            .ok()
+            .flatten()
         }
 
         async fn settings_schema(
             self: Arc<Self>,
-            _: &Arc<dyn LspAdapterDelegate>,
+            delegate: &Arc<dyn LspAdapterDelegate>,
             _: OwnedMutexGuard<Option<(bool, LanguageServerBinary)>>,
             _: &mut gpui::AsyncApp,
         ) -> Option<serde_json::Value> {
-            self.json_call("language_server_workspace_configuration_schema")
-                .await
-                .ok()
-                .flatten()
+            self.call_for_worktree::<serde_json::Value>(
+                "language_server_workspace_configuration_schema",
+                None,
+                delegate,
+            )
+            .await
+            .and_then(parse_optional_json)
+            .ok()
+            .flatten()
         }
 
         async fn additional_initialization_options(
             self: Arc<Self>,
             target: LanguageServerName,
-            _: &Arc<dyn LspAdapterDelegate>,
+            delegate: &Arc<dyn LspAdapterDelegate>,
         ) -> Result<Option<serde_json::Value>> {
-            self.json_call_target(
-                "language_server_additional_initialization_options",
-                Some(&target),
-            )
-            .await
+            let value = self
+                .call_for_worktree::<serde_json::Value>(
+                    "language_server_additional_initialization_options",
+                    Some(&target),
+                    delegate,
+                )
+                .await?;
+            parse_optional_json(value)
         }
 
         async fn additional_workspace_configuration(
             self: Arc<Self>,
             target: LanguageServerName,
-            _: &Arc<dyn LspAdapterDelegate>,
+            delegate: &Arc<dyn LspAdapterDelegate>,
             _: &mut gpui::AsyncApp,
         ) -> Result<Option<serde_json::Value>> {
-            self.json_call_target(
-                "language_server_additional_workspace_configuration",
-                Some(&target),
-            )
-            .await
+            let value = self
+                .call_for_worktree::<serde_json::Value>(
+                    "language_server_additional_workspace_configuration",
+                    Some(&target),
+                    delegate,
+                )
+                .await?;
+            parse_optional_json(value)
         }
     }
 
@@ -816,7 +851,7 @@ mod remote {
 
         async fn get_binary(
             &self,
-            _: &Arc<dyn DapDelegate>,
+            delegate: &Arc<dyn DapDelegate>,
             definition: &DebugTaskDefinition,
             user_installed_path: Option<PathBuf>,
             _: Option<Vec<String>>,
@@ -831,6 +866,9 @@ mod remote {
                         "config": definition.config,
                         "tcp_connection": definition.tcp_connection,
                         "user_installed_path": user_installed_path,
+                        "worktree_id": delegate.worktree_id().to_proto(),
+                        "worktree_root": delegate.worktree_root_path(),
+                        "worktree_env": delegate.shell_env().await,
                     }),
                 )
                 .await?;
@@ -1117,6 +1155,11 @@ mod remote {
                 .flatten()
                 .cloned()
                 .collect::<Vec<_>>();
+            SettingsStore::update_global(cx, |store, cx| {
+                for language in &old_languages {
+                    store.remove_language_semantic_token_rules(language.as_ref(), cx);
+                }
+            });
             self.languages
                 .remove_languages(&old_languages, &old_grammars);
             self.extension_languages.clear();
@@ -1147,6 +1190,7 @@ mod remote {
             }
             self.extension_debug_locators.clear();
             self.extension_language_model_providers.clear();
+            let mut semantic_token_rules_to_add = Vec::new();
 
             for extension in contributions.extensions {
                 let extension_id: Arc<str> = Arc::from(extension.id);
@@ -1263,6 +1307,34 @@ mod remote {
                     let matcher = config.matcher.clone();
                     let hidden = config.hidden;
                     let loaded_config = config.clone();
+                    let context_provider = contribution.tasks.as_deref().and_then(|contents| {
+                        match settings::parse_json_with_comments::<TaskTemplates>(contents) {
+                            Ok(definitions) => Some(
+                                Arc::new(ContextProviderWithTasks::new(definitions))
+                                    as Arc<_>,
+                            ),
+                            Err(error) => {
+                                log::error!(
+                                    "failed to parse task contribution for extension {} language {}: {error:#}",
+                                    extension_id,
+                                    name
+                                );
+                                None
+                            }
+                        }
+                    });
+                    if let Some(contents) = contribution.semantic_token_rules.as_deref() {
+                        match settings::parse_json_with_comments::<SemanticTokenRules>(contents) {
+                            Ok(rules) => semantic_token_rules_to_add.push((name.clone(), rules)),
+                            Err(error) => {
+                                log::error!(
+                                    "failed to parse semantic token rules for extension {} language {}: {error:#}",
+                                    extension_id,
+                                    name
+                                );
+                            }
+                        }
+                    }
                     let query_files = contribution.queries;
                     self.languages.register_language(
                         name.clone(),
@@ -1274,7 +1346,7 @@ mod remote {
                             Ok(LoadedLanguage {
                                 config: loaded_config.clone(),
                                 queries: language_queries_from_response(&query_files),
-                                context_provider: None,
+                                context_provider: context_provider.clone(),
                                 toolchain_provider: None,
                                 manifest_name: None,
                             })
@@ -1387,6 +1459,12 @@ mod remote {
                     );
                 }
             }
+
+            SettingsStore::update_global(cx, |store, cx| {
+                for (language, rules) in semantic_token_rules_to_add {
+                    store.set_language_semantic_token_rules(language.0, rules, cx);
+                }
+            });
 
             let installed_llm_extensions: HashSet<Arc<str>> = self
                 .extension_language_model_providers
