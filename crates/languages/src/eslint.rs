@@ -56,8 +56,7 @@ impl EsLintLspAdapter {
     #[cfg(not(target_family = "wasm"))]
     const SERVER_PATH: &'static str = "vscode-eslint/server/out/eslintServer.js";
     #[cfg(target_family = "wasm")]
-    const SERVER_PATH: &'static str =
-        "node_modules/vscode-langservers-extracted/bin/vscode-eslint-language-server";
+    const SERVER_PATH: &'static str = "node_modules/@zed-industries/vscode-langservers-extracted/bin/vscode-eslint-language-server";
     const SERVER_NAME: LanguageServerName = LanguageServerName::new_static("eslint");
 
     const FLAT_CONFIG_FILE_NAMES_V8_21: &'static [&'static str] = &["eslint.config.js"];
@@ -102,7 +101,7 @@ impl LspInstaller for EsLintLspAdapter {
         {
             let version = self
                 .node
-                .npm_package_latest_version("vscode-langservers-extracted")
+                .npm_package_latest_version("@zed-industries/vscode-langservers-extracted")
                 .await?;
             return Ok(GitHubLspBinaryVersion {
                 name: version.to_string(),
@@ -148,7 +147,7 @@ impl LspInstaller for EsLintLspAdapter {
                     fs::create_dir_all(&destination_path).await?;
                     node.npm_install_latest_packages(
                         &destination_path,
-                        &["vscode-langservers-extracted"],
+                        &["@zed-industries/vscode-langservers-extracted"],
                     )
                     .await?;
                 }
