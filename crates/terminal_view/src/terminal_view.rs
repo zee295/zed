@@ -302,7 +302,7 @@ impl TerminalView {
             block_below_cursor: None,
             scroll_top: Pixels::ZERO,
             scroll_handle,
-            needs_serialize: false,
+            needs_serialize: cfg!(target_family = "wasm"),
             custom_title: None,
             ime_state: None,
             self_handle: cx.entity().downgrade(),

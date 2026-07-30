@@ -400,6 +400,7 @@ impl Command {
 
             let io = Arc::new(Mutex::new(ProcessIo::new()));
             router.lock().unwrap().by_id.insert(proc_id, io.clone());
+            let actual_proc_id = Arc::new(std::sync::atomic::AtomicU64::new(proc_id));
 
             let (spawn_ready_tx, spawn_ready_rx) = oneshot::channel();
 
@@ -407,25 +408,39 @@ impl Command {
             // spawn, the exit notification will mark the process as done.
             let client_for_spawn = client.clone();
             let router_for_spawn = router.clone();
+            let io_for_spawn = io.clone();
+            let actual_proc_id_for_spawn = actual_proc_id.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 let result: Result<SpawnResponse, _> =
                     client_for_spawn.call("Process::spawn", &request).await;
-                let _ = spawn_ready_tx.send(result.is_ok());
-                if result.is_err() {
-                    if let Some(io) = router_for_spawn.lock().unwrap().by_id.get(&proc_id) {
-                        let mut guard = io.lock().unwrap();
-                        guard.exit_status = Some(ExitStatus::default());
-                        if let Some(tx) = guard.exit_tx.take() {
-                            tx.send(ExitStatus::default()).ok();
+                match result {
+                    Ok(response) => {
+                        if response.proc_id != proc_id {
+                            let mut router = router_for_spawn.lock().unwrap();
+                            router.by_id.remove(&proc_id);
+                            router.by_id.insert(response.proc_id, io_for_spawn.clone());
                         }
-                        if let Some(waker) = guard.exit_waker.take() {
-                            waker.wake();
-                        }
-                        if let Some(waker) = guard.stdout_waker.take() {
-                            waker.wake();
-                        }
-                        if let Some(waker) = guard.stderr_waker.take() {
-                            waker.wake();
+                        actual_proc_id_for_spawn
+                            .store(response.proc_id, std::sync::atomic::Ordering::SeqCst);
+                        let _ = spawn_ready_tx.send(Some(response.proc_id));
+                    }
+                    Err(_) => {
+                        let _ = spawn_ready_tx.send(None);
+                        if let Some(io) = router_for_spawn.lock().unwrap().by_id.get(&proc_id) {
+                            let mut guard = io.lock().unwrap();
+                            guard.exit_status = Some(ExitStatus::default());
+                            if let Some(tx) = guard.exit_tx.take() {
+                                tx.send(ExitStatus::default()).ok();
+                            }
+                            if let Some(waker) = guard.exit_waker.take() {
+                                waker.wake();
+                            }
+                            if let Some(waker) = guard.stdout_waker.take() {
+                                waker.wake();
+                            }
+                            if let Some(waker) = guard.stderr_waker.take() {
+                                waker.wake();
+                            }
                         }
                     }
                 }
@@ -435,11 +450,10 @@ impl Command {
                 let (tx, mut rx) = mpsc::unbounded::<Vec<u8>>();
                 io.lock().unwrap().stdin_tx = Some(tx.clone());
                 let client_for_stdin = client.clone();
-                let proc_id_for_stdin = proc_id;
                 wasm_bindgen_futures::spawn_local(async move {
-                    if !spawn_ready_rx.await.unwrap_or(false) {
+                    let Some(proc_id_for_stdin) = spawn_ready_rx.await.unwrap_or(None) else {
                         return;
-                    }
+                    };
                     while let Some(chunk) = rx.next().await {
                         let _ = client_for_stdin
                             .call_void(
@@ -479,7 +493,7 @@ impl Command {
 
             Ok(Child {
                 io,
-                proc_id,
+                proc_id: actual_proc_id,
                 client,
                 stdin,
                 stdout,
@@ -590,7 +604,7 @@ impl Command {
 
 pub struct Child {
     io: Arc<Mutex<ProcessIo>>,
-    proc_id: u64,
+    proc_id: Arc<std::sync::atomic::AtomicU64>,
     client: RpcClient,
     pub stdin: Option<ChildStdin>,
     pub stdout: Option<ChildStdout>,
@@ -658,7 +672,7 @@ impl Child {
         #[cfg(target_family = "wasm")]
         {
             let client = self.client.clone();
-            let proc_id = self.proc_id;
+            let proc_id = self.proc_id.load(std::sync::atomic::Ordering::SeqCst);
             wasm_bindgen_futures::spawn_local(async move {
                 let _ = client
                     .call_void("Process::kill", &ProcIdRequest { proc_id })
@@ -673,7 +687,7 @@ impl Child {
     }
 
     pub fn id(&self) -> u32 {
-        self.proc_id as u32
+        self.proc_id.load(std::sync::atomic::Ordering::SeqCst) as u32
     }
 }
 

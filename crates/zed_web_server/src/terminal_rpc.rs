@@ -227,17 +227,7 @@ impl TerminalManager {
     }
 
     fn resume_terminal(&mut self, resume_key: &str, params: &Value) -> Result<Option<Value>> {
-        let term_id = self
-            .terminals_by_resume_key
-            .get(resume_key)
-            .copied()
-            .or_else(|| {
-                self.terminals
-                    .iter()
-                    .filter(|(_, terminal)| terminal.resume_key.is_none())
-                    .map(|(term_id, _)| *term_id)
-                    .min()
-            });
+        let term_id = self.terminals_by_resume_key.get(resume_key).copied();
         let Some(term_id) = term_id else {
             return Ok(None);
         };
@@ -744,6 +734,48 @@ mod tests {
         )?;
         assert_eq!(missing["attached"], false);
         terminals.dispatch("Terminal::close", &json!({"term_id": term_id}))?;
+        Ok(())
+    }
+
+    #[test]
+    fn does_not_resume_an_unbound_terminal_for_an_unrelated_key() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let fs = Arc::new(FsRpc::new(root.path().to_path_buf(), false)?);
+        let (outgoing, _notifications) = mpsc::unbounded_channel();
+        let mut terminals = TerminalManager::new(fs, outgoing);
+        let unbound = terminals.dispatch(
+            "Terminal::open",
+            &json!({
+                "shell": {
+                    "program": "/bin/sh",
+                    "args": ["-c", "sleep 30"]
+                }
+            }),
+        )?;
+        let unbound_id = unbound["term_id"].as_u64().unwrap();
+
+        let keyed = terminals.dispatch(
+            "Terminal::open",
+            &json!({
+                "shell": {
+                    "program": "/bin/sh",
+                    "args": ["-c", "sleep 30"]
+                },
+                "resume_key": "workspace:2:terminal:7"
+            }),
+        )?;
+        let keyed_id = keyed["term_id"].as_u64().unwrap();
+
+        assert_ne!(keyed_id, unbound_id);
+        assert_eq!(keyed["resumed"], false);
+        assert_eq!(
+            terminals
+                .terminals_by_resume_key
+                .get("workspace:2:terminal:7"),
+            Some(&keyed_id)
+        );
+        terminals.dispatch("Terminal::close", &json!({"term_id": unbound_id}))?;
+        terminals.dispatch("Terminal::close", &json!({"term_id": keyed_id}))?;
         Ok(())
     }
 

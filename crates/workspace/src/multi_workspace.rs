@@ -1504,17 +1504,6 @@ impl MultiWorkspace {
             }
         }
 
-        #[cfg(target_family = "wasm")]
-        let language_server_transition = {
-            let old_project = old_active_workspace.read(cx).project().clone();
-            let new_project = workspace.read(cx).project().clone();
-            if old_project != new_project {
-                Some((old_project, new_project, workspace_was_retained))
-            } else {
-                None
-            }
-        };
-
         self.active_workspace = workspace;
         // Publish the new active workspace before anyone reads the shared cell
         // to decide who owns the window chrome.
@@ -1542,21 +1531,6 @@ impl MultiWorkspace {
         self.serialize(cx);
         self.focus_active_workspace(window, cx);
         cx.notify();
-
-        #[cfg(target_family = "wasm")]
-        if let Some((old_project, new_project, workspace_was_retained)) = language_server_transition
-        {
-            cx.defer(move |cx| {
-                old_project.update(cx, |project, cx| {
-                    project.stop_all_language_servers(cx);
-                });
-                if workspace_was_retained {
-                    new_project.update(cx, |project, cx| {
-                        project.restart_all_language_servers(cx);
-                    });
-                }
-            });
-        }
     }
 
     /// Adds `workspace` as a retained background tab without switching the

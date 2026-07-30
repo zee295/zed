@@ -222,13 +222,23 @@ impl ProcessManager {
             .transpose()?
             .filter(|path| path.is_dir())
             .unwrap_or(root);
-        let identity = (kind == ProcessKind::LanguageServer).then(|| ProcessIdentity {
+        let identity = (kind != ProcessKind::Generic).then(|| ProcessIdentity {
             program: program.clone(),
             args: args.clone(),
             cwd: cwd.clone(),
         });
         if let Some(identity) = identity.as_ref() {
-            self.replace_disconnected_language_server(identity);
+            match kind {
+                ProcessKind::LanguageServer => self.replace_disconnected_language_server(identity),
+                ProcessKind::AcpAgent => {
+                    if let Some(proc_id) =
+                        self.reattach_disconnected_idle_agent(identity, owner_generation)
+                    {
+                        return Ok(json!({"proc_id": proc_id}));
+                    }
+                }
+                ProcessKind::Generic => {}
+            }
         }
 
         let mut command = AsyncCommand::new(&program);
@@ -377,8 +387,10 @@ impl ProcessManager {
             .processes
             .iter()
             .filter_map(|(proc_id, entry)| {
-                (entry.disconnected && entry.identity.as_ref() == Some(identity))
-                    .then_some(*proc_id)
+                (entry.disconnected
+                    && entry.kind == ProcessKind::LanguageServer
+                    && entry.identity.as_ref() == Some(identity))
+                .then_some(*proc_id)
             })
             .collect::<Vec<_>>();
         for proc_id in proc_ids {
@@ -391,6 +403,35 @@ impl ProcessManager {
                 terminate_process(entry);
             }
         }
+    }
+
+    fn reattach_disconnected_idle_agent(
+        &mut self,
+        identity: &ProcessIdentity,
+        owner_generation: u64,
+    ) -> Option<u64> {
+        let proc_id = self.processes.iter().find_map(|(proc_id, entry)| {
+            let idle = entry
+                .acp_activity
+                .lock()
+                .map(|activity| activity.prompts.is_empty())
+                .unwrap_or(false);
+            (entry.disconnected
+                && idle
+                && !entry.task.is_finished()
+                && entry.kind == ProcessKind::AcpAgent
+                && entry.identity.as_ref() == Some(identity))
+            .then_some(*proc_id)
+        })?;
+        let entry = self.processes.get_mut(&proc_id)?;
+        entry.owner_generation = owner_generation;
+        entry.disconnected = false;
+        tracing::info!(
+            proc_id,
+            cwd = %identity.cwd.display(),
+            "reattached disconnected idle ACP agent"
+        );
+        Some(proc_id)
     }
 
     fn attach(&mut self, params: &Value, owner_generation: u64) -> Result<Value> {
@@ -1005,6 +1046,85 @@ mod tests {
         assert!(processes.processes.contains_key(&52));
         processes
             .dispatch("Process::kill", &json!({"proc_id": 52}), 2)
+            .await?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reload_reattaches_disconnected_idle_agent() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let fs = Arc::new(FsRpc::new(root.path().to_path_buf(), false)?);
+        let (outgoing, _notifications) = mpsc::unbounded_channel::<Message>();
+        let mut processes = ProcessManager::new(fs, outgoing);
+        let spawn = |proc_id| {
+            json!({
+                "proc_id": proc_id,
+                "program": "/bin/cat",
+                "cwd": "/workspace",
+                "env": [["ZED_WEB_PROCESS_KIND", "acp-agent"]],
+                "stdin_pipe": true,
+                "stdout_pipe": true,
+                "stderr_pipe": true,
+            })
+        };
+
+        processes.dispatch("Process::spawn", &spawn(53), 1).await?;
+        processes.detach_generation(1);
+        let response = processes.dispatch("Process::spawn", &spawn(54), 2).await?;
+
+        assert_eq!(response["proc_id"], 53);
+        assert!(processes.processes.contains_key(&53));
+        assert!(!processes.processes.contains_key(&54));
+        let reattached = processes.processes.get(&53).unwrap();
+        assert_eq!(reattached.owner_generation, 2);
+        assert!(!reattached.disconnected);
+        processes
+            .dispatch("Process::kill", &json!({"proc_id": 53}), 2)
+            .await?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reload_preserves_agent_with_active_prompt() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let fs = Arc::new(FsRpc::new(root.path().to_path_buf(), false)?);
+        let (outgoing, _notifications) = mpsc::unbounded_channel::<Message>();
+        let mut processes = ProcessManager::new(fs, outgoing);
+        let spawn = |proc_id| {
+            json!({
+                "proc_id": proc_id,
+                "program": "/bin/cat",
+                "cwd": "/workspace",
+                "env": [["ZED_WEB_PROCESS_KIND", "acp-agent"]],
+                "stdin_pipe": true,
+                "stdout_pipe": true,
+                "stderr_pipe": true,
+            })
+        };
+
+        processes.dispatch("Process::spawn", &spawn(55), 1).await?;
+        processes
+            .processes
+            .get(&55)
+            .unwrap()
+            .acp_activity
+            .lock()
+            .unwrap()
+            .prompts
+            .insert("request-1".into(), "session-1".into());
+        processes.detach_generation(1);
+        let response = processes.dispatch("Process::spawn", &spawn(56), 2).await?;
+
+        assert_eq!(response["proc_id"], 56);
+        assert!(processes.processes.contains_key(&55));
+        assert!(processes.processes.contains_key(&56));
+        processes
+            .dispatch("Process::kill", &json!({"proc_id": 55}), 1)
+            .await?;
+        processes
+            .dispatch("Process::kill", &json!({"proc_id": 56}), 2)
             .await?;
         Ok(())
     }

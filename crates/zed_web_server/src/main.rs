@@ -556,9 +556,17 @@ async fn index(
             .any(|parameter| parameter == "path" || parameter.starts_with("path="))
     });
     if !has_workspace_path {
-        let root_text = state.root.to_string_lossy();
-        let root = urlencoding::encode(&root_text);
-        return Redirect::temporary(&format!("/?path={root}")).into_response();
+        let paths = state
+            .workspace_state
+            .active_paths()
+            .filter(|paths| !paths.is_empty())
+            .unwrap_or_else(|| vec![state.root.display().to_string()]);
+        let query = paths
+            .iter()
+            .map(|path| format!("path={}", urlencoding::encode(path)))
+            .collect::<Vec<_>>()
+            .join("&");
+        return Redirect::temporary(&format!("/?{query}")).into_response();
     }
     for name in ["workspace.html", "index.html"] {
         let target = state.static_root.join(name);

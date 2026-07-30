@@ -121,6 +121,17 @@ struct WebWorkspaceUiState {
     sidebar_open: bool,
     #[serde(default)]
     project_groups: Vec<Vec<String>>,
+    #[serde(default)]
+    active_workspace_id: Option<String>,
+    #[serde(default)]
+    workspaces: Vec<WebHostedWorkspace>,
+}
+
+#[cfg(target_family = "wasm")]
+#[derive(Clone, Default, serde::Deserialize)]
+struct WebHostedWorkspace {
+    id: String,
+    paths: Vec<String>,
 }
 
 #[cfg(target_family = "wasm")]
@@ -178,6 +189,20 @@ fn sync_project_paths_url(project: &Entity<project::Project>, cx: &App) {
     if let Ok(paths) = serde_json::to_string(&paths) {
         sync_workspace_paths_json(&paths);
     }
+    save_active_workspace(paths);
+}
+
+#[cfg(target_family = "wasm")]
+fn save_active_workspace(paths: Vec<String>) {
+    let Some(client) = wasm_remote::remote_client() else {
+        return;
+    };
+    wasm_bindgen_futures::spawn_local(async move {
+        client
+            .call_void("Workspace::activate", &serde_json::json!({"paths": paths}))
+            .await
+            .log_err();
+    });
 }
 
 #[cfg(target_family = "wasm")]
@@ -2111,6 +2136,21 @@ fn launch(
 ) {
     gpui_platform::web_init();
     let mut paths = workspace_paths_from_url();
+    if paths.is_empty()
+        && let Some(active_workspace_id) = ui_state.active_workspace_id.as_deref()
+        && let Some(active_workspace) = ui_state
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == active_workspace_id)
+    {
+        paths.extend(
+            active_workspace
+                .paths
+                .iter()
+                .filter(|path| !path.is_empty())
+                .map(std::path::PathBuf::from),
+        );
+    }
     if paths.is_empty() {
         paths.push(workspace_root);
     }

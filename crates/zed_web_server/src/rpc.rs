@@ -505,6 +505,13 @@ pub async fn serve(socket: WebSocket, state: AppState) {
             .unwrap_or_default();
         let result = if method == "Workspace::ui_state" {
             serde_json::to_value(state.workspace_state.snapshot()).map_err(Into::into)
+        } else if method == "Workspace::activate" {
+            canonical_workspace_paths(&session.fs, &params).and_then(|paths| {
+                state
+                    .workspace_state
+                    .activate(paths)
+                    .and_then(|workspace| serde_json::to_value(workspace).map_err(Into::into))
+            })
         } else if method == "Workspace::set_sidebar_open" {
             let open = params
                 .get("open")
@@ -667,6 +674,29 @@ pub async fn serve(socket: WebSocket, state: AppState) {
     heartbeat.abort();
     writer.await.ok();
     tracing::info!("rpc client disconnected");
+}
+
+fn canonical_workspace_paths(fs: &FsRpc, params: &Value) -> Result<Vec<String>> {
+    let paths = params
+        .get("paths")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("missing workspace paths"))?;
+    let mut canonical = Vec::with_capacity(paths.len());
+    for path in paths {
+        let path = path
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("workspace path must be a string"))?;
+        let value = fs.dispatch("Fs::canonicalize", &json!({ "path": path }))?;
+        let path = value
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("canonical workspace path was not a string"))?
+            .to_string();
+        if !canonical.contains(&path) {
+            canonical.push(path);
+        }
+    }
+    anyhow::ensure!(!canonical.is_empty(), "workspace paths cannot be empty");
+    Ok(canonical)
 }
 
 async fn dispatch(
