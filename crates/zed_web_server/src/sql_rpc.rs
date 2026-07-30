@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rusqlite::{
     Connection, Row, ToSql,
@@ -53,6 +53,7 @@ impl SqlRpc {
         let mut state = self.lock_for_client(client_id)?;
         let result = match method {
             "Sql::query" => query(&mut state, params),
+            "Sql::batch" => batch(&mut state, params),
             "Sql::script" => script(&mut state, params),
             "Sql::migrate" => migrate(&mut state, params),
             "Sql::bootstrap_kvp" => bootstrap_kvp(&mut state),
@@ -273,6 +274,70 @@ fn query(state: &mut SqlState, params: &Value) -> Result<Value> {
         "changes": changes,
         "savepoint_depth": state.savepoint_depth,
     }))
+}
+
+fn batch(state: &mut SqlState, params: &Value) -> Result<Value> {
+    let queries = params
+        .get("queries")
+        .and_then(Value::as_array)
+        .context("SQL batch queries must be an array")?;
+
+    state.connection.execute_batch("SAVEPOINT zed_rpc_batch")?;
+    let result = (|| {
+        let mut last_rowids = Vec::with_capacity(queries.len());
+        for (index, request) in queries.iter().enumerate() {
+            let sql = request
+                .get("sql")
+                .and_then(Value::as_str)
+                .filter(|sql| !sql.trim().is_empty())
+                .with_context(|| format!("SQL batch query {index} has no SQL"))?;
+            let raw_params = request
+                .get("params")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let resolved_params = raw_params
+                .iter()
+                .map(|param| resolve_batch_param(param, &last_rowids))
+                .collect::<Result<Vec<_>>>()?;
+            query(
+                state,
+                &json!({
+                    "sql": sql,
+                    "params": resolved_params,
+                }),
+            )?;
+            last_rowids.push(state.connection.last_insert_rowid());
+        }
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            state.connection.execute_batch("RELEASE zed_rpc_batch")?;
+            Ok(json!({"ok": true, "queries": queries.len()}))
+        }
+        Err(error) => {
+            state
+                .connection
+                .execute_batch("ROLLBACK TO zed_rpc_batch; RELEASE zed_rpc_batch")?;
+            Err(error)
+        }
+    }
+}
+
+fn resolve_batch_param(param: &Value, last_rowids: &[i64]) -> Result<Value> {
+    if param.get("type").and_then(Value::as_str) != Some("batch_last_rowid") {
+        return Ok(param.clone());
+    }
+    let query = param
+        .get("query")
+        .and_then(Value::as_u64)
+        .context("SQL batch row ID reference has no query index")? as usize;
+    let rowid = last_rowids
+        .get(query)
+        .with_context(|| format!("SQL batch row ID references future query {query}"))?;
+    Ok(json!(rowid))
 }
 
 fn script(state: &mut SqlState, params: &Value) -> Result<Value> {
@@ -608,6 +673,92 @@ fn placeholder_count(sql: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_resolves_inserted_row_ids_and_commits_atomically() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let sql = SqlRpc::new(root.path())?;
+        sql.dispatch(
+            "Sql::query",
+            &json!({
+                "sql": "
+                    CREATE TABLE batch_parents(id INTEGER PRIMARY KEY, name TEXT);
+                    CREATE TABLE batch_children(
+                        id INTEGER PRIMARY KEY,
+                        parent_id INTEGER NOT NULL REFERENCES batch_parents(id),
+                        name TEXT
+                    )"
+            }),
+        )?;
+
+        let result = sql.dispatch(
+            "Sql::batch",
+            &json!({
+                "queries": [
+                    {
+                        "sql": "INSERT INTO batch_parents(name) VALUES (?)",
+                        "params": ["parent"]
+                    },
+                    {
+                        "sql": "INSERT INTO batch_children(parent_id, name) VALUES (?, ?)",
+                        "params": [
+                            {"type": "batch_last_rowid", "query": 0},
+                            "child"
+                        ]
+                    }
+                ]
+            }),
+        )?;
+        assert_eq!(result, json!({"ok": true, "queries": 2}));
+
+        let rows = sql.dispatch(
+            "Sql::query",
+            &json!({
+                "sql": "
+                    SELECT batch_parents.name, batch_children.name
+                    FROM batch_children
+                    JOIN batch_parents ON batch_parents.id = batch_children.parent_id"
+            }),
+        )?;
+        assert_eq!(rows["rows"], json!([["parent", "child"]]));
+        Ok(())
+    }
+
+    #[test]
+    fn batch_rolls_back_all_queries_on_error() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let sql = SqlRpc::new(root.path())?;
+        sql.dispatch(
+            "Sql::query",
+            &json!({"sql": "CREATE TABLE batch_records(id INTEGER PRIMARY KEY, name TEXT UNIQUE)"}),
+        )?;
+
+        assert!(
+            sql.dispatch(
+                "Sql::batch",
+                &json!({
+                    "queries": [
+                        {
+                            "sql": "INSERT INTO batch_records(name) VALUES (?)",
+                            "params": ["duplicate"]
+                        },
+                        {
+                            "sql": "INSERT INTO batch_records(name) VALUES (?)",
+                            "params": ["duplicate"]
+                        }
+                    ]
+                }),
+            )
+            .is_err()
+        );
+
+        let count = sql.dispatch(
+            "Sql::query",
+            &json!({"sql": "SELECT COUNT(*) FROM batch_records"}),
+        )?;
+        assert_eq!(count["rows"], json!([[0]]));
+        Ok(())
+    }
 
     #[test]
     fn migration_is_idempotent_and_detects_drift() -> Result<()> {

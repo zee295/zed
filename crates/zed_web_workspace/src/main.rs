@@ -2122,8 +2122,6 @@ fn launch(
     let handle = gpui_platform::single_threaded_web()
         .with_assets(web_assets)
         .run_embedded(move |cx: &mut App| {
-            let app_state =
-                init_app_state(cx, extension_assets.clone(), remote_client.clone(), &paths);
             let legacy_project_groups = workspace_project_groups_from_url();
             let persisted_project_groups = ui_state
                 .project_groups
@@ -2142,6 +2140,17 @@ fn launch(
             } else {
                 persisted_project_groups
             };
+
+            let mut prefetch_roots = paths.clone();
+            prefetch_roots.extend(project_groups.iter().flatten().cloned());
+            prefetch_roots.sort_unstable();
+            prefetch_roots.dedup();
+            let app_state = init_app_state(
+                cx,
+                extension_assets.clone(),
+                remote_client.clone(),
+                &prefetch_roots,
+            );
             let open_task =
                 workspace::open_paths(&paths, app_state, workspace::OpenOptions::default(), cx);
             log_open_result(open_task, project_groups, ui_state, cx);

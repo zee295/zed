@@ -3,8 +3,13 @@ use log::{Level, Log, Metadata, Record};
 struct ConsoleLogger;
 
 impl Log for ConsoleLogger {
-    fn enabled(&self, _metadata: &Metadata) -> bool {
-        true
+    fn enabled(&self, metadata: &Metadata) -> bool {
+        let max_level = if cfg!(debug_assertions) {
+            log::LevelFilter::Debug
+        } else {
+            log::LevelFilter::Info
+        };
+        metadata.level() <= max_level
     }
 
     fn log(&self, record: &Record) {

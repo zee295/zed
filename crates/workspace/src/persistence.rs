@@ -1647,6 +1647,12 @@ impl WorkspaceDb {
     }
 
     pub(crate) async fn save_workspace(&self, workspace: SerializedWorkspace) {
+        #[cfg(target_family = "wasm")]
+        if matches!(workspace.location, SerializedWorkspaceLocation::Local) {
+            self.save_workspace_web(workspace).await.log_err();
+            return;
+        }
+
         let paths = workspace.paths.serialize();
         let identity_paths = workspace.identity_paths.map(|paths| paths.serialize());
         log::debug!("Saving workspace at location: {:?}", workspace.location);
@@ -1825,6 +1831,261 @@ impl WorkspaceDb {
             .log_err();
         })
         .await;
+    }
+
+    #[cfg(target_family = "wasm")]
+    async fn save_workspace_web(&self, workspace: SerializedWorkspace) -> Result<()> {
+        use sqlez::remote_sql::{SqlBatchParam, SqlBatchQuery, SqlParam, execute_batch_async};
+
+        fn text(value: impl Into<String>) -> SqlParam {
+            SqlParam::text(value)
+        }
+
+        fn optional_text(value: Option<impl Into<String>>) -> SqlParam {
+            value.map(text).unwrap_or_else(SqlParam::null)
+        }
+
+        fn optional_i64(value: Option<i64>) -> SqlParam {
+            value.map(SqlParam::int).unwrap_or_else(SqlParam::null)
+        }
+
+        fn push_pane_group(
+            queries: &mut Vec<SqlBatchQuery>,
+            workspace_id: i64,
+            pane_group: &SerializedPaneGroup,
+            parent: Option<(usize, usize)>,
+        ) {
+            match pane_group {
+                SerializedPaneGroup::Group {
+                    axis,
+                    children,
+                    flexes,
+                } => {
+                    let parent_id = parent
+                        .map(|(query, _)| SqlBatchParam::last_rowid(query))
+                        .unwrap_or_else(|| SqlParam::null().into());
+                    let position = parent
+                        .map(|(_, position)| SqlParam::int(position as i64).into())
+                        .unwrap_or_else(|| SqlParam::null().into());
+                    let axis = match axis.0 {
+                        Axis::Horizontal => "Horizontal",
+                        Axis::Vertical => "Vertical",
+                    };
+                    let group_query = queries.len();
+                    queries.push(SqlBatchQuery::with_params(
+                        "INSERT INTO pane_groups(
+                            workspace_id, parent_group_id, position, axis, flexes
+                         ) VALUES (?, ?, ?, ?, ?)",
+                        vec![
+                            SqlParam::int(workspace_id).into(),
+                            parent_id,
+                            position,
+                            text(axis).into(),
+                            optional_text(
+                                flexes
+                                    .as_ref()
+                                    .map(|flexes| serde_json::json!(flexes).to_string()),
+                            )
+                            .into(),
+                        ],
+                    ));
+                    for (position, child) in children.iter().enumerate() {
+                        push_pane_group(
+                            queries,
+                            workspace_id,
+                            child,
+                            Some((group_query, position)),
+                        );
+                    }
+                }
+                SerializedPaneGroup::Pane(pane) => {
+                    let pane_query = queries.len();
+                    queries.push(SqlBatchQuery::new(
+                        "INSERT INTO panes(workspace_id, active, pinned_count)
+                         VALUES (?, ?, ?)",
+                        vec![
+                            SqlParam::int(workspace_id),
+                            SqlParam::int(i64::from(pane.active)),
+                            SqlParam::int(pane.pinned_count as i64),
+                        ],
+                    ));
+
+                    let parent_id = parent
+                        .map(|(query, _)| SqlBatchParam::last_rowid(query))
+                        .unwrap_or_else(|| SqlParam::null().into());
+                    let position = parent
+                        .map(|(_, position)| SqlParam::int(position as i64).into())
+                        .unwrap_or_else(|| SqlParam::null().into());
+                    queries.push(SqlBatchQuery::with_params(
+                        "INSERT INTO center_panes(pane_id, parent_group_id, position)
+                         VALUES (?, ?, ?)",
+                        vec![SqlBatchParam::last_rowid(pane_query), parent_id, position],
+                    ));
+
+                    for (position, item) in pane.children.iter().enumerate() {
+                        queries.push(SqlBatchQuery::with_params(
+                            "INSERT INTO items(
+                                workspace_id, pane_id, position, kind, item_id, active, preview
+                             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            vec![
+                                SqlParam::int(workspace_id).into(),
+                                SqlBatchParam::last_rowid(pane_query),
+                                SqlParam::int(position as i64).into(),
+                                text(item.kind.as_ref()).into(),
+                                SqlParam::int(item.item_id as i64).into(),
+                                SqlParam::int(i64::from(item.active)).into(),
+                                SqlParam::int(i64::from(item.preview)).into(),
+                            ],
+                        ));
+                    }
+                }
+            }
+        }
+
+        let workspace_id = i64::from(workspace.id);
+        let paths = workspace.paths.serialize();
+        let identity_paths = workspace.identity_paths.map(|paths| paths.serialize());
+        let mut queries = vec![
+            SqlBatchQuery::new(
+                "DELETE FROM pane_groups WHERE workspace_id = ?1;
+                 DELETE FROM panes WHERE workspace_id = ?1;",
+                vec![SqlParam::int(workspace_id)],
+            ),
+            SqlBatchQuery::new(
+                "DELETE FROM bookmarks WHERE workspace_id = ?1",
+                vec![SqlParam::int(workspace_id)],
+            ),
+        ];
+
+        for (path, bookmarks) in workspace.bookmarks {
+            for bookmark in bookmarks {
+                queries.push(SqlBatchQuery::new(
+                    "INSERT INTO bookmarks(workspace_id, path, row, label)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    vec![
+                        SqlParam::int(workspace_id),
+                        text(path.to_string_lossy()),
+                        SqlParam::int(bookmark.row as i64),
+                        text(bookmark.label),
+                    ],
+                ));
+            }
+        }
+
+        queries.push(SqlBatchQuery::new(
+            "DELETE FROM breakpoints WHERE workspace_id = ?1",
+            vec![SqlParam::int(workspace_id)],
+        ));
+        for (path, breakpoints) in workspace.breakpoints {
+            for breakpoint in breakpoints {
+                queries.push(SqlBatchQuery::new(
+                    "INSERT INTO breakpoints(
+                        workspace_id, path, breakpoint_location, log_message,
+                        condition, hit_condition, state
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    vec![
+                        SqlParam::int(workspace_id),
+                        text(path.to_string_lossy()),
+                        SqlParam::int(breakpoint.row as i64),
+                        optional_text(breakpoint.message.map(|value| value.to_string())),
+                        optional_text(breakpoint.condition.map(|value| value.to_string())),
+                        optional_text(breakpoint.hit_condition.map(|value| value.to_string())),
+                        SqlParam::int(breakpoint.state.to_int() as i64),
+                    ],
+                ));
+            }
+        }
+
+        queries.push(SqlBatchQuery::new(
+            "DELETE FROM user_toolchains WHERE workspace_id = ?1",
+            vec![SqlParam::int(workspace_id)],
+        ));
+        for (scope, toolchains) in workspace.user_toolchains {
+            for toolchain in toolchains {
+                let (toolchain_workspace_id, worktree_root_path, relative_worktree_path) =
+                    match &scope {
+                        ToolchainScope::Subproject(worktree_root_path, path) => (
+                            workspace_id,
+                            Some(worktree_root_path.to_string_lossy().into_owned()),
+                            Some(path.as_unix_str().to_owned()),
+                        ),
+                        ToolchainScope::Project => (workspace_id, None, None),
+                        ToolchainScope::Global => (0, None, None),
+                    };
+                queries.push(SqlBatchQuery::new(
+                    "INSERT OR REPLACE INTO user_toolchains(
+                        remote_connection_id, workspace_id, worktree_root_path,
+                        relative_worktree_path, language_name, name, path, raw_json
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    vec![
+                        SqlParam::null(),
+                        SqlParam::int(toolchain_workspace_id),
+                        text(worktree_root_path.unwrap_or_default()),
+                        text(relative_worktree_path.unwrap_or_default()),
+                        text(toolchain.language_name.as_ref()),
+                        text(toolchain.name.to_string()),
+                        text(toolchain.path.to_string()),
+                        text(toolchain.as_json.to_string()),
+                    ],
+                ));
+            }
+        }
+
+        if !paths.paths.is_empty() {
+            queries.push(SqlBatchQuery::new(
+                "DELETE FROM workspaces
+                 WHERE workspace_id != ?1 AND paths IS ?2 AND remote_connection_id IS ?3",
+                vec![
+                    SqlParam::int(workspace_id),
+                    text(paths.paths.clone()),
+                    SqlParam::null(),
+                ],
+            ));
+        }
+
+        queries.push(SqlBatchQuery::new(
+            "INSERT INTO workspaces(
+                workspace_id, paths, paths_order, identity_paths, identity_paths_order,
+                remote_connection_id, left_dock_visible, left_dock_active_panel,
+                left_dock_zoom, right_dock_visible, right_dock_active_panel,
+                right_dock_zoom, bottom_dock_visible, bottom_dock_active_panel,
+                bottom_dock_zoom, session_id, window_id, timestamp
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                ?13, ?14, ?15, ?16, ?17, CURRENT_TIMESTAMP
+             )
+             ON CONFLICT DO UPDATE SET
+                paths = ?2, paths_order = ?3, identity_paths = ?4,
+                identity_paths_order = ?5, remote_connection_id = ?6,
+                left_dock_visible = ?7, left_dock_active_panel = ?8,
+                left_dock_zoom = ?9, right_dock_visible = ?10,
+                right_dock_active_panel = ?11, right_dock_zoom = ?12,
+                bottom_dock_visible = ?13, bottom_dock_active_panel = ?14,
+                bottom_dock_zoom = ?15, session_id = ?16, window_id = ?17,
+                timestamp = CURRENT_TIMESTAMP",
+            vec![
+                SqlParam::int(workspace_id),
+                text(paths.paths),
+                text(paths.order),
+                optional_text(identity_paths.as_ref().map(|paths| paths.paths.clone())),
+                optional_text(identity_paths.as_ref().map(|paths| paths.order.clone())),
+                SqlParam::null(),
+                SqlParam::int(i64::from(workspace.docks.left.visible)),
+                optional_text(workspace.docks.left.active_panel),
+                SqlParam::int(i64::from(workspace.docks.left.zoom)),
+                SqlParam::int(i64::from(workspace.docks.right.visible)),
+                optional_text(workspace.docks.right.active_panel),
+                SqlParam::int(i64::from(workspace.docks.right.zoom)),
+                SqlParam::int(i64::from(workspace.docks.bottom.visible)),
+                optional_text(workspace.docks.bottom.active_panel),
+                SqlParam::int(i64::from(workspace.docks.bottom.zoom)),
+                optional_text(workspace.session_id),
+                optional_i64(workspace.window_id.map(|value| value as i64)),
+            ],
+        ));
+
+        push_pane_group(&mut queries, workspace_id, &workspace.center_group, None);
+        execute_batch_async(queries).await
     }
 
     pub(crate) async fn get_or_create_remote_connection(

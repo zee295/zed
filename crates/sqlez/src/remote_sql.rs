@@ -121,6 +121,54 @@ impl SqlParam {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum SqlBatchParam {
+    Value(SqlParam),
+    LastRowId {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        query: usize,
+    },
+}
+
+impl SqlBatchParam {
+    pub fn last_rowid(query: usize) -> Self {
+        Self::LastRowId {
+            kind: "batch_last_rowid",
+            query,
+        }
+    }
+}
+
+impl From<SqlParam> for SqlBatchParam {
+    fn from(value: SqlParam) -> Self {
+        Self::Value(value)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SqlBatchQuery {
+    sql: String,
+    params: Vec<SqlBatchParam>,
+}
+
+impl SqlBatchQuery {
+    pub fn new(sql: impl Into<String>, params: Vec<SqlParam>) -> Self {
+        Self {
+            sql: sql.into(),
+            params: params.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    pub fn with_params(sql: impl Into<String>, params: Vec<SqlBatchParam>) -> Self {
+        Self {
+            sql: sql.into(),
+            params,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum SqlCell {
     Null,
@@ -281,6 +329,29 @@ pub async fn execute_async(sql: &str, params: &[SqlParam]) -> Result<SqlQueryRes
         read_cache::apply_common_write(sql, &params_json);
     }
     Ok(result)
+}
+
+/// Execute dependent statements as one atomic server-side transaction.
+///
+/// A parameter can refer to the row ID inserted by an earlier query in the
+/// batch. This lets callers persist parent/child data without a network round
+/// trip for every generated SQLite ID.
+#[cfg(target_family = "wasm")]
+pub async fn execute_batch_async(queries: Vec<SqlBatchQuery>) -> Result<()> {
+    async_call(
+        "Sql::batch",
+        request_with_client_id(&json!({
+            "params": {
+                "queries": queries,
+            }
+        }))
+        .get("params")
+        .cloned()
+        .context("build asynchronous SQL batch parameters")?,
+    )
+    .await?;
+    read_cache_clear();
+    Ok(())
 }
 
 #[cfg(target_family = "wasm")]

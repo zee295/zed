@@ -2328,6 +2328,7 @@ impl Sidebar {
 
         let key_for_toggle = key.clone();
         let key_for_focus = key.clone();
+        let activate_on_primary_click = cfg!(target_family = "wasm");
 
         // The fade gradient renders as a visible patch on transparent windows,
         // so truncate the label instead.
@@ -2483,7 +2484,10 @@ impl Sidebar {
             })
             .on_click(
                 cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                    if event.modifiers().secondary() {
+                    let should_activate = activate_on_primary_click
+                        && this.active_project_group_key(cx).as_ref() != Some(&key_for_focus);
+                    if event.modifiers().secondary() || should_activate {
+                        this.set_group_expanded(&key_for_focus, true, cx);
                         this.activate_or_open_workspace_for_group(&key_for_focus, window, cx);
                     } else if !this.has_filter_query(cx) {
                         this.toggle_collapse(&key_for_toggle, window, cx);
@@ -3566,7 +3570,14 @@ impl Sidebar {
         match entry {
             ListEntry::ProjectHeader { key, .. } => {
                 let key = key.clone();
-                self.toggle_collapse(&key, window, cx);
+                let should_activate = cfg!(target_family = "wasm")
+                    && self.active_project_group_key(cx).as_ref() != Some(&key);
+                if should_activate {
+                    self.set_group_expanded(&key, true, cx);
+                    self.activate_or_open_workspace_for_group(&key, window, cx);
+                } else {
+                    self.toggle_collapse(&key, window, cx);
+                }
             }
             ListEntry::Thread(thread) => {
                 let metadata = thread.metadata.clone();
