@@ -232,7 +232,7 @@ impl ProcessManager {
                 ProcessKind::LanguageServer => self.replace_disconnected_language_server(identity),
                 ProcessKind::AcpAgent => {
                     if let Some(proc_id) =
-                        self.reattach_disconnected_idle_agent(identity, owner_generation)
+                        self.reattach_disconnected_agent(identity, owner_generation)
                     {
                         return Ok(json!({"proc_id": proc_id}));
                     }
@@ -405,19 +405,13 @@ impl ProcessManager {
         }
     }
 
-    fn reattach_disconnected_idle_agent(
+    fn reattach_disconnected_agent(
         &mut self,
         identity: &ProcessIdentity,
         owner_generation: u64,
     ) -> Option<u64> {
         let proc_id = self.processes.iter().find_map(|(proc_id, entry)| {
-            let idle = entry
-                .acp_activity
-                .lock()
-                .map(|activity| activity.prompts.is_empty())
-                .unwrap_or(false);
             (entry.disconnected
-                && idle
                 && !entry.task.is_finished()
                 && entry.kind == ProcessKind::AcpAgent
                 && entry.identity.as_ref() == Some(identity))
@@ -429,7 +423,7 @@ impl ProcessManager {
         tracing::info!(
             proc_id,
             cwd = %identity.cwd.display(),
-            "reattached disconnected idle ACP agent"
+            "reattached disconnected ACP agent"
         );
         Some(proc_id)
     }
@@ -947,6 +941,7 @@ mod tests {
 
     use anyhow::Result;
     use axum::extract::ws::Message;
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use serde_json::json;
     use tokio::sync::mpsc;
 
@@ -1052,7 +1047,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn reload_reattaches_disconnected_idle_agent() -> anyhow::Result<()> {
+    async fn reload_reattaches_disconnected_agent() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let fs = Arc::new(FsRpc::new(root.path().to_path_buf(), false)?);
         let (outgoing, _notifications) = mpsc::unbounded_channel::<Message>();
@@ -1087,10 +1082,10 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn reload_preserves_agent_with_active_prompt() -> anyhow::Result<()> {
+    async fn reload_reattaches_agent_with_active_prompt() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let fs = Arc::new(FsRpc::new(root.path().to_path_buf(), false)?);
-        let (outgoing, _notifications) = mpsc::unbounded_channel::<Message>();
+        let (outgoing, mut notifications) = mpsc::unbounded_channel::<Message>();
         let mut processes = ProcessManager::new(fs, outgoing);
         let spawn = |proc_id| {
             json!({
@@ -1117,14 +1112,44 @@ mod tests {
         processes.detach_generation(1);
         let response = processes.dispatch("Process::spawn", &spawn(56), 2).await?;
 
-        assert_eq!(response["proc_id"], 56);
+        assert_eq!(response["proc_id"], 55);
         assert!(processes.processes.contains_key(&55));
-        assert!(processes.processes.contains_key(&56));
+        assert!(!processes.processes.contains_key(&56));
+        let reattached = processes.processes.get(&55).unwrap();
+        assert_eq!(reattached.owner_generation, 2);
+        assert!(!reattached.disconnected);
+        assert_eq!(
+            processes.running_sessions()?,
+            json!({"sessions": ["session-1"]})
+        );
+
+        let frame = br#"{"jsonrpc":"2.0","id":2,"method":"initialize"}\n"#;
+        processes
+            .dispatch(
+                "Process::write_stdin",
+                &json!({"proc_id": 55, "data": BASE64.encode(frame)}),
+                2,
+            )
+            .await?;
+        let notification =
+            tokio::time::timeout(std::time::Duration::from_secs(2), notifications.recv())
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("ACP output notification channel closed"))?;
+        let Message::Text(notification) = notification else {
+            anyhow::bail!("expected ACP stdout text notification");
+        };
+        let notification: serde_json::Value = serde_json::from_str(&notification)?;
+        assert_eq!(notification["method"], "Process::stdout");
+        assert_eq!(notification["params"]["proc_id"], 55);
+        let output = BASE64.decode(
+            notification["params"]["data"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("missing ACP stdout data"))?,
+        )?;
+        assert_eq!(output, frame);
+
         processes
             .dispatch("Process::kill", &json!({"proc_id": 55}), 1)
-            .await?;
-        processes
-            .dispatch("Process::kill", &json!({"proc_id": 56}), 2)
             .await?;
         Ok(())
     }
