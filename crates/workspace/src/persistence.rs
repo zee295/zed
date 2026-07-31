@@ -2909,35 +2909,43 @@ impl WorkspaceDb {
         &self,
         workspace_id: WorkspaceId,
     ) -> Result<Vec<(Toolchain, Arc<Path>, Arc<RelPath>)>> {
-        self.write(move |this| {
-            let mut select = this
+        #[cfg(target_family = "wasm")]
+        let toolchain: Vec<(String, String, String, String, String, String)> = {
+            let mut select = self
                 .select_bound(toolchains_query())
                 .context("select toolchains")?;
+            select(workspace_id)?
+        };
 
-            let toolchain: Vec<(String, String, String, String, String, String)> =
-                select(workspace_id)?;
+        #[cfg(not(target_family = "wasm"))]
+        let toolchain: Vec<(String, String, String, String, String, String)> = self
+            .write(move |this| {
+                let mut select = this
+                    .select_bound(toolchains_query())
+                    .context("select toolchains")?;
+                select(workspace_id)
+            })
+            .await?;
 
-            Ok(toolchain
-                .into_iter()
-                .filter_map(
-                    |(name, path, worktree_root_path, relative_worktree_path, language, json)| {
-                        Some((
-                            Toolchain {
-                                name: name.into(),
-                                path: path.into(),
-                                language_name: LanguageName::new(&language),
-                                as_json: serde_json::Value::from_str(&json).ok()?,
-                            },
-                            Arc::from(worktree_root_path.as_ref()),
-                            RelPath::from_unix_str(&relative_worktree_path)
-                                .log_err()?
-                                .into(),
-                        ))
-                    },
-                )
-                .collect())
-        })
-        .await
+        Ok(toolchain
+            .into_iter()
+            .filter_map(
+                |(name, path, worktree_root_path, relative_worktree_path, language, json)| {
+                    Some((
+                        Toolchain {
+                            name: name.into(),
+                            path: path.into(),
+                            language_name: LanguageName::new(&language),
+                            as_json: serde_json::Value::from_str(&json).ok()?,
+                        },
+                        Arc::from(worktree_root_path.as_ref()),
+                        RelPath::from_unix_str(&relative_worktree_path)
+                            .log_err()?
+                            .into(),
+                    ))
+                },
+            )
+            .collect())
     }
 
     pub async fn set_toolchain(

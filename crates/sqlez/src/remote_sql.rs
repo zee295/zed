@@ -367,9 +367,8 @@ async fn async_call(method: &str, params: Value) -> Result<Value> {
 mod read_cache {
     use super::{SqlCell, SqlQueryResult};
     use serde_json::Value;
-    use std::cell::RefCell;
     use std::collections::HashMap;
-    use std::sync::{LazyLock, Mutex};
+    use std::sync::{LazyLock, Mutex, MutexGuard, TryLockError};
 
     #[derive(Default)]
     pub struct CommonReads {
@@ -377,10 +376,19 @@ mod read_cache {
         scoped: HashMap<(String, String), String>,
     }
 
-    thread_local! {
-        static CACHE: RefCell<HashMap<String, SqlQueryResult>> = RefCell::new(HashMap::new());
-    }
+    static CACHE: LazyLock<Mutex<HashMap<String, SqlQueryResult>>> =
+        LazyLock::new(Default::default);
     static COMMON: LazyLock<Mutex<Option<CommonReads>>> = LazyLock::new(Default::default);
+
+    fn cache() -> MutexGuard<'static, HashMap<String, SqlQueryResult>> {
+        loop {
+            match CACHE.try_lock() {
+                Ok(cache) => return cache,
+                Err(TryLockError::Poisoned(error)) => return error.into_inner(),
+                Err(TryLockError::WouldBlock) => std::hint::spin_loop(),
+            }
+        }
+    }
 
     fn key(sql: &str, params: &[Value]) -> String {
         format!(
@@ -391,17 +399,15 @@ mod read_cache {
     }
 
     pub fn get(sql: &str, params: &[Value]) -> Option<SqlQueryResult> {
-        CACHE.with(|c| c.borrow().get(&key(sql, params)).cloned())
+        cache().get(&key(sql, params)).cloned()
     }
 
     pub fn put(sql: &str, params: &[Value], result: &SqlQueryResult) {
-        CACHE.with(|c| {
-            c.borrow_mut().insert(key(sql, params), result.clone());
-        });
+        cache().insert(key(sql, params), result.clone());
     }
 
     pub fn clear() {
-        CACHE.with(|c| c.borrow_mut().clear());
+        cache().clear();
     }
 
     pub fn prime(kv: Vec<(String, String)>, scoped: Vec<(String, String, String)>) {
