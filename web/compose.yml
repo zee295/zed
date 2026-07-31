@@ -1,6 +1,6 @@
 services:
   zed-web:
-    image: ${ZED_WEB_IMAGE:-ghcr.io/zee295/zed-web:1.13.0-web.14}
+    image: ${ZED_WEB_IMAGE:-ghcr.io/zee295/zed-web:1.13.0-web.15}
     build:
       context: ..
       dockerfile: web/Dockerfile
