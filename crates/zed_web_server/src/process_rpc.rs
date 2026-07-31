@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     env,
     path::PathBuf,
     process::{Command, Stdio},
@@ -23,6 +23,7 @@ use tokio::{
 use crate::fs_rpc::FsRpc;
 
 const PROCESS_KIND_ENV: &str = "ZED_WEB_PROCESS_KIND";
+const MAX_DEFERRED_ACP_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
 pub fn handles(method: &str) -> bool {
     matches!(method, "Process::output" | "Process::status")
@@ -93,6 +94,9 @@ struct AcpActivity {
     input: Vec<u8>,
     output: Vec<u8>,
     prompts: HashMap<String, String>,
+    suspended_sessions: HashSet<String>,
+    deferred_output: VecDeque<(String, Vec<u8>)>,
+    deferred_output_bytes: usize,
 }
 
 impl AcpActivity {
@@ -106,36 +110,112 @@ impl AcpActivity {
                 .get("method")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            if method != "session/prompt" && method != "session.prompt" {
-                continue;
-            }
-            let Some(id) = value.get("id").map(Value::to_string) else {
-                continue;
-            };
             let session_id = value
                 .pointer("/params/sessionId")
                 .or_else(|| value.pointer("/params/session_id"))
                 .and_then(Value::as_str);
-            if let Some(session_id) = session_id {
-                self.prompts.insert(id, session_id.to_string());
+            match method {
+                "session/prompt" | "session.prompt" => {
+                    let Some(id) = value.get("id").map(Value::to_string) else {
+                        continue;
+                    };
+                    if let Some(session_id) = session_id {
+                        self.prompts.insert(id, session_id.to_string());
+                    }
+                }
+                "session/load" | "session.load" | "session/resume" | "session.resume" => {
+                    if let Some(session_id) = session_id {
+                        self.resume_session_from_history(session_id);
+                    }
+                }
+                _ => {}
             }
         }
     }
 
-    fn feed_output(&mut self, bytes: &[u8]) {
+    fn route_output(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
         self.output.extend_from_slice(bytes);
+        let mut forwarded = Vec::new();
         for line in take_lines(&mut self.output) {
             let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+                forwarded.push(with_newline(line));
                 continue;
             };
-            if value.get("result").is_none() && value.get("error").is_none() {
-                continue;
+            if value.get("result").is_some() || value.get("error").is_some() {
+                if let Some(id) = value.get("id").map(Value::to_string) {
+                    self.prompts.remove(&id);
+                }
             }
-            if let Some(id) = value.get("id").map(Value::to_string) {
-                self.prompts.remove(&id);
+
+            let suspended_session = value
+                .get("method")
+                .and_then(Value::as_str)
+                .is_some_and(|method| method == "session/update" || method == "session.update")
+                .then(|| {
+                    value
+                        .pointer("/params/sessionId")
+                        .or_else(|| value.pointer("/params/session_id"))
+                        .and_then(Value::as_str)
+                })
+                .flatten()
+                .filter(|session_id| self.suspended_sessions.contains(*session_id));
+            if let Some(session_id) = suspended_session {
+                self.defer_output(session_id.to_string(), with_newline(line));
+            } else {
+                forwarded.push(with_newline(line));
             }
         }
+        forwarded
     }
+
+    fn suspend_active_sessions(&mut self) {
+        self.suspended_sessions
+            .extend(self.prompts.values().cloned());
+    }
+
+    fn defer_output(&mut self, session_id: String, frame: Vec<u8>) {
+        self.deferred_output_bytes += frame.len();
+        self.deferred_output.push_back((session_id, frame));
+        while self.deferred_output_bytes > MAX_DEFERRED_ACP_OUTPUT_BYTES {
+            let Some((_, frame)) = self.deferred_output.pop_front() else {
+                break;
+            };
+            self.deferred_output_bytes = self.deferred_output_bytes.saturating_sub(frame.len());
+        }
+    }
+
+    fn resume_session_from_history(&mut self, session_id: &str) {
+        // A fresh browser registers the thread before sending session/load. ACP
+        // then replays its history, so forwarding these transient copies would
+        // duplicate content that the load response is about to reconstruct.
+        self.suspended_sessions.remove(session_id);
+        let mut removed_bytes = 0;
+        self.deferred_output.retain(|(deferred_session, frame)| {
+            if deferred_session == session_id {
+                removed_bytes += frame.len();
+                false
+            } else {
+                true
+            }
+        });
+        self.deferred_output_bytes = self.deferred_output_bytes.saturating_sub(removed_bytes);
+    }
+
+    fn resume_existing_client(&mut self) -> Vec<Vec<u8>> {
+        // A transport reconnect keeps the existing WASM router and ACP thread,
+        // so it needs the short outage buffer instead of a history reload.
+        self.suspended_sessions.clear();
+        self.deferred_output_bytes = 0;
+        self.deferred_output
+            .drain(..)
+            .map(|(_, frame)| frame)
+            .collect()
+    }
+}
+
+fn with_newline(mut line: Vec<u8>) -> Vec<u8> {
+    line.push(b'\n');
+    line
 }
 
 fn take_lines(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
@@ -291,7 +371,7 @@ impl ProcessManager {
                 "Process::stdout",
                 outgoing.clone(),
                 None,
-                Some(acp_activity.clone()),
+                (kind == ProcessKind::AcpAgent).then(|| acp_activity.clone()),
             ))
         });
         let stderr_task = stderr.map(|stderr| {
@@ -358,6 +438,11 @@ impl ProcessManager {
         for entry in self.processes.values_mut() {
             if entry.owner_generation == generation {
                 entry.disconnected = true;
+                if entry.kind == ProcessKind::AcpAgent
+                    && let Ok(mut activity) = entry.acp_activity.lock()
+                {
+                    activity.suspend_active_sessions();
+                }
             }
         }
     }
@@ -439,6 +524,17 @@ impl ProcessManager {
             if let Some(entry) = self.processes.get_mut(&proc_id) {
                 entry.owner_generation = owner_generation;
                 entry.disconnected = false;
+                if entry.kind == ProcessKind::AcpAgent
+                    && let Ok(mut activity) = entry.acp_activity.lock()
+                {
+                    for frame in activity.resume_existing_client() {
+                        notify(
+                            &self.outgoing,
+                            "Process::stdout",
+                            json!({"proc_id": proc_id, "data": BASE64.encode(frame)}),
+                        );
+                    }
+                }
                 attached.push(proc_id);
             } else {
                 missing.push(proc_id);
@@ -793,21 +889,26 @@ async fn pump_output(
         if count == 0 {
             break;
         }
-        if let Some(activity) = &acp_activity
-            && let Ok(mut activity) = activity.lock()
-        {
-            activity.feed_output(&buffer[..count]);
-        }
-        let chunks = rewriter
-            .as_mut()
-            .map(|rewriter| rewriter.feed(&buffer[..count]))
-            .unwrap_or_else(|| vec![buffer[..count].to_vec()]);
-        for chunk in chunks {
-            notify(
-                &outgoing,
-                method,
-                json!({"proc_id": proc_id, "data": BASE64.encode(chunk)}),
-            );
+        let routed = if let Some(activity) = &acp_activity {
+            activity
+                .lock()
+                .map(|mut activity| activity.route_output(&buffer[..count]))
+                .unwrap_or_default()
+        } else {
+            vec![buffer[..count].to_vec()]
+        };
+        for routed_chunk in routed {
+            let chunks = rewriter
+                .as_mut()
+                .map(|rewriter| rewriter.feed(&routed_chunk))
+                .unwrap_or_else(|| vec![routed_chunk]);
+            for chunk in chunks {
+                notify(
+                    &outgoing,
+                    method,
+                    json!({"proc_id": proc_id, "data": BASE64.encode(chunk)}),
+                );
+            }
         }
     }
     if let Some(rewriter) = rewriter
@@ -962,9 +1063,67 @@ mod tests {
             ["claude-session"]
         );
 
-        activity.feed_output(br#"{"jsonrpc":"2.0","id":17,"result":{"stopReason":"end_turn"}}"#);
-        activity.feed_output(b"\n");
+        activity.route_output(br#"{"jsonrpc":"2.0","id":17,"result":{"stopReason":"end_turn"}}"#);
+        activity.route_output(b"\n");
         assert!(activity.prompts.is_empty());
+    }
+
+    #[test]
+    fn reload_defers_active_session_updates_until_session_load() {
+        let mut activity = AcpActivity::default();
+        activity.feed_input(
+            br#"{"jsonrpc":"2.0","id":17,"method":"session/prompt","params":{"sessionId":"claude-session"}}
+"#,
+        );
+        activity.suspend_active_sessions();
+
+        let missed = activity.route_output(
+            br#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"claude-session","update":{"sessionUpdate":"agent_message_chunk"}}}
+"#,
+        );
+        assert!(missed.is_empty());
+        assert_eq!(activity.deferred_output.len(), 1);
+
+        activity.feed_input(
+            br#"{"jsonrpc":"2.0","id":18,"method":"session/load","params":{"sessionId":"claude-session"}}
+"#,
+        );
+        assert!(activity.deferred_output.is_empty());
+        let resumed = activity.route_output(
+            br#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"claude-session","update":{"sessionUpdate":"agent_message_chunk"}}}
+"#,
+        );
+        assert_eq!(resumed.len(), 1);
+        assert!(resumed[0].ends_with(b"\n"));
+    }
+
+    #[test]
+    fn reconnect_replays_deferred_updates_to_existing_client() {
+        let mut activity = AcpActivity::default();
+        activity.feed_input(
+            br#"{"jsonrpc":"2.0","id":17,"method":"session/prompt","params":{"sessionId":"claude-session"}}
+"#,
+        );
+        activity.suspend_active_sessions();
+        assert!(
+            activity
+                .route_output(
+                    br#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"claude-session","update":{"sessionUpdate":"agent_message_chunk"}}}
+"#,
+                )
+                .is_empty()
+        );
+
+        let replay = activity.resume_existing_client();
+        assert_eq!(replay.len(), 1);
+        assert!(activity.suspended_sessions.is_empty());
+        assert!(activity.deferred_output.is_empty());
+
+        let live = activity.route_output(
+            br#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"claude-session","update":{"sessionUpdate":"agent_message_chunk"}}}
+"#,
+        );
+        assert_eq!(live.len(), 1);
     }
 
     #[cfg(unix)]
@@ -1123,7 +1282,7 @@ mod tests {
             json!({"sessions": ["session-1"]})
         );
 
-        let frame = br#"{"jsonrpc":"2.0","id":2,"method":"initialize"}\n"#;
+        let frame = b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\"}\n";
         processes
             .dispatch(
                 "Process::write_stdin",
