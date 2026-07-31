@@ -516,6 +516,9 @@ impl Fs for RemoteFs {
     }
 
     async fn is_dir(&self, path: &std::path::Path) -> bool {
+        if let Some(metadata) = lock_shared(&self.prefetched_metadata).get(path) {
+            return metadata.is_dir;
+        }
         self.client
             .call("Fs::is_dir", &json!({ "path": path_arg(path) }))
             .await
