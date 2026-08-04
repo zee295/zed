@@ -1,10 +1,10 @@
 use std::rc::Rc;
 
 use gpui::{
-    Capslock, DispatchEventResult, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers,
-    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
-    MouseUpEvent, NavigationDirection, Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent,
-    TouchPhase, point, px,
+    Capslock, ClipboardEntry, ClipboardItem, DispatchEventResult, Image, ImageFormat, KeyDownEvent,
+    KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
+    MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, PlatformInput,
+    Point, ScrollDelta, ScrollWheelEvent, TouchPhase, point, px,
 };
 use wasm_bindgen::prelude::*;
 
@@ -502,6 +502,50 @@ impl WebWindowInner {
             let Some(clipboard_data) = event.clipboard_data() else {
                 return;
             };
+
+            let image_files = clipboard_image_files(&clipboard_data);
+            if !image_files.is_empty() {
+                event.prevent_default();
+                let this = Rc::clone(&this);
+                wasm_bindgen_futures::spawn_local(async move {
+                    let mut entries = Vec::with_capacity(image_files.len());
+                    for (file, format) in image_files {
+                        match wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await {
+                            Ok(buffer) => {
+                                let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
+                                entries
+                                    .push(ClipboardEntry::Image(Image::from_bytes(format, bytes)));
+                            }
+                            Err(error) => {
+                                log::warn!("failed to read pasted browser image: {error:?}");
+                            }
+                        }
+                    }
+
+                    if entries.is_empty() {
+                        return;
+                    }
+
+                    *this.pending_clipboard.borrow_mut() = Some(ClipboardItem { entries });
+                    let modifiers = if this.is_mac {
+                        Modifiers::command()
+                    } else {
+                        Modifiers::control()
+                    };
+                    this.dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
+                        keystroke: Keystroke {
+                            modifiers,
+                            key: "v".into(),
+                            key_char: None,
+                        },
+                        is_held: false,
+                        prefer_character_input: false,
+                    }));
+                    this.pending_clipboard.borrow_mut().take();
+                });
+                return;
+            }
+
             let Ok(text) = clipboard_data.get_data("text/plain") else {
                 return;
             };
@@ -590,6 +634,23 @@ impl WebWindowInner {
             );
         })
     }
+}
+
+fn clipboard_image_files(
+    clipboard_data: &web_sys::DataTransfer,
+) -> Vec<(web_sys::File, ImageFormat)> {
+    let items = clipboard_data.items();
+    (0..items.length())
+        .filter_map(|index| {
+            let item = items.get(index)?;
+            if item.kind() != "file" {
+                return None;
+            }
+            let format = ImageFormat::from_mime_type(&item.type_())?;
+            let file = item.get_as_file().ok().flatten()?;
+            Some((file, format))
+        })
+        .collect()
 }
 
 fn dom_key_to_gpui_key(event: &web_sys::KeyboardEvent) -> String {

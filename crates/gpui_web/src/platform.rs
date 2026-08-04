@@ -44,6 +44,7 @@ pub struct WebPlatform {
     wgpu_context: Rc<RefCell<Option<WgpuContext>>>,
     cursor_visible: Rc<Cell<bool>>,
     last_cursor_css: Rc<Cell<&'static str>>,
+    pending_clipboard: Rc<RefCell<Option<ClipboardItem>>>,
     /// In-window application menus (no OS menu bar on the web).
     menus: RefCell<Vec<OwnedMenu>>,
     _cursor_restore_listeners: Vec<EventListenerHandle>,
@@ -88,6 +89,7 @@ impl WebPlatform {
 
         let cursor_visible = Rc::new(Cell::new(true));
         let last_cursor_css = Rc::new(Cell::new("default"));
+        let pending_clipboard = Rc::new(RefCell::new(None));
         let cursor_restore_listeners = cursor_restore_listeners(
             &browser_window,
             cursor_visible.clone(),
@@ -105,6 +107,7 @@ impl WebPlatform {
             wgpu_context: Rc::new(RefCell::new(None)),
             cursor_visible,
             last_cursor_css,
+            pending_clipboard,
             menus: RefCell::new(Vec::new()),
             _cursor_restore_listeners: cursor_restore_listeners,
         }
@@ -187,7 +190,13 @@ impl Platform for WebPlatform {
             anyhow::anyhow!("WebGPU context not initialized. Was Platform::run() called?")
         })?;
 
-        let window = WebWindow::new(handle, params, context, self.browser_window.clone())?;
+        let window = WebWindow::new(
+            handle,
+            params,
+            context,
+            self.browser_window.clone(),
+            self.pending_clipboard.clone(),
+        )?;
         *self.active_window.borrow_mut() = Some(handle);
         Ok(Box::new(window))
     }
@@ -383,7 +392,7 @@ impl Platform for WebPlatform {
     }
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
-        None
+        self.pending_clipboard.borrow_mut().take()
     }
 
     fn write_to_clipboard(&self, item: ClipboardItem) {

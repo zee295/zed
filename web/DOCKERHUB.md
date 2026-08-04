@@ -23,7 +23,7 @@ docker run -d \
   --restart unless-stopped \
   -p 8090:8090 \
   -v "$PWD/workspace:/workspace" \
-  zee295/zed-web:1.13.0-web.16
+  zee295/zed-web:1.13.0-web.17
 
 docker exec zed-web sh -c \
   'until test -s /workspace/.zed/web-auth-token; do sleep 1; done; cat /workspace/.zed/web-auth-token'
@@ -74,7 +74,7 @@ TLS, and appropriate host-level access controls.
 
 ## Tags And Platforms
 
-- Pin release tags such as `1.13.0-web.16` for reproducible deployments.
+- Pin release tags such as `1.13.0-web.17` for reproducible deployments.
 - `latest` tracks the newest successful `zed-web` branch build and can change
   without a release.
 - Published release images support `linux/amd64` and `linux/arm64`.
