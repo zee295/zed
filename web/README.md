@@ -25,7 +25,7 @@ docker run -d \
   --restart unless-stopped \
   -p 8090:8090 \
   -v "$PWD/workspace:/workspace" \
-  zee295/zed-web:1.13.0-web.17
+  zee295/zed-web:1.13.0-web.18
 docker exec zed-web sh -c \
   'until test -s /workspace/.zed/web-auth-token; do sleep 1; done; cat /workspace/.zed/web-auth-token'
 ```
@@ -44,7 +44,7 @@ The same tested multi-architecture release is mirrored to Docker Hub after each
 successful build. To use that registry instead, set:
 
 ```sh
-ZED_WEB_IMAGE=docker.io/zee295/zed-web:1.13.0-web.17 \
+ZED_WEB_IMAGE=docker.io/zee295/zed-web:1.13.0-web.18 \
 ZED_WORKSPACE="$PWD/workspace" \
 docker compose -f web/compose.yml up -d
 ```
@@ -100,7 +100,7 @@ docker run -d \
   -e ZED_WEB_TOKEN='replace-with-a-long-secret' \
   -e ZED_WEB_RESTRICT_PATHS=true \
   -e ZED_WEB_SECURE_COOKIE=false \
-  zee295/zed-web:1.13.0-web.17
+  zee295/zed-web:1.13.0-web.18
 ```
 
 The one image contains:
@@ -123,7 +123,7 @@ docker run -d \
   -p 8090:8090 \
   -v "$PWD/workspace:/workspace" \
   -e ZED_WEB_OLLAMA_URL=http://host.docker.internal:11434 \
-  zee295/zed-web:1.13.0-web.17
+  zee295/zed-web:1.13.0-web.18
 ```
 
 For Compose, set the same variable in the shell; `web/compose.yml` already adds
