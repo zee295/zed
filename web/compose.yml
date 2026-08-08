@@ -16,5 +16,10 @@ services:
       ZED_WEB_RESTRICT_PATHS: ${ZED_WEB_RESTRICT_PATHS:-false}
       ZED_WEB_SECURE_COOKIE: ${ZED_WEB_SECURE_COOKIE:-false}
       ZED_WEB_TOKEN: ${ZED_WEB_TOKEN:-}
+      ZED_WEB_OLLAMA_URL: ${ZED_WEB_OLLAMA_URL:-}
+      ZED_WEB_LLAMA_CPP_URL: ${ZED_WEB_LLAMA_CPP_URL:-}
+      ZED_WEB_LM_STUDIO_URL: ${ZED_WEB_LM_STUDIO_URL:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - "${ZED_WORKSPACE:-./workspace}:/workspace"

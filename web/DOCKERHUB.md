@@ -50,6 +50,12 @@ The image includes Node.js 22 with npm/npx for extensions and ACP agents.
 Provider credentials such as `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` remain on
 the server when passed as container environment variables.
 
+Ollama, llama.cpp, and LM Studio requests also run through the Rust server. Use
+`ZED_WEB_OLLAMA_URL`, `ZED_WEB_LLAMA_CPP_URL`, or `ZED_WEB_LM_STUDIO_URL` to
+point the container at the model service. For a service on the Docker host,
+add `--add-host=host.docker.internal:host-gateway` and use a URL such as
+`http://host.docker.internal:11434`.
+
 ## Large Repositories
 
 An `ENOSPC` error from `fs.watch` means the Docker host's shared Linux inotify

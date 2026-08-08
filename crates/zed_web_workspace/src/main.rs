@@ -1231,14 +1231,13 @@ fn init_app_state(
     let languages = Arc::new(languages);
 
     let clock: Arc<dyn clock::SystemClock> = Arc::new(RealSystemClock);
-    // Model providers (Anthropic / OpenAI) call cx.http_client() directly.
-    // Route their API hosts through the host server, which injects the key and
-    // streams the upstream response back (avoids browser CORS + keeps keys on
-    // the host). Other URLs go straight to browser fetch.
-    // Safety: gpui_web marks `new` unsafe under its `multithreaded` feature
-    // because fetch is only valid from the single browser main thread. The web
-    // workspace runs the whole app on that one thread, so this is sound here.
-    let fetch = unsafe { gpui_web::FetchHttpClient::new() };
+    // Browser JS handles are local to one wasm-bindgen worker instance. Keep
+    // fetch promises on the main thread even when a provider starts its HTTP
+    // future on GPUI's background executor; only plain Rust data crosses the
+    // worker boundary.
+    let fetch = gpui_web::FetchHttpClient::new_with_main_thread_dispatcher(
+        cx.background_executor().dispatcher().clone(),
+    );
     let proxy_http = Arc::new(web_proxy_http::ProxyHttpClient::new(
         Arc::new(fetch),
         &server_origin,

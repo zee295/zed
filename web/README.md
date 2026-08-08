@@ -81,6 +81,9 @@ Optional built-in agent and API proxy settings:
 | `ZED_AGENT_MODEL` | Override the built-in agent model. |
 | `ZED_AGENT_BASE_URL` | Override the built-in agent API endpoint. |
 | `ZED_EXTERNAL_AGENTS` | JSON array of additional server-side agent commands. |
+| `ZED_WEB_OLLAMA_URL` | Server-side Ollama endpoint. Defaults to `http://127.0.0.1:11434`. |
+| `ZED_WEB_LLAMA_CPP_URL` | Server-side llama.cpp endpoint. Defaults to `http://127.0.0.1:8080`. |
+| `ZED_WEB_LM_STUDIO_URL` | Server-side LM Studio endpoint. Defaults to `http://127.0.0.1:1234`. |
 
 Compose also reads `ZED_WEB_IMAGE`, `ZED_WORKSPACE`, and the host-side
 `ZED_WEB_PORT` before starting the container. These select the image, bind
@@ -108,6 +111,24 @@ The one image contains:
 - Node.js 22 with npm and npx for extensions and ACP agents
 - compressed fonts, icons, themes, prompts, images, and sounds
 - Git, SSH, Node/npm, shells, and terminal runtime dependencies
+
+Local model requests are performed by the Rust server, not by the browser. If
+the model server runs on the Docker host, point the relevant endpoint at
+`host.docker.internal`:
+
+```sh
+docker run -d \
+  --name zed-web \
+  --add-host=host.docker.internal:host-gateway \
+  -p 8090:8090 \
+  -v "$PWD/workspace:/workspace" \
+  -e ZED_WEB_OLLAMA_URL=http://host.docker.internal:11434 \
+  zee295/zed-web:1.13.0-web.17
+```
+
+For Compose, set the same variable in the shell; `web/compose.yml` already adds
+the Linux host-gateway alias. A model server in another Compose service can be
+addressed by its service name instead, such as `http://ollama:11434`.
 
 The workspace is the only required volume. Persistent editor SQL, access token,
 extension packages, terminals, agent state, and project data remain under that

@@ -402,23 +402,58 @@ async fn proxy_http(
     AxumPath((provider, rest)): AxumPath<(String, String)>,
     body: Bytes,
 ) -> Response {
-    let (upstream, key_variables, auth_header) = match provider.as_str() {
+    let (upstream, key_variables, auth_header, forward_client_auth) = match provider.as_str() {
         "anthropic" => (
-            "https://api.anthropic.com",
+            "https://api.anthropic.com".to_string(),
             &["ANTHROPIC_API_KEY", "ZED_AGENT_API_KEY"][..],
             "x-api-key",
+            false,
         ),
         "openai" => (
-            "https://api.openai.com",
+            "https://api.openai.com".to_string(),
             &["OPENAI_API_KEY", "ZED_AGENT_API_KEY"][..],
             "authorization",
+            false,
         ),
-        "acp-registry" => ("https://cdn.agentclientprotocol.com", &[][..], ""),
-        "github-api" => ("https://api.github.com", &[][..], ""),
-        "github" => ("https://github.com", &[][..], ""),
-        "github-codeload" => ("https://codeload.github.com", &[][..], ""),
-        "github-raw" => ("https://raw.githubusercontent.com", &[][..], ""),
-        "github-objects" => ("https://objects.githubusercontent.com", &[][..], ""),
+        "acp-registry" => (
+            "https://cdn.agentclientprotocol.com".into(),
+            &[][..],
+            "",
+            false,
+        ),
+        "github-api" => ("https://api.github.com".into(), &[][..], "", false),
+        "github" => ("https://github.com".into(), &[][..], "", false),
+        "github-codeload" => ("https://codeload.github.com".into(), &[][..], "", false),
+        "github-raw" => (
+            "https://raw.githubusercontent.com".into(),
+            &[][..],
+            "",
+            false,
+        ),
+        "github-objects" => (
+            "https://objects.githubusercontent.com".into(),
+            &[][..],
+            "",
+            false,
+        ),
+        "ollama" => (
+            proxy_upstream("ZED_WEB_OLLAMA_URL", "http://127.0.0.1:11434"),
+            &[][..],
+            "",
+            true,
+        ),
+        "llama-cpp" => (
+            proxy_upstream("ZED_WEB_LLAMA_CPP_URL", "http://127.0.0.1:8080"),
+            &[][..],
+            "",
+            true,
+        ),
+        "lm-studio" => (
+            proxy_upstream("ZED_WEB_LM_STUDIO_URL", "http://127.0.0.1:1234"),
+            &[][..],
+            "",
+            true,
+        ),
         _ => {
             return (
                 StatusCode::NOT_FOUND,
@@ -436,18 +471,7 @@ async fn proxy_http(
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET);
     let mut request = state.http.request(request_method, target);
     for (name, value) in &headers {
-        if matches!(
-            name.as_str(),
-            "host"
-                | "origin"
-                | "referer"
-                | "content-length"
-                | "connection"
-                | "accept-encoding"
-                | "authorization"
-                | "x-api-key"
-                | "x-zed-proxy-target"
-        ) {
+        if should_skip_proxy_request_header(name.as_str(), forward_client_auth) {
             continue;
         }
         request = request.header(name.as_str(), value.as_bytes());
@@ -504,6 +528,33 @@ async fn proxy_http(
         HeaderValue::from_static("*"),
     );
     security_headers(response)
+}
+
+fn proxy_upstream(variable: &str, default: &str) -> String {
+    normalize_proxy_upstream(std::env::var(variable).ok().as_deref(), default)
+}
+
+fn normalize_proxy_upstream(configured: Option<&str>, default: &str) -> String {
+    configured
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(default)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn should_skip_proxy_request_header(name: &str, forward_client_auth: bool) -> bool {
+    matches!(
+        name,
+        "host"
+            | "origin"
+            | "referer"
+            | "content-length"
+            | "connection"
+            | "cookie"
+            | "accept-encoding"
+            | "x-zed-proxy-target"
+    ) || (!forward_client_auth && matches!(name, "authorization" | "x-api-key"))
 }
 
 fn rewrite_acp_registry(bytes: &[u8]) -> Vec<u8> {
@@ -732,6 +783,26 @@ main{{width:min(360px,calc(100vw - 32px))}}input,button{{width:100%;height:38px;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalizes_model_proxy_upstreams() {
+        assert_eq!(
+            normalize_proxy_upstream(Some(" http://models:11434/ "), "unused"),
+            "http://models:11434"
+        );
+        assert_eq!(
+            normalize_proxy_upstream(Some(""), "http://127.0.0.1:11434"),
+            "http://127.0.0.1:11434"
+        );
+    }
+
+    #[test]
+    fn proxy_never_forwards_browser_session_cookies() {
+        assert!(should_skip_proxy_request_header("cookie", true));
+        assert!(should_skip_proxy_request_header("cookie", false));
+        assert!(!should_skip_proxy_request_header("x-api-key", true));
+        assert!(should_skip_proxy_request_header("x-api-key", false));
+    }
 
     #[test]
     fn canonicalizes_virtual_workspace_path_without_dropping_other_paths() {
