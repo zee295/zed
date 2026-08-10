@@ -93,6 +93,40 @@ test("restores panel visibility after reload", async ({ browser, baseURL }) => {
   await context.close();
 });
 
+test("accepts pasted images exposed only through clipboard files", async ({
+  browser,
+  baseURL,
+}) => {
+  const context = await browser.newContext();
+  await authenticate(context, baseURL);
+  const page = await context.newPage();
+  await openWorkspace(page, baseURL);
+
+  const pasteWasHandled = await page.evaluate(() => {
+    const input = document.querySelector("input");
+    const transfer = new DataTransfer();
+    transfer.items.add(
+      new File([new Uint8Array([1, 2, 3])], "screenshot.png", {
+        type: "image/png",
+      }),
+    );
+
+    const event = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "clipboardData", {
+      value: {
+        items: { length: 0 },
+        files: transfer.files,
+        getData: () => "",
+      },
+    });
+    input.dispatchEvent(event);
+    return event.defaultPrevented;
+  });
+
+  expect(pasteWasHandled).toBe(true);
+  await context.close();
+});
+
 test("offers a real new-tab link when an external popup is blocked", async ({
   browser,
   baseURL,

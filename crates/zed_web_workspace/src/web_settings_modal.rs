@@ -78,7 +78,7 @@ impl Render for SettingsModal {
 pub fn open_settings_popup(
     original_window: Option<gpui::WindowHandle<workspace::MultiWorkspace>>,
     page: Option<String>,
-    _workspace: &mut Workspace,
+    workspace: &mut Workspace,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
@@ -90,14 +90,17 @@ pub fn open_settings_popup(
     //      `Workspace` via AppState/settings fetch.
     //   2. `defer_in` then presents the pre-built entity via `toggle_modal`.
     let window_handle = window.window_handle();
+    let context_server_store = workspace.project().read(cx).context_server_store();
     cx.spawn_in(window, {
         let original_window = original_window.clone();
         let page = page.clone();
+        let context_server_store = context_server_store.clone();
         async move |_workspace, cx| {
             // Phase 1: build SettingsWindow lease-free via `new_window_entity`
             // (uses `update_window`, which doesn't hold a `Workspace` lease).
             let settings = cx.new_window_entity(|window, cx| {
                 let mut settings = SettingsWindow::new_modal(original_window, window, cx);
+                settings.set_context_server_store(context_server_store);
                 if let Some(page) = page.as_deref() {
                     settings.open_page(page, window, cx);
                 }

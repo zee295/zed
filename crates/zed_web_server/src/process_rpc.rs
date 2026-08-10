@@ -23,6 +23,7 @@ use tokio::{
 use crate::fs_rpc::FsRpc;
 
 const PROCESS_KIND_ENV: &str = "ZED_WEB_PROCESS_KIND";
+const PROCESS_IDENTITY_ENV: &str = "ZED_WEB_PROCESS_IDENTITY";
 const MAX_DEFERRED_ACP_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
 pub fn handles(method: &str) -> bool {
@@ -69,6 +70,7 @@ struct ProcessEntry {
 enum ProcessKind {
     AcpAgent,
     LanguageServer,
+    McpServer,
     Generic,
 }
 
@@ -77,6 +79,7 @@ impl ProcessKind {
         match environment.remove(PROCESS_KIND_ENV).as_deref() {
             Some("acp-agent") => Self::AcpAgent,
             Some("language-server") => Self::LanguageServer,
+            Some("mcp-server") => Self::McpServer,
             _ => Self::Generic,
         }
     }
@@ -87,6 +90,14 @@ struct ProcessIdentity {
     program: PathBuf,
     args: Vec<String>,
     cwd: PathBuf,
+    logical_id: Option<String>,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct OrphanedProcessReap {
+    pub language_servers: usize,
+    pub mcp_servers: usize,
+    pub mcp_waiting_for_agent: bool,
 }
 
 #[derive(Default)]
@@ -294,6 +305,7 @@ impl ProcessManager {
             .is_some_and(|name| name.contains("lldb-dap"));
         let mut process_environment = environment(params);
         let kind = ProcessKind::from_environment(&mut process_environment);
+        let logical_id = process_environment.remove(PROCESS_IDENTITY_ENV);
         let cwd = params
             .get("cwd")
             .and_then(Value::as_str)
@@ -306,14 +318,26 @@ impl ProcessManager {
             program: program.clone(),
             args: args.clone(),
             cwd: cwd.clone(),
+            logical_id,
         });
         if let Some(identity) = identity.as_ref() {
             match kind {
                 ProcessKind::LanguageServer => self.replace_disconnected_language_server(identity),
                 ProcessKind::AcpAgent => {
-                    if let Some(proc_id) =
-                        self.reattach_disconnected_agent(identity, owner_generation)
-                    {
+                    if let Some(proc_id) = self.reattach_disconnected_process(
+                        ProcessKind::AcpAgent,
+                        identity,
+                        owner_generation,
+                    ) {
+                        return Ok(json!({"proc_id": proc_id}));
+                    }
+                }
+                ProcessKind::McpServer => {
+                    if let Some(proc_id) = self.reattach_disconnected_process(
+                        ProcessKind::McpServer,
+                        identity,
+                        owner_generation,
+                    ) {
                         return Ok(json!({"proc_id": proc_id}));
                     }
                 }
@@ -447,8 +471,8 @@ impl ProcessManager {
         }
     }
 
-    pub fn reap_orphaned_language_servers(&mut self, generation: u64) -> usize {
-        let proc_ids = self
+    pub fn reap_orphaned_processes(&mut self, generation: u64) -> OrphanedProcessReap {
+        let language_server_ids = self
             .processes
             .iter()
             .filter_map(|(proc_id, entry)| {
@@ -458,13 +482,45 @@ impl ProcessManager {
                     .then_some(*proc_id)
             })
             .collect::<Vec<_>>();
-        let count = proc_ids.len();
-        for proc_id in proc_ids {
+        let language_servers = language_server_ids.len();
+        for proc_id in language_server_ids {
             if let Some(entry) = self.processes.remove(&proc_id) {
                 terminate_process(entry);
             }
         }
-        count
+
+        let mcp_server_ids = self
+            .processes
+            .iter()
+            .filter_map(|(proc_id, entry)| {
+                (entry.owner_generation == generation
+                    && entry.disconnected
+                    && entry.kind == ProcessKind::McpServer)
+                    .then_some(*proc_id)
+            })
+            .collect::<Vec<_>>();
+        let has_running_agent = self
+            .processes
+            .values()
+            .any(|entry| entry.kind == ProcessKind::AcpAgent && !entry.task.is_finished());
+        let mcp_waiting_for_agent = has_running_agent && !mcp_server_ids.is_empty();
+        let mcp_servers = if has_running_agent {
+            0
+        } else {
+            let count = mcp_server_ids.len();
+            for proc_id in mcp_server_ids {
+                if let Some(entry) = self.processes.remove(&proc_id) {
+                    terminate_process(entry);
+                }
+            }
+            count
+        };
+
+        OrphanedProcessReap {
+            language_servers,
+            mcp_servers,
+            mcp_waiting_for_agent,
+        }
     }
 
     fn replace_disconnected_language_server(&mut self, identity: &ProcessIdentity) {
@@ -490,15 +546,16 @@ impl ProcessManager {
         }
     }
 
-    fn reattach_disconnected_agent(
+    fn reattach_disconnected_process(
         &mut self,
+        kind: ProcessKind,
         identity: &ProcessIdentity,
         owner_generation: u64,
     ) -> Option<u64> {
         let proc_id = self.processes.iter().find_map(|(proc_id, entry)| {
             (entry.disconnected
                 && !entry.task.is_finished()
-                && entry.kind == ProcessKind::AcpAgent
+                && entry.kind == kind
                 && entry.identity.as_ref() == Some(identity))
             .then_some(*proc_id)
         })?;
@@ -507,8 +564,9 @@ impl ProcessManager {
         entry.disconnected = false;
         tracing::info!(
             proc_id,
+            ?kind,
             cwd = %identity.cwd.display(),
-            "reattached disconnected ACP agent"
+            "reattached disconnected process"
         );
         Some(proc_id)
     }
@@ -1047,7 +1105,8 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{
-        AcpActivity, FrameRewriter, ProcessManager, rewrite_process_value, sanitize_lldb_frame,
+        AcpActivity, FrameRewriter, OrphanedProcessReap, ProcessManager, rewrite_process_value,
+        sanitize_lldb_frame,
     };
     use crate::fs_rpc::FsRpc;
 
@@ -1241,6 +1300,106 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn reload_reattaches_disconnected_mcp_server_by_id() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let fs = Arc::new(FsRpc::new(root.path().to_path_buf(), false)?);
+        let (outgoing, _notifications) = mpsc::unbounded_channel::<Message>();
+        let mut processes = ProcessManager::new(fs, outgoing);
+        let spawn = |proc_id, server_id| {
+            json!({
+                "proc_id": proc_id,
+                "program": "/bin/cat",
+                "cwd": "/workspace",
+                "env": [
+                    ["ZED_WEB_PROCESS_KIND", "mcp-server"],
+                    ["ZED_WEB_PROCESS_IDENTITY", server_id],
+                ],
+                "stdin_pipe": true,
+                "stdout_pipe": true,
+                "stderr_pipe": true,
+            })
+        };
+
+        processes
+            .dispatch("Process::spawn", &spawn(57, "filesystem"), 1)
+            .await?;
+        processes.detach_generation(1);
+        let response = processes
+            .dispatch("Process::spawn", &spawn(58, "filesystem"), 2)
+            .await?;
+
+        assert_eq!(response["proc_id"], 57);
+        assert!(processes.processes.contains_key(&57));
+        assert!(!processes.processes.contains_key(&58));
+
+        let response = processes
+            .dispatch("Process::spawn", &spawn(59, "another-server"), 2)
+            .await?;
+        assert_eq!(response["proc_id"], 59);
+        assert!(processes.processes.contains_key(&59));
+
+        processes
+            .dispatch("Process::kill", &json!({"proc_id": 57}), 2)
+            .await?;
+        processes
+            .dispatch("Process::kill", &json!({"proc_id": 59}), 2)
+            .await?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn orphan_reaper_keeps_mcp_until_acp_agent_stops() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let fs = Arc::new(FsRpc::new(root.path().to_path_buf(), false)?);
+        let (outgoing, _notifications) = mpsc::unbounded_channel::<Message>();
+        let mut processes = ProcessManager::new(fs, outgoing);
+
+        for (proc_id, kind) in [(60, "mcp-server"), (61, "acp-agent")] {
+            processes
+                .dispatch(
+                    "Process::spawn",
+                    &json!({
+                        "proc_id": proc_id,
+                        "program": "/bin/cat",
+                        "env": [["ZED_WEB_PROCESS_KIND", kind]],
+                        "stdin_pipe": true,
+                        "stdout_pipe": true,
+                        "stderr_pipe": true,
+                    }),
+                    1,
+                )
+                .await?;
+        }
+        processes.detach_generation(1);
+
+        assert_eq!(
+            processes.reap_orphaned_processes(1),
+            OrphanedProcessReap {
+                language_servers: 0,
+                mcp_servers: 0,
+                mcp_waiting_for_agent: true,
+            }
+        );
+        assert!(processes.processes.contains_key(&60));
+
+        processes
+            .dispatch("Process::kill", &json!({"proc_id": 61}), 1)
+            .await?;
+        assert_eq!(
+            processes.reap_orphaned_processes(1),
+            OrphanedProcessReap {
+                language_servers: 0,
+                mcp_servers: 1,
+                mcp_waiting_for_agent: false,
+            }
+        );
+        assert!(!processes.processes.contains_key(&60));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn reload_reattaches_agent_with_active_prompt() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let fs = Arc::new(FsRpc::new(root.path().to_path_buf(), false)?);
@@ -1343,12 +1502,26 @@ mod tests {
             .dispatch("Process::attach", &json!({"proc_ids": [61]}), 2)
             .await?;
 
-        assert_eq!(processes.reap_orphaned_language_servers(1), 0);
+        assert_eq!(
+            processes.reap_orphaned_processes(1),
+            OrphanedProcessReap {
+                language_servers: 0,
+                mcp_servers: 0,
+                mcp_waiting_for_agent: false,
+            }
+        );
         assert!(processes.processes.contains_key(&61));
         assert!(processes.processes.contains_key(&62));
 
         processes.detach_generation(2);
-        assert_eq!(processes.reap_orphaned_language_servers(2), 1);
+        assert_eq!(
+            processes.reap_orphaned_processes(2),
+            OrphanedProcessReap {
+                language_servers: 1,
+                mcp_servers: 0,
+                mcp_waiting_for_agent: false,
+            }
+        );
         assert!(!processes.processes.contains_key(&61));
         assert!(processes.processes.contains_key(&62));
         processes

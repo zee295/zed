@@ -14,7 +14,7 @@ use util::process::Child;
 use util::shell::Shell;
 use util::shell_builder::ShellBuilder;
 
-use crate::client::ModelContextServerBinary;
+use crate::client::{ContextServerId, ModelContextServerBinary};
 use crate::transport::Transport;
 
 pub struct StdioTransport {
@@ -25,7 +25,8 @@ pub struct StdioTransport {
 }
 
 impl StdioTransport {
-    pub fn new(
+    pub(crate) fn new(
+        _server_id: &ContextServerId,
         binary: ModelContextServerBinary,
         working_directory: &Option<PathBuf>,
         cx: &AsyncApp,
@@ -35,6 +36,11 @@ impl StdioTransport {
             builder.build_std_command(Some(binary.executable.display().to_string()), &binary.args);
 
         command.envs(binary.env.unwrap_or_default());
+        #[cfg(target_family = "wasm")]
+        {
+            command.env("ZED_WEB_PROCESS_KIND", "mcp-server");
+            command.env("ZED_WEB_PROCESS_IDENTITY", _server_id.0.as_ref());
+        }
 
         if let Some(working_directory) = working_directory {
             command.current_dir(working_directory);

@@ -1384,10 +1384,10 @@ fn init_app_state(
             .register_action(agent_ui::InlineAssistant::inline_assist);
     })
     .detach();
-    // Real settings GUI window (audio / edit-prediction / MCP pages are stubbed
-    // on wasm; everything else — General, Appearance, Editor, AI, Keymap, … — is
-    // the desktop settings_ui). Registered before web_user_menu so its
-    // OpenSettings/OpenSettingsPage handlers win over the JSON-file fallback.
+    // Real settings GUI window (audio and edit-prediction pages are stubbed on
+    // wasm; MCP uses the server-backed process and HTTP bridges). Registered
+    // before web_user_menu so its OpenSettings/OpenSettingsPage handlers win
+    // over the JSON-file fallback.
     settings_ui::init(cx);
     keymap_editor::init(cx);
     // Present the settings GUI as an in-window modal popup (the web build has a
@@ -1399,12 +1399,24 @@ fn init_app_state(
         log::info!("zed_web_workspace: registering settings popup actions on workspace");
         workspace
             .register_action(|workspace, _: &zed_actions::OpenSettings, window, cx| {
-                web_settings_modal::open_settings_popup(None, None, workspace, window, cx);
+                let original_window = window
+                    .window_handle()
+                    .downcast::<workspace::MultiWorkspace>();
+                web_settings_modal::open_settings_popup(
+                    original_window,
+                    None,
+                    workspace,
+                    window,
+                    cx,
+                );
             })
             .register_action(
                 |workspace, action: &zed_actions::OpenSettingsPage, window, cx| {
+                    let original_window = window
+                        .window_handle()
+                        .downcast::<workspace::MultiWorkspace>();
                     web_settings_modal::open_settings_popup(
-                        None,
+                        original_window,
                         Some(action.page.clone()),
                         workspace,
                         window,
@@ -1413,16 +1425,37 @@ fn init_app_state(
                 },
             )
             .register_action(|workspace, _: &zed_actions::OpenSettingsAt, window, cx| {
-                web_settings_modal::open_settings_popup(None, None, workspace, window, cx);
+                let original_window = window
+                    .window_handle()
+                    .downcast::<workspace::MultiWorkspace>();
+                web_settings_modal::open_settings_popup(
+                    original_window,
+                    None,
+                    workspace,
+                    window,
+                    cx,
+                );
             })
             .register_action(
                 |workspace, _: &zed_actions::OpenProjectSettings, window, cx| {
-                    web_settings_modal::open_settings_popup(None, None, workspace, window, cx);
+                    let original_window = window
+                        .window_handle()
+                        .downcast::<workspace::MultiWorkspace>();
+                    web_settings_modal::open_settings_popup(
+                        original_window,
+                        None,
+                        workspace,
+                        window,
+                        cx,
+                    );
                 },
             )
             .register_action(|workspace, _: &zed_actions::OpenKeymap, window, cx| {
+                let original_window = window
+                    .window_handle()
+                    .downcast::<workspace::MultiWorkspace>();
                 web_settings_modal::open_settings_popup(
-                    None,
+                    original_window,
                     Some("Keymap".to_string()),
                     workspace,
                     window,

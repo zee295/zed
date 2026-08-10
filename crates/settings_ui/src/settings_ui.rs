@@ -18,7 +18,9 @@ use gpui::{
 
 use language::Buffer;
 use platform_title_bar::PlatformTitleBar;
-use project::{Project, ProjectPath, Worktree, WorktreeId};
+use project::{
+    Project, ProjectPath, Worktree, WorktreeId, context_server_store::ContextServerStore,
+};
 use release_channel::ReleaseChannel;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -933,6 +935,7 @@ fn active_language_mut() -> Option<std::sync::RwLockWriteGuard<'static, Option<S
 pub struct SettingsWindow {
     title_bar: Option<Entity<PlatformTitleBar>>,
     original_window: Option<WindowHandle<MultiWorkspace>>,
+    pub(crate) context_server_store: Option<Entity<ContextServerStore>>,
     files: Vec<(SettingsUiFile, FocusHandle)>,
     worktree_root_dirs: HashMap<WorktreeId, String>,
     current_file: SettingsUiFile,
@@ -1778,6 +1781,10 @@ impl SettingsWindow {
         Self::new(original_window, window, cx)
     }
 
+    pub fn set_context_server_store(&mut self, store: Entity<ContextServerStore>) {
+        self.context_server_store = Some(store);
+    }
+
     pub fn open_page(&mut self, page: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.opening_link = false;
         self.search_bar.update(cx, |editor, cx| {
@@ -2003,6 +2010,7 @@ impl SettingsWindow {
         let mut this = Self {
             title_bar,
             original_window,
+            context_server_store: None,
 
             worktree_root_dirs: HashMap::default(),
             files: vec![],
@@ -5457,6 +5465,7 @@ pub mod test {
         let mut settings_window = SettingsWindow {
             title_bar: None,
             original_window: None,
+            context_server_store: None,
             worktree_root_dirs: HashMap::default(),
             files: Vec::default(),
             current_file: crate::SettingsUiFile::User,

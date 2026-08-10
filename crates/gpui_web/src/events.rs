@@ -640,14 +640,32 @@ fn clipboard_image_files(
     clipboard_data: &web_sys::DataTransfer,
 ) -> Vec<(web_sys::File, ImageFormat)> {
     let items = clipboard_data.items();
-    (0..items.length())
+    let image_files = (0..items.length())
         .filter_map(|index| {
             let item = items.get(index)?;
             if item.kind() != "file" {
                 return None;
             }
-            let format = ImageFormat::from_mime_type(&item.type_())?;
             let file = item.get_as_file().ok().flatten()?;
+            let format = ImageFormat::from_mime_type(&item.type_())
+                .or_else(|| ImageFormat::from_mime_type(&file.type_()))?;
+            Some((file, format))
+        })
+        .collect::<Vec<_>>();
+
+    if !image_files.is_empty() {
+        return image_files;
+    }
+
+    // Some browsers expose pasted screenshots only through `files`, or leave
+    // the DataTransferItem MIME type empty while retaining it on the File.
+    let Some(files) = clipboard_data.files() else {
+        return Vec::new();
+    };
+    (0..files.length())
+        .filter_map(|index| {
+            let file = files.item(index)?;
+            let format = ImageFormat::from_mime_type(&file.type_())?;
             Some((file, format))
         })
         .collect()

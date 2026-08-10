@@ -1,10 +1,14 @@
+#[cfg(not(target_family = "wasm"))]
 use std::sync::Arc;
 
 use collections::HashMap;
 use context_server::ContextServerId;
 use editor::Editor;
+#[cfg(not(target_family = "wasm"))]
 use extension_host::ExtensionStore;
-use gpui::{Action as _, Entity, Focusable as _, ScrollHandle, WeakEntity, prelude::*};
+#[cfg(not(target_family = "wasm"))]
+use gpui::Action as _;
+use gpui::{Entity, Focusable as _, ScrollHandle, WeakEntity, prelude::*};
 use project::context_server_store::{
     ContextServerConfiguration, ContextServerStatus, ContextServerStore,
 };
@@ -16,6 +20,7 @@ use ui::{
 };
 use util::ResultExt as _;
 
+#[cfg(not(target_family = "wasm"))]
 use zed_actions::ExtensionCategoryFilter;
 
 use crate::{PROJECT, SettingField, SettingItem, SettingsPageItem, SettingsWindow, USER};
@@ -27,6 +32,11 @@ pub(crate) fn render_mcp_servers_page(
     cx: &mut Context<SettingsWindow>,
 ) -> AnyElement {
     let context_server_store = get_context_server_store(settings_window, cx);
+    let connection_description = if cfg!(target_family = "wasm") {
+        "Stdio servers run on the Zed Web server; HTTP servers connect through its network proxy."
+    } else {
+        "Manage servers connected directly or via extensions."
+    };
 
     let server_list = if let Some(store) = context_server_store.as_ref() {
         let server_ids = store.read(cx).server_ids().to_vec();
@@ -56,7 +66,7 @@ pub(crate) fn render_mcp_servers_page(
                 .gap_2()
                 .child(
                     v_flex().child(Label::new("Configured Servers")).child(
-                        Label::new("Manage servers connected directly or via extensions.")
+                        Label::new(connection_description)
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                     ),
@@ -95,9 +105,13 @@ fn get_context_server_store(
     settings_window: &SettingsWindow,
     cx: &App,
 ) -> Option<Entity<ContextServerStore>> {
+    if let Some(store) = settings_window.context_server_store.as_ref() {
+        return Some(store.clone());
+    }
+
     let original_window = settings_window.original_window.as_ref()?;
     let multi_workspace = original_window.read(cx).ok()?;
-    let workspace = multi_workspace.workspaces().next()?;
+    let workspace = multi_workspace.workspace();
     let project = workspace.read(cx).project().clone();
     Some(project.read(cx).context_server_store())
 }
@@ -254,6 +268,7 @@ fn map_server_status(status: &ContextServerStatus) -> AiSettingItemStatus {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn resolve_extension_display_name(id: &ContextServerId, cx: &App) -> Option<SharedString> {
     ExtensionStore::global(cx)
         .read(cx)
@@ -269,6 +284,11 @@ fn resolve_extension_display_name(id: &ContextServerId, cx: &App) -> Option<Shar
                 .unwrap_or(name);
             SharedString::from(stripped.to_string())
         })
+}
+
+#[cfg(target_family = "wasm")]
+fn resolve_extension_display_name(_id: &ContextServerId, _cx: &App) -> Option<SharedString> {
+    None
 }
 
 fn render_configure_button(
@@ -528,6 +548,7 @@ pub(crate) fn render_add_server_popover(
     window: &mut Window,
     cx: &mut Context<SettingsWindow>,
 ) -> impl IntoElement {
+    #[cfg(not(target_family = "wasm"))]
     let original_window = settings_window.original_window;
     // Stable handle so the button keeps focus state across renders and can show a
     // focus ring even when the page is opened (and the button auto-focused) via a
@@ -562,7 +583,12 @@ pub(crate) fn render_add_server_popover(
             move |window, cx| {
                 let settings_window = settings_window.clone();
                 Some(ContextMenu::build(window, cx, move |menu, _window, _cx| {
-                    menu.entry("Add Local Server", None, {
+                    let stdio_label = if cfg!(target_family = "wasm") {
+                        "Add Server Process"
+                    } else {
+                        "Add Local Server"
+                    };
+                    let menu = menu.entry(stdio_label, None, {
                         let settings_window = settings_window.clone();
                         move |window, cx| {
                             settings_window
@@ -577,8 +603,8 @@ pub(crate) fn render_add_server_popover(
                                 })
                                 .log_err();
                         }
-                    })
-                    .entry("Add Remote Server", None, {
+                    });
+                    let menu = menu.entry("Add Remote Server", None, {
                         let settings_window = settings_window.clone();
                         move |window, cx| {
                             settings_window
@@ -593,9 +619,9 @@ pub(crate) fn render_add_server_popover(
                                 })
                                 .log_err();
                         }
-                    })
-                    .separator()
-                    .entry("Install from Extensions", None, {
+                    });
+                    #[cfg(not(target_family = "wasm"))]
+                    let menu = menu.separator().entry("Install from Extensions", None, {
                         move |_window, cx| {
                             if let Some(original_window) = original_window.as_ref() {
                                 cx.activate(true);
@@ -616,7 +642,8 @@ pub(crate) fn render_add_server_popover(
                                     .log_err();
                             }
                         }
-                    })
+                    });
+                    menu
                 }))
             }
         });
@@ -634,15 +661,7 @@ fn uninstall_server(
     cx: &mut App,
 ) {
     if provided_by_extension {
-        if let Some((ext_id, manifest)) =
-            resolve_extension_for_context_server(context_server_id, cx)
-        {
-            if extension_only_provides_context_server(&manifest) {
-                ExtensionStore::global(cx)
-                    .update(cx, |store, cx| store.uninstall_extension(ext_id, cx))
-                    .detach_and_log_err(cx);
-            }
-        }
+        uninstall_extension_context_server(context_server_id, cx);
     }
 
     let fs = <dyn fs::Fs>::global(cx);
@@ -655,6 +674,21 @@ fn uninstall_server(
     });
 }
 
+#[cfg(not(target_family = "wasm"))]
+fn uninstall_extension_context_server(context_server_id: &ContextServerId, cx: &mut App) {
+    if let Some((ext_id, manifest)) = resolve_extension_for_context_server(context_server_id, cx)
+        && extension_only_provides_context_server(&manifest)
+    {
+        ExtensionStore::global(cx)
+            .update(cx, |store, cx| store.uninstall_extension(ext_id, cx))
+            .detach_and_log_err(cx);
+    }
+}
+
+#[cfg(target_family = "wasm")]
+fn uninstall_extension_context_server(_context_server_id: &ContextServerId, _cx: &mut App) {}
+
+#[cfg(not(target_family = "wasm"))]
 fn resolve_extension_for_context_server(
     id: &ContextServerId,
     cx: &App,
@@ -667,6 +701,7 @@ fn resolve_extension_for_context_server(
         .map(|(id, entry)| (id.clone(), entry.manifest.clone()))
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn extension_only_provides_context_server(manifest: &extension::ExtensionManifest) -> bool {
     manifest.context_servers.len() == 1
         && manifest.themes.is_empty()
@@ -873,6 +908,7 @@ pub(crate) fn open_mcp_server_form(
         "Configure MCP Server"
     } else {
         match transport {
+            McpTransport::Stdio if cfg!(target_family = "wasm") => "Add MCP Server Process",
             McpTransport::Stdio => "Add Local MCP Server",
             McpTransport::Http => "Add Remote MCP Server",
         }
@@ -900,6 +936,11 @@ fn render_mcp_server_form_page(
     };
     let transport = form.transport;
     let error = form.error.clone();
+    let command_description = if cfg!(target_family = "wasm") {
+        "Required. Path to the executable on the Zed Web server."
+    } else {
+        "Required. Path to the executable that launches the server."
+    };
 
     let fields = v_flex()
         .w_full()
@@ -916,7 +957,7 @@ fn render_mcp_server_form_page(
                 .child(render_form_field(
                     settings_window,
                     "Command",
-                    "Required. Path to the executable that launches the server.",
+                    command_description,
                     &form.command,
                     cx,
                 ))
