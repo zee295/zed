@@ -620,26 +620,19 @@ pub(crate) fn render_add_server_popover(
                         let settings_window = settings_window.clone();
                         move |_window, cx| {
                             #[cfg(target_family = "wasm")]
-                            settings_window
-                                .update(cx, |_this, cx| cx.emit(DismissEvent))
-                                .log_err();
-                            if let Some(original_window) = original_window.as_ref() {
-                                cx.activate(true);
-                                original_window
-                                    .update(cx, |_, window, cx| {
-                                        window.activate_window();
-                                        window.dispatch_action(
-                                            zed_actions::Extensions {
-                                                category_filter: Some(
-                                                    ExtensionCategoryFilter::ContextServers,
-                                                ),
-                                                id: None,
-                                            }
-                                            .boxed_clone(),
-                                            cx,
-                                        );
-                                    })
+                            {
+                                settings_window
+                                    .update(cx, |_this, cx| cx.emit(DismissEvent))
                                     .log_err();
+                                if let Some(original_window) = original_window {
+                                    cx.defer(move |cx| {
+                                        open_context_server_extensions(original_window, cx);
+                                    });
+                                }
+                            }
+                            #[cfg(not(target_family = "wasm"))]
+                            if let Some(original_window) = original_window {
+                                open_context_server_extensions(original_window, cx);
                             }
                         }
                     });
@@ -653,6 +646,26 @@ pub(crate) fn render_add_server_popover(
         .border_1()
         .border_color(border_color)
         .child(popover)
+}
+
+fn open_context_server_extensions(
+    original_window: gpui::WindowHandle<workspace::MultiWorkspace>,
+    cx: &mut App,
+) {
+    cx.activate(true);
+    original_window
+        .update(cx, |_, window, cx| {
+            window.activate_window();
+            window.dispatch_action(
+                zed_actions::Extensions {
+                    category_filter: Some(ExtensionCategoryFilter::ContextServers),
+                    id: None,
+                }
+                .boxed_clone(),
+                cx,
+            );
+        })
+        .log_err();
 }
 
 fn uninstall_server(
