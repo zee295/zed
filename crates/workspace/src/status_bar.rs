@@ -3,8 +3,9 @@ use crate::{
     sidebar_side_context_menu,
 };
 use gpui::{
-    Anchor, AnyView, App, Context, Decorations, Entity, FocusHandle, Focusable, IntoElement,
-    ParentElement, Render, Role, SharedString, Styled, Subscription, WeakEntity, Window,
+    Anchor, AnyView, App, Context, Decorations, Entity, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, ParentElement, Render, Role, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, WeakEntity, Window,
 };
 use settings::{SettingsContent, update_settings_file};
 use std::{any::TypeId, sync::Arc};
@@ -100,6 +101,7 @@ impl SidebarStatus {
 pub struct StatusBar {
     left_items: Vec<Box<dyn StatusItemViewHandle>>,
     right_items: Vec<Box<dyn StatusItemViewHandle>>,
+    mobile_web_expanded: bool,
     active_pane: Entity<Pane>,
     multi_workspace: Option<WeakEntity<MultiWorkspace>>,
     focus_handle: FocusHandle,
@@ -115,6 +117,8 @@ impl Focusable for StatusBar {
 impl Render for StatusBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let sidebar = SidebarStatus::query(&self.multi_workspace, cx);
+        let mobile_web_viewport =
+            cfg!(target_family = "wasm") && window.viewport_size().width <= px(900.);
 
         h_flex()
             .id("status-bar")
@@ -181,8 +185,13 @@ impl Render for StatusBar {
                     .border_b(px(1.0))
                     .border_color(cx.theme().colors().status_bar_background),
             })
-            .child(self.render_left_tools(&sidebar, cx))
-            .child(self.render_right_tools(&sidebar, cx))
+            .when(mobile_web_viewport, |this| {
+                this.child(self.render_mobile_web_tools(&sidebar, cx))
+            })
+            .when(!mobile_web_viewport, |this| {
+                this.child(self.render_left_tools(&sidebar, cx))
+                    .child(self.render_right_tools(&sidebar, cx))
+            })
     }
 }
 
@@ -227,6 +236,77 @@ impl StatusBar {
                 sidebar.show_toggle && !sidebar.open && sidebar.side == SidebarSide::Right,
                 |this| this.child(self.render_sidebar_toggle(sidebar, cx)),
             )
+    }
+
+    fn render_mobile_web_tools(
+        &self,
+        sidebar: &SidebarStatus,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let expanded = self.mobile_web_expanded;
+        let toggle = IconButton::new("toggle-mobile-status-bar", IconName::Ellipsis)
+            .icon_size(IconSize::Small)
+            .tab_index(0isize)
+            .toggle_state(expanded)
+            .aria_label(if expanded {
+                "Hide status bar buttons"
+            } else {
+                "Show status bar buttons"
+            })
+            .tooltip(Tooltip::text(if expanded {
+                "Hide Status Bar Buttons"
+            } else {
+                "Show Status Bar Buttons"
+            }))
+            .on_click(cx.listener(|status_bar, _, _, cx| {
+                status_bar.mobile_web_expanded = !status_bar.mobile_web_expanded;
+                cx.notify();
+            }));
+
+        h_flex()
+            .w_full()
+            .min_w_0()
+            .gap_1()
+            .child(toggle)
+            .when(expanded, |this| {
+                this.child(
+                    h_flex()
+                        .id("mobile-status-bar-buttons")
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1()
+                        .overflow_x_scroll()
+                        .when(
+                            sidebar.show_toggle
+                                && !sidebar.open
+                                && sidebar.side == SidebarSide::Left,
+                            |this| this.child(self.render_sidebar_toggle(sidebar, cx)),
+                        )
+                        .children(self.left_items.iter().enumerate().map(|(index, item)| {
+                            render_hideable_item("status-bar-mobile-left", index, item.as_ref(), cx)
+                        }))
+                        .children(
+                            self.right_items
+                                .iter()
+                                .enumerate()
+                                .rev()
+                                .map(|(index, item)| {
+                                    render_hideable_item(
+                                        "status-bar-mobile-right",
+                                        index,
+                                        item.as_ref(),
+                                        cx,
+                                    )
+                                }),
+                        )
+                        .when(
+                            sidebar.show_toggle
+                                && !sidebar.open
+                                && sidebar.side == SidebarSide::Right,
+                            |this| this.child(self.render_sidebar_toggle(sidebar, cx)),
+                        ),
+                )
+            })
     }
 
     fn render_sidebar_toggle(
@@ -333,6 +413,7 @@ impl StatusBar {
         let mut this = Self {
             left_items: Default::default(),
             right_items: Default::default(),
+            mobile_web_expanded: false,
             active_pane: active_pane.clone(),
             multi_workspace,
             focus_handle: cx.focus_handle(),

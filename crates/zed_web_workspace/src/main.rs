@@ -49,9 +49,6 @@ mod web_settings_modal;
 mod web_quick_action_bar;
 
 #[cfg(target_family = "wasm")]
-mod mobile_workspace_nav;
-
-#[cfg(target_family = "wasm")]
 use wasm_bindgen::prelude::*;
 
 #[cfg(target_family = "wasm")]
@@ -128,11 +125,6 @@ struct WebWorkspaceUiState {
     active_workspace_id: Option<String>,
     #[serde(default)]
     workspaces: Vec<WebHostedWorkspace>,
-}
-
-#[cfg(target_family = "wasm")]
-fn is_mobile_web_viewport(window: &Window) -> bool {
-    window.viewport_size().width <= px(900.)
 }
 
 #[cfg(target_family = "wasm")]
@@ -1685,26 +1677,19 @@ fn install_workspace_chrome(cx: &mut App) {
         });
 
         workspace.status_bar().update(cx, |status_bar, cx| {
-            if is_mobile_web_viewport(window) {
-                let mobile_nav = cx.new(|_| {
-                    mobile_workspace_nav::MobileWorkspaceNav::new(workspace_handle.downgrade())
-                });
-                status_bar.add_left_item(mobile_nav, window, cx);
-            } else {
-                status_bar.add_left_item(search_button, window, cx);
-                status_bar.add_left_item(lsp_button, window, cx);
-                status_bar.add_left_item(diagnostic_summary, window, cx);
-                status_bar.add_left_item(active_file_name, window, cx);
-                status_bar.add_left_item(git_blame_status, window, cx);
-                status_bar.add_left_item(merge_conflict_indicator, window, cx);
-                status_bar.add_left_item(activity_indicator, window, cx);
-                status_bar.add_right_item(edit_prediction_button, window, cx);
-                status_bar.add_right_item(active_buffer_encoding, window, cx);
-                status_bar.add_right_item(active_buffer_language, window, cx);
-                status_bar.add_right_item(active_toolchain, window, cx);
-                status_bar.add_right_item(line_ending_indicator, window, cx);
-                status_bar.add_right_item(cursor_position, window, cx);
-            }
+            status_bar.add_left_item(search_button, window, cx);
+            status_bar.add_left_item(lsp_button, window, cx);
+            status_bar.add_left_item(diagnostic_summary, window, cx);
+            status_bar.add_left_item(active_file_name, window, cx);
+            status_bar.add_left_item(git_blame_status, window, cx);
+            status_bar.add_left_item(merge_conflict_indicator, window, cx);
+            status_bar.add_left_item(activity_indicator, window, cx);
+            status_bar.add_right_item(edit_prediction_button, window, cx);
+            status_bar.add_right_item(active_buffer_encoding, window, cx);
+            status_bar.add_right_item(active_buffer_language, window, cx);
+            status_bar.add_right_item(active_toolchain, window, cx);
+            status_bar.add_right_item(line_ending_indicator, window, cx);
+            status_bar.add_right_item(cursor_position, window, cx);
         });
 
         let panels_started = Arc::new(AtomicBool::new(false));
