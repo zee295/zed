@@ -89,6 +89,15 @@ pub(crate) struct ClickState {
     current_count: usize,
 }
 
+pub(crate) struct TouchPointerState {
+    pointer_id: i32,
+    start_position: Point<Pixels>,
+    last_position: Point<Pixels>,
+    scrolling: bool,
+}
+
+const TOUCH_SCROLL_THRESHOLD: f32 = 6.0;
+
 impl Default for ClickState {
     fn default() -> Self {
         Self {
@@ -122,6 +131,7 @@ impl WebWindowInner {
         let mut handles = vec![
             self.register_pointer_down(),
             self.register_pointer_up(),
+            self.register_pointer_cancel(),
             self.register_pointer_move(),
             self.register_pointer_leave(),
             self.register_wheel(),
@@ -189,7 +199,6 @@ impl WebWindowInner {
         self.listen("pointerdown", move |event: JsValue| {
             let event: web_sys::PointerEvent = event.unchecked_into();
             event.prevent_default();
-            this.input_element.focus().ok();
 
             // Capture the pointer so drags that leave the canvas keep
             // delivering pointermove/pointerup here; otherwise a release
@@ -200,6 +209,21 @@ impl WebWindowInner {
             let button = dom_mouse_button_to_gpui(event.button());
             let position = pointer_position_in_element(&event);
             let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
+
+            if event.pointer_type() == "touch" {
+                this.active_touch.replace(Some(TouchPointerState {
+                    pointer_id: event.pointer_id(),
+                    start_position: position,
+                    last_position: position,
+                    scrolling: false,
+                }));
+                let mut current_state = this.state.borrow_mut();
+                current_state.mouse_position = position;
+                current_state.modifiers = modifiers;
+                return;
+            }
+
+            this.input_element.focus().ok();
             let time = js_sys::Date::now();
 
             this.pressed_button.set(Some(button));
@@ -231,6 +255,54 @@ impl WebWindowInner {
             let position = pointer_position_in_element(&event);
             let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
 
+            if event.pointer_type() == "touch" {
+                let Some(touch) = this.active_touch.take() else {
+                    return;
+                };
+                if touch.pointer_id != event.pointer_id() {
+                    this.active_touch.replace(Some(touch));
+                    return;
+                }
+
+                {
+                    let mut current_state = this.state.borrow_mut();
+                    current_state.mouse_position = position;
+                    current_state.modifiers = modifiers;
+                }
+
+                if touch.scrolling {
+                    this.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        position,
+                        delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
+                        modifiers,
+                        touch_phase: TouchPhase::Ended,
+                    }));
+                } else {
+                    // Delay the synthetic click until pointerup so a drag can
+                    // become a scroll gesture without first selecting text.
+                    this.input_element.focus().ok();
+                    let button = MouseButton::Left;
+                    let click_count = this
+                        .click_state
+                        .borrow_mut()
+                        .register_click(position, js_sys::Date::now());
+                    this.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
+                        button,
+                        position,
+                        modifiers,
+                        click_count,
+                        first_mouse: false,
+                    }));
+                    this.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
+                        button,
+                        position,
+                        modifiers,
+                        click_count,
+                    }));
+                }
+                return;
+            }
+
             this.pressed_button.set(None);
             let click_count = this.click_state.borrow().current_count;
 
@@ -249,6 +321,30 @@ impl WebWindowInner {
         })
     }
 
+    fn register_pointer_cancel(self: &Rc<Self>) -> EventListenerHandle {
+        let this = Rc::clone(self);
+        self.listen("pointercancel", move |event: JsValue| {
+            let event: web_sys::PointerEvent = event.unchecked_into();
+            let Some(touch) = this.active_touch.take() else {
+                return;
+            };
+            if touch.pointer_id != event.pointer_id() {
+                this.active_touch.replace(Some(touch));
+                return;
+            }
+
+            this.canvas.release_pointer_capture(event.pointer_id()).ok();
+            if touch.scrolling {
+                this.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                    position: touch.last_position,
+                    delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
+                    modifiers: Modifiers::default(),
+                    touch_phase: TouchPhase::Cancelled,
+                }));
+            }
+        })
+    }
+
     fn register_pointer_move(self: &Rc<Self>) -> EventListenerHandle {
         let this = Rc::clone(self);
         self.listen("pointermove", move |event: JsValue| {
@@ -257,6 +353,51 @@ impl WebWindowInner {
 
             let position = pointer_position_in_element(&event);
             let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
+
+            if event.pointer_type() == "touch" {
+                let mut active_touch = this.active_touch.borrow_mut();
+                let Some(touch) = active_touch.as_mut() else {
+                    return;
+                };
+                if touch.pointer_id != event.pointer_id() {
+                    return;
+                }
+
+                let total_x = f32::from(position.x - touch.start_position.x);
+                let total_y = f32::from(position.y - touch.start_position.y);
+                let distance = total_x.hypot(total_y);
+                if !touch.scrolling && distance < TOUCH_SCROLL_THRESHOLD {
+                    touch.last_position = position;
+                    return;
+                }
+
+                let touch_phase = if touch.scrolling {
+                    TouchPhase::Moved
+                } else {
+                    touch.scrolling = true;
+                    TouchPhase::Started
+                };
+                let delta = point(
+                    position.x - touch.last_position.x,
+                    position.y - touch.last_position.y,
+                );
+                touch.last_position = position;
+                drop(active_touch);
+
+                {
+                    let mut current_state = this.state.borrow_mut();
+                    current_state.mouse_position = position;
+                    current_state.modifiers = modifiers;
+                }
+                this.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Pixels(delta),
+                    modifiers,
+                    touch_phase,
+                }));
+                return;
+            }
+
             let current_pressed = this.pressed_button.get();
 
             {
