@@ -17002,6 +17002,7 @@ dependencies = [
  "editor",
  "extension",
  "extension_host",
+ "extensions_ui",
  "feature_flags",
  "fs",
  "futures 0.3.32",

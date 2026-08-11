@@ -76,6 +76,9 @@ edit_prediction.workspace = true
 edit_prediction_ui.workspace = true
 extension_host.workspace = true
 
+[target.'cfg(target_family = "wasm")'.dependencies]
+extensions_ui.workspace = true
+
 [dev-dependencies]
 fs = { workspace = true, features = ["test-support"] }
 futures.workspace = true

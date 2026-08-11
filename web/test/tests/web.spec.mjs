@@ -102,11 +102,14 @@ test("accepts pasted images exposed only through clipboard files", async ({
   const page = await context.newPage();
   await openWorkspace(page, baseURL);
 
-  const pasteWasHandled = await page.evaluate(() => {
+  const pasteResult = await page.evaluate(async () => {
     const input = document.querySelector("input");
     const transfer = new DataTransfer();
+    const png = Uint8Array.from(atob(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAF/gL+XhN4WQAAAABJRU5ErkJggg==",
+    ), (character) => character.charCodeAt(0));
     transfer.items.add(
-      new File([new Uint8Array([1, 2, 3])], "screenshot.png", {
+      new File([png], "screenshot.png", {
         type: "image/png",
       }),
     );
@@ -120,10 +123,17 @@ test("accepts pasted images exposed only through clipboard files", async ({
       },
     });
     input.dispatchEvent(event);
-    return event.defaultPrevented;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    return {
+      defaultPrevented: event.defaultPrevented,
+      rpcState: self.__zedRpcConnectionState,
+    };
   });
 
-  expect(pasteWasHandled).toBe(true);
+  expect(pasteResult).toEqual({
+    defaultPrevented: true,
+    rpcState: "open",
+  });
   await context.close();
 });
 

@@ -5378,6 +5378,46 @@ mod tests {
         }));
     }
 
+    #[gpui::test]
+    async fn test_paste_clipboard_image_inserts_image_mention(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (message_editor, editor, mut cx) = setup_paste_test_message_editor(json!({}), cx).await;
+
+        message_editor.update(&mut cx, |message_editor, _cx| {
+            message_editor
+                .session_capabilities
+                .write()
+                .set_prompt_capabilities(acp::PromptCapabilities::new().image(true));
+        });
+
+        let bytes = base64::prelude::BASE64_STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+            .expect("decode png");
+        cx.write_to_clipboard(ClipboardItem::from(gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            bytes,
+        )));
+        message_editor.update_in(&mut cx, |message_editor, window, cx| {
+            message_editor.paste(&Paste, window, cx);
+        });
+        cx.run_until_parked();
+
+        let expected_uri = MentionUri::PastedImage {
+            name: "Image".to_string(),
+        }
+        .to_uri()
+        .to_string();
+        editor.update(&mut cx, |editor, cx| {
+            assert_eq!(editor.text(cx), format!("[@Image]({expected_uri}) "));
+        });
+
+        let contents = mention_contents(&message_editor, &mut cx).await;
+        assert!(matches!(
+            contents.as_slice(),
+            [(MentionUri::PastedImage { .. }, Mention::Image(_))]
+        ));
+    }
+
     async fn setup_paste_test_message_editor(
         project_tree: Value,
         cx: &mut TestAppContext,

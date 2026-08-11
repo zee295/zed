@@ -1,4 +1,3 @@
-#[cfg(not(target_family = "wasm"))]
 use std::sync::Arc;
 
 use collections::HashMap;
@@ -6,8 +5,9 @@ use context_server::ContextServerId;
 use editor::Editor;
 #[cfg(not(target_family = "wasm"))]
 use extension_host::ExtensionStore;
-#[cfg(not(target_family = "wasm"))]
 use gpui::Action as _;
+#[cfg(target_family = "wasm")]
+use gpui::DismissEvent;
 use gpui::{Entity, Focusable as _, ScrollHandle, WeakEntity, prelude::*};
 use project::context_server_store::{
     ContextServerConfiguration, ContextServerStatus, ContextServerStore,
@@ -20,8 +20,10 @@ use ui::{
 };
 use util::ResultExt as _;
 
-#[cfg(not(target_family = "wasm"))]
 use zed_actions::ExtensionCategoryFilter;
+
+#[cfg(target_family = "wasm")]
+use extensions_ui::ExtensionStore;
 
 use crate::{PROJECT, SettingField, SettingItem, SettingsPageItem, SettingsWindow, USER};
 
@@ -268,7 +270,6 @@ fn map_server_status(status: &ContextServerStatus) -> AiSettingItemStatus {
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
 fn resolve_extension_display_name(id: &ContextServerId, cx: &App) -> Option<SharedString> {
     ExtensionStore::global(cx)
         .read(cx)
@@ -284,11 +285,6 @@ fn resolve_extension_display_name(id: &ContextServerId, cx: &App) -> Option<Shar
                 .unwrap_or(name);
             SharedString::from(stripped.to_string())
         })
-}
-
-#[cfg(target_family = "wasm")]
-fn resolve_extension_display_name(_id: &ContextServerId, _cx: &App) -> Option<SharedString> {
-    None
 }
 
 fn render_configure_button(
@@ -548,7 +544,6 @@ pub(crate) fn render_add_server_popover(
     window: &mut Window,
     cx: &mut Context<SettingsWindow>,
 ) -> impl IntoElement {
-    #[cfg(not(target_family = "wasm"))]
     let original_window = settings_window.original_window;
     // Stable handle so the button keeps focus state across renders and can show a
     // focus ring even when the page is opened (and the button auto-focused) via a
@@ -620,9 +615,14 @@ pub(crate) fn render_add_server_popover(
                                 .log_err();
                         }
                     });
-                    #[cfg(not(target_family = "wasm"))]
                     let menu = menu.separator().entry("Install from Extensions", None, {
+                        #[cfg(target_family = "wasm")]
+                        let settings_window = settings_window.clone();
                         move |_window, cx| {
+                            #[cfg(target_family = "wasm")]
+                            settings_window
+                                .update(cx, |_this, cx| cx.emit(DismissEvent))
+                                .log_err();
                             if let Some(original_window) = original_window.as_ref() {
                                 cx.activate(true);
                                 original_window
@@ -674,7 +674,6 @@ fn uninstall_server(
     });
 }
 
-#[cfg(not(target_family = "wasm"))]
 fn uninstall_extension_context_server(context_server_id: &ContextServerId, cx: &mut App) {
     if let Some((ext_id, manifest)) = resolve_extension_for_context_server(context_server_id, cx)
         && extension_only_provides_context_server(&manifest)
@@ -685,10 +684,6 @@ fn uninstall_extension_context_server(context_server_id: &ContextServerId, cx: &
     }
 }
 
-#[cfg(target_family = "wasm")]
-fn uninstall_extension_context_server(_context_server_id: &ContextServerId, _cx: &mut App) {}
-
-#[cfg(not(target_family = "wasm"))]
 fn resolve_extension_for_context_server(
     id: &ContextServerId,
     cx: &App,
@@ -701,7 +696,6 @@ fn resolve_extension_for_context_server(
         .map(|(id, entry)| (id.clone(), entry.manifest.clone()))
 }
 
-#[cfg(not(target_family = "wasm"))]
 fn extension_only_provides_context_server(manifest: &extension::ExtensionManifest) -> bool {
     manifest.context_servers.len() == 1
         && manifest.themes.is_empty()

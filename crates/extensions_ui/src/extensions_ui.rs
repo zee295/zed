@@ -3,11 +3,13 @@ mod extension_suggest;
 mod extension_version_selector;
 mod store;
 
+pub use store::{ExtensionManifest, ExtensionStore};
+
 use std::sync::OnceLock;
 use std::time::Duration;
 use std::{any::TypeId, ops::Range, sync::Arc};
 
-use crate::store::{ExtensionManifest, ExtensionOperation, ExtensionStore};
+use crate::store::ExtensionOperation;
 use anyhow::Context as _;
 use cloud_api_types::{ExtensionMetadata, ExtensionProvides};
 use collections::{BTreeMap, BTreeSet};

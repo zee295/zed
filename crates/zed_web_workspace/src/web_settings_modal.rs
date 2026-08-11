@@ -5,7 +5,8 @@
 //! full settings window renders as an in-window popup over the workspace.
 
 use gpui::{
-    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render, Window,
+    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render, Subscription,
+    Window,
 };
 use settings_ui::SettingsWindow;
 use ui::{Tooltip, prelude::*};
@@ -15,13 +16,18 @@ use workspace::{DismissDecision, ModalView, Workspace};
 pub struct SettingsModal {
     settings: Entity<SettingsWindow>,
     focus_handle: FocusHandle,
+    _dismiss_subscription: Subscription,
 }
 
 impl SettingsModal {
     pub fn new(settings: Entity<SettingsWindow>, cx: &mut Context<Self>) -> Self {
+        let dismiss_subscription = cx.subscribe(&settings, |_this, _, _: &DismissEvent, cx| {
+            cx.emit(DismissEvent);
+        });
         Self {
             settings,
             focus_handle: cx.focus_handle(),
+            _dismiss_subscription: dismiss_subscription,
         }
     }
 }
