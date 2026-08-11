@@ -374,13 +374,32 @@ impl ContextServerStore {
         matches!(self.state, ContextServerStoreState::Remote { .. })
     }
 
-    /// Returns all configured context server ids, excluding the ones that are disabled
-    pub fn configured_server_ids(&self) -> Vec<ContextServerId> {
-        self.context_server_settings
+    /// Returns all configured context server ids, excluding the ones that are disabled.
+    /// Extension-provided servers are enabled by default even without a settings entry.
+    pub fn configured_server_ids(&self, cx: &App) -> Vec<ContextServerId> {
+        let mut configured_ids = self
+            .context_server_settings
             .iter()
             .filter(|(_, entry)| entry.settings.enabled())
-            .map(|(id, _)| ContextServerId(id.clone()))
-            .collect()
+            .map(|(id, _)| id.clone())
+            .collect::<HashSet<_>>();
+
+        for (id, _) in self.registry.read(cx).context_server_descriptors() {
+            let explicitly_disabled = self
+                .context_server_settings
+                .get(&id)
+                .is_some_and(|entry| !entry.settings.enabled());
+            if !explicitly_disabled {
+                configured_ids.insert(id);
+            }
+        }
+
+        let mut configured_ids = configured_ids
+            .into_iter()
+            .map(ContextServerId)
+            .collect::<Vec<_>>();
+        configured_ids.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        configured_ids
     }
 
     #[cfg(feature = "test-support")]

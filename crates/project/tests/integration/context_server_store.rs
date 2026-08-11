@@ -1647,7 +1647,7 @@ async fn test_multi_worktree_context_server_settings(cx: &mut TestAppContext) {
 
     // Only server-a should be configured
     cx.update(|cx| {
-        let configured = store.read(cx).configured_server_ids();
+        let configured = store.read(cx).configured_server_ids(cx);
         assert!(
             configured.contains(&server_a_id),
             "server-a should be configured from project_a"
@@ -1670,7 +1670,7 @@ async fn test_multi_worktree_context_server_settings(cx: &mut TestAppContext) {
 
     // Both servers should now be configured
     cx.update(|cx| {
-        let configured = store.read(cx).configured_server_ids();
+        let configured = store.read(cx).configured_server_ids(cx);
         assert!(
             configured.contains(&server_a_id),
             "server-a should still be configured from project_a"
@@ -1741,7 +1741,7 @@ async fn test_multi_worktree_duplicate_server_first_wins(cx: &mut TestAppContext
 
     // The server should appear exactly once
     cx.update(|cx| {
-        let configured = store.read(cx).configured_server_ids();
+        let configured = store.read(cx).configured_server_ids(cx);
         let count = configured
             .iter()
             .filter(|id| id.0.as_ref() == SHARED_SERVER)
@@ -1833,6 +1833,12 @@ async fn test_is_server_enabled(cx: &mut TestAppContext) {
         assert!(!store.is_server_enabled(&server_2_id, cx));
         assert!(store.is_server_enabled(&server_3_id, cx));
         assert!(!store.is_server_enabled(&server_4_id, cx));
+
+        let configured = store.configured_server_ids(cx);
+        assert!(configured.contains(&server_1_id));
+        assert!(!configured.contains(&server_2_id));
+        assert!(configured.contains(&server_3_id));
+        assert!(!configured.contains(&server_4_id));
     })
 }
 
