@@ -21,7 +21,7 @@ docker run -d \
   --restart unless-stopped \
   -p 8090:8090 \
   -v "$PWD/workspace:/workspace" \
-  zee295/zed-web:1.13.0-web.18
+  ghcr.io/zee295/zed-web:latest
 docker exec zed-web sh -c \
   'until test -s /workspace/.zed/web-auth-token; do sleep 1; done; cat /workspace/.zed/web-auth-token'
 ```

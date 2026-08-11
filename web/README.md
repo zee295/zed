@@ -16,7 +16,7 @@ and multi-user presence are outside its scope.
 
 ## Run The Published Image
 
-Run the Docker Hub image directly:
+Run the latest tested multi-architecture image directly:
 
 ```sh
 mkdir -p workspace
@@ -25,7 +25,7 @@ docker run -d \
   --restart unless-stopped \
   -p 8090:8090 \
   -v "$PWD/workspace:/workspace" \
-  zee295/zed-web:1.13.0-web.18
+  ghcr.io/zee295/zed-web:latest
 docker exec zed-web sh -c \
   'until test -s /workspace/.zed/web-auth-token; do sleep 1; done; cat /workspace/.zed/web-auth-token'
 ```
@@ -44,7 +44,7 @@ The same tested multi-architecture release is mirrored to Docker Hub after each
 successful build. To use that registry instead, set:
 
 ```sh
-ZED_WEB_IMAGE=docker.io/zee295/zed-web:1.13.0-web.18 \
+ZED_WEB_IMAGE=docker.io/zee295/zed-web:latest \
 ZED_WORKSPACE="$PWD/workspace" \
 docker compose -f web/compose.yml up -d
 ```
@@ -100,7 +100,7 @@ docker run -d \
   -e ZED_WEB_TOKEN='replace-with-a-long-secret' \
   -e ZED_WEB_RESTRICT_PATHS=true \
   -e ZED_WEB_SECURE_COOKIE=false \
-  zee295/zed-web:1.13.0-web.18
+  ghcr.io/zee295/zed-web:latest
 ```
 
 The one image contains:
@@ -111,6 +111,23 @@ The one image contains:
 - Node.js 22 with npm and npx for extensions and ACP agents
 - compressed fonts, icons, themes, prompts, images, and sounds
 - Git, SSH, Node/npm, shells, and terminal runtime dependencies
+
+## MCP Servers
+
+The image includes the server-side MCP runtime, but it does not preconfigure a
+specific MCP package. In Zed Web, open **Settings > AI > MCP Servers** and add a
+server process. For example, use `npx` as the command with these arguments:
+
+```text
+-y
+@modelcontextprotocol/server-filesystem
+/workspace
+```
+
+The command runs inside the container and its configuration persists in the
+mounted workspace. Browser reloads reattach to the same MCP process. When the
+browser disconnects during an ACP session, the MCP process remains available
+until that agent stops, after which the orphaned process is cleaned up.
 
 Local model requests are performed by the Rust server, not by the browser. If
 the model server runs on the Docker host, point the relevant endpoint at
@@ -123,7 +140,7 @@ docker run -d \
   -p 8090:8090 \
   -v "$PWD/workspace:/workspace" \
   -e ZED_WEB_OLLAMA_URL=http://host.docker.internal:11434 \
-  zee295/zed-web:1.13.0-web.18
+  ghcr.io/zee295/zed-web:latest
 ```
 
 For Compose, set the same variable in the shell; `web/compose.yml` already adds
