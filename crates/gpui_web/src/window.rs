@@ -497,7 +497,7 @@ impl WebWindowInner {
             |callback| {
                 callback(RequestFrameOptions {
                     require_presentation: false,
-                    force_render: false,
+                    force_render: true,
                 })
             },
         );
