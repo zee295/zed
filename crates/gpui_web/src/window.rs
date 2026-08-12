@@ -113,6 +113,9 @@ impl WebWindow {
         style
             .set_property("touch-action", "none")
             .map_err(|e| anyhow::anyhow!("Failed to set touch-action style: {e:?}"))?;
+        style
+            .set_property("-webkit-tap-highlight-color", "transparent")
+            .map_err(|e| anyhow::anyhow!("Failed to disable canvas tap highlight: {e:?}"))?;
 
         let body = document
             .body()
