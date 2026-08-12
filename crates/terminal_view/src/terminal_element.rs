@@ -1892,6 +1892,10 @@ impl InputHandler for TerminalInputHandler {
         Some(bounds)
     }
 
+    fn element_bounds(&mut self, _window: &mut Window, cx: &mut App) -> Option<Bounds<Pixels>> {
+        Some(self.terminal_view.read(cx).terminal_bounds(cx).bounds)
+    }
+
     fn apple_press_and_hold_enabled(&mut self) -> bool {
         false
     }
