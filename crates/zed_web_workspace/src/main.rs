@@ -1111,8 +1111,14 @@ fn web_default_settings() -> String {
             },
             "use_system_path_prompts": false,
             "use_system_prompts": false,
+            "agent": {
+                "dock": "left"
+            },
+            "collaboration_panel": {
+                "dock": "right"
+            },
             "project_panel": {
-                "dock": "left",
+                "dock": "right",
                 "auto_fold_dirs": false,
                 "default_width": 280,
                 "button": true
@@ -1123,7 +1129,7 @@ fn web_default_settings() -> String {
                 "button": true
             },
             "git_panel": {
-                "dock": "left",
+                "dock": "right",
                 "button": true
             },
             "terminal": {
@@ -1768,7 +1774,7 @@ impl WebTitleBar {
 impl gpui::Render for WebTitleBar {
     fn render(
         &mut self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) -> impl gpui::IntoElement {
         use ui::{PopoverMenu, prelude::*};
@@ -1838,6 +1844,7 @@ impl gpui::Render for WebTitleBar {
             );
         // Layout matches desktop Linux/Windows title bar:
         // [ File Edit View … ] [▾ project] path          Zed Web  [▾ user menu]
+        let compact = window.viewport_size().width <= px(600.);
         let user_menu = web_user_menu::render_user_menu_button(workspace, cx);
         let children: Vec<gpui::AnyElement> = vec![
             h_flex()
@@ -1847,30 +1854,35 @@ impl gpui::Render for WebTitleBar {
                 .child(self.menu_bar.clone())
                 .child(div().mx_1().w(px(1.)).h_3().bg(cx.theme().colors().border))
                 .child(project_switcher)
-                .child(
-                    Label::new(if path_hint.is_empty() {
-                        "remote".to_string()
-                    } else {
-                        path_hint
-                    })
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-                )
+                .when(!compact, |title_bar| {
+                    title_bar.child(
+                        Label::new(if path_hint.is_empty() {
+                            "remote".to_string()
+                        } else {
+                            path_hint
+                        })
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                })
                 .into_any_element(),
             div().flex_1().into_any_element(),
             h_flex()
                 .gap_2()
                 .items_center()
-                .child(
-                    Label::new("Zed Web")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
+                .when(!compact, |title_bar| {
+                    title_bar.child(
+                        Label::new("Zed Web")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                })
                 .child(user_menu)
                 .into_any_element(),
         ];
 
         self.platform.update(cx, |bar, _cx| {
+            bar.set_left_padding(!compact);
             bar.set_children(children);
         });
 
@@ -2004,12 +2016,7 @@ fn load_core_panels(
                 cx.clone(),
                 "terminal"
             ),
-            add_panel_when_ready(
-                agent_panel,
-                workspace_handle.clone(),
-                cx.clone(),
-                "agent"
-            ),
+            add_panel_when_ready(agent_panel, workspace_handle.clone(), cx.clone(), "agent"),
         );
 
         if [

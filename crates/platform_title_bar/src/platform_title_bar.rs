@@ -33,6 +33,7 @@ pub struct PlatformTitleBar {
     system_window_tabs: Entity<SystemWindowTabs>,
     button_layout: Option<WindowButtonLayout>,
     multi_workspace: Option<WeakEntity<MultiWorkspace>>,
+    left_padding: bool,
 }
 
 impl PlatformTitleBar {
@@ -48,6 +49,7 @@ impl PlatformTitleBar {
             system_window_tabs,
             button_layout: None,
             multi_workspace: None,
+            left_padding: true,
         }
     }
 
@@ -81,6 +83,10 @@ impl PlatformTitleBar {
 
     pub fn set_button_layout(&mut self, button_layout: Option<WindowButtonLayout>) {
         self.button_layout = button_layout;
+    }
+
+    pub fn set_left_padding(&mut self, left_padding: bool) {
+        self.left_padding = left_padding;
     }
 
     fn effective_button_layout(
@@ -240,7 +246,9 @@ impl Render for PlatformTitleBar {
             .map(|this| {
                 let show_left_controls = !(sidebar.open && sidebar.side == SidebarSide::Left);
 
-                if window.is_fullscreen() {
+                if !self.left_padding {
+                    this
+                } else if window.is_fullscreen() {
                     this.pl_2()
                 } else if self.platform_style == PlatformStyle::Mac && show_left_controls {
                     this.pl(px(TRAFFIC_LIGHT_PADDING))

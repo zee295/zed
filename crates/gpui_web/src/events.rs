@@ -184,7 +184,7 @@ impl WebWindowInner {
         self.with_callback(|callbacks| &mut callbacks.input, |callback| callback(input))
     }
 
-    fn update_active_status(&self, active: bool) {
+    pub(crate) fn update_active_status(&self, active: bool) {
         let changed = {
             let mut state = self.state.borrow_mut();
             let changed = state.is_active != active;

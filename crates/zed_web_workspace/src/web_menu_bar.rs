@@ -8,7 +8,10 @@ use gpui::{
     SharedString, Window, div,
 };
 use smallvec::SmallVec;
-use ui::{Button, ButtonStyle, ContextMenu, LabelSize, PopoverMenu, PopoverMenuHandle, prelude::*};
+use ui::{
+    Button, ButtonStyle, ContextMenu, IconButton, IconSize, LabelSize, PopoverMenu,
+    PopoverMenuHandle, Tooltip, prelude::*,
+};
 
 #[derive(Clone)]
 struct MenuEntry {
@@ -19,6 +22,7 @@ struct MenuEntry {
 /// Horizontal menu bar: File · Edit · Selection · View · Go · …
 pub struct WebMenuBar {
     entries: SmallVec<[MenuEntry; 8]>,
+    compact_handle: PopoverMenuHandle<ContextMenu>,
 }
 
 impl WebMenuBar {
@@ -32,6 +36,7 @@ impl WebMenuBar {
                     handle: PopoverMenuHandle::default(),
                 })
                 .collect(),
+            compact_handle: PopoverMenuHandle::default(),
         }
     }
 
@@ -74,39 +79,50 @@ impl WebMenuBar {
     ) -> Entity<ContextMenu> {
         ContextMenu::build(window, cx, |menu, window, cx| {
             let menu = menu.when_some(window.focused(cx), |menu, focused| menu.context(focused));
-            let sanitized_items = Self::sanitize_menu_items(entry.menu.items);
-
-            sanitized_items
-                .into_iter()
-                .fold(menu, |menu, item| match item {
-                    OwnedMenuItem::Separator => menu.separator(),
-                    OwnedMenuItem::Action {
-                        name,
-                        action,
-                        checked,
-                        disabled,
-                        ..
-                    } => menu.action_checked_with_disabled(name, action, checked, disabled),
-                    OwnedMenuItem::Submenu(submenu) => {
-                        submenu
-                            .items
-                            .into_iter()
-                            .fold(menu, |menu, item| match item {
-                                OwnedMenuItem::Separator => menu.separator(),
-                                OwnedMenuItem::Action {
-                                    name,
-                                    action,
-                                    checked,
-                                    disabled,
-                                    ..
-                                } => menu
-                                    .action_checked_with_disabled(name, action, checked, disabled),
-                                OwnedMenuItem::Submenu(_) | OwnedMenuItem::SystemMenu(_) => menu,
-                            })
-                    }
-                    OwnedMenuItem::SystemMenu(_) => menu,
-                })
+            Self::populate_menu(menu, entry.menu.items)
         })
+    }
+
+    fn populate_menu(menu: ContextMenu, items: Vec<OwnedMenuItem>) -> ContextMenu {
+        Self::sanitize_menu_items(items)
+            .into_iter()
+            .fold(menu, |menu, item| match item {
+                OwnedMenuItem::Separator => menu.separator(),
+                OwnedMenuItem::Action {
+                    name,
+                    action,
+                    checked,
+                    disabled,
+                    ..
+                } => menu.action_checked_with_disabled(name, action, checked, disabled),
+                OwnedMenuItem::Submenu(submenu) => Self::populate_menu(menu, submenu.items),
+                OwnedMenuItem::SystemMenu(_) => menu,
+            })
+    }
+
+    fn render_compact_menu(&self) -> impl IntoElement {
+        let entries = self.entries.clone();
+
+        PopoverMenu::new("compact-application-menu")
+            .menu(move |window, cx| {
+                Some(ContextMenu::build(window, cx, |menu, _, _| {
+                    entries.iter().fold(menu, |menu, entry| {
+                        let entry = entry.clone();
+                        menu.submenu(entry.menu.name.clone(), move |menu, _, _| {
+                            Self::populate_menu(menu, entry.menu.items.clone())
+                        })
+                    })
+                }))
+            })
+            .trigger_with_tooltip(
+                IconButton::new("compact-application-menu-trigger", IconName::Menu)
+                    .style(ButtonStyle::Subtle)
+                    .icon_size(IconSize::Small)
+                    .tab_index(0isize)
+                    .aria_label("Application menu"),
+                Tooltip::text("Application menu"),
+            )
+            .with_handle(self.compact_handle.clone())
     }
 
     fn render_standard_menu(&self, entry: &MenuEntry) -> impl IntoElement {
@@ -154,17 +170,22 @@ impl WebMenuBar {
 }
 
 impl Render for WebMenuBar {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let compact = window.viewport_size().width <= px(600.);
+
         div()
             .key_context("ApplicationMenu")
             .flex()
             .flex_row()
             .items_center()
             .gap_x_0p5()
-            .children(
-                self.entries
-                    .iter()
-                    .map(|entry| self.render_standard_menu(entry)),
-            )
+            .when(compact, |menu| menu.child(self.render_compact_menu()))
+            .when(!compact, |menu| {
+                menu.children(
+                    self.entries
+                        .iter()
+                        .map(|entry| self.render_standard_menu(entry)),
+                )
+            })
     }
 }

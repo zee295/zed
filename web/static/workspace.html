@@ -11,6 +11,7 @@
             height: 100%;
             height: 100dvh;
             overflow: hidden;
+            -webkit-tap-highlight-color: transparent;
             background: #11111b;
             color: #cdd6f4;
             font-family: system-ui, sans-serif;
@@ -24,6 +25,11 @@
         canvas {
             display: block;
             overscroll-behavior: none;
+            outline: none;
+            -webkit-tap-highlight-color: transparent;
+            -webkit-touch-callout: none;
+            -webkit-user-select: none;
+            user-select: none;
         }
         #boot {
             position: absolute;

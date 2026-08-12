@@ -116,6 +116,15 @@ impl WebWindow {
         style
             .set_property("-webkit-tap-highlight-color", "transparent")
             .map_err(|e| anyhow::anyhow!("Failed to disable canvas tap highlight: {e:?}"))?;
+        style
+            .set_property("-webkit-touch-callout", "none")
+            .map_err(|e| anyhow::anyhow!("Failed to disable canvas touch callout: {e:?}"))?;
+        style
+            .set_property("-webkit-user-select", "none")
+            .map_err(|e| anyhow::anyhow!("Failed to disable canvas text selection: {e:?}"))?;
+        style
+            .set_property("user-select", "none")
+            .map_err(|e| anyhow::anyhow!("Failed to disable canvas text selection: {e:?}"))?;
 
         let body = document
             .body()
@@ -504,7 +513,8 @@ impl WebWindowInner {
         if accepts_touch_input {
             self.input_element.focus().ok();
         } else {
-            self.canvas.focus().ok();
+            self.input_element.blur().ok();
+            self.update_active_status(true);
         }
     }
 
