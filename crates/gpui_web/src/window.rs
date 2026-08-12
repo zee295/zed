@@ -477,6 +477,34 @@ impl WebWindowInner {
         Some(result)
     }
 
+    pub(crate) fn update_touch_input_focus(&self, position: Point<Pixels>) {
+        // A tap can synchronously move GPUI focus. Draw the invalidated frame now so
+        // the platform input handler below represents the control that was tapped.
+        self.with_callback(
+            |callbacks| &mut callbacks.request_frame,
+            |callback| {
+                callback(RequestFrameOptions {
+                    require_presentation: false,
+                    force_render: false,
+                })
+            },
+        );
+
+        let accepts_touch_input = self
+            .with_input_handler(|handler| {
+                handler
+                    .element_bounds()
+                    .is_some_and(|bounds| bounds.contains(&position))
+            })
+            .unwrap_or(false);
+
+        if accepts_touch_input {
+            self.input_element.focus().ok();
+        } else {
+            self.canvas.focus().ok();
+        }
+    }
+
     pub(crate) fn register_appearance_change(self: &Rc<Self>) -> Option<EventListenerHandle> {
         let mql = self
             .browser_window

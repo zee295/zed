@@ -2107,20 +2107,12 @@ impl Render for MultiWorkspace {
         let multi_workspace_enabled = self.multi_workspace_enabled(cx);
         let sidebar_side = self.sidebar_side(cx);
         let sidebar_on_right = sidebar_side == SidebarSide::Right;
-        let mobile_web_viewport =
-            cfg!(target_family = "wasm") && window.viewport_size().width <= px(900.);
 
         let sidebar: Option<AnyElement> = if multi_workspace_enabled && self.sidebar_open() {
             self.sidebar.as_ref().map(|sidebar_handle| {
                 let weak = cx.weak_entity();
 
-                let configured_width = sidebar_handle.width(cx);
-                let sidebar_width =
-                    if mobile_web_viewport && configured_width > window.viewport_size().width {
-                        window.viewport_size().width
-                    } else {
-                        configured_width
-                    };
+                let sidebar_width = sidebar_handle.width(cx);
                 let resize_handle = deferred(
                     div()
                         .id("sidebar-resize-handle")
@@ -2168,23 +2160,15 @@ impl Render for MultiWorkspace {
                     .h_full()
                     .w(sidebar_width)
                     .flex_shrink_0()
-                    .when(mobile_web_viewport, |this| {
-                        this.absolute()
-                            .top_0()
-                            .bottom_0()
-                            .when(sidebar_on_right, |this| this.right_0())
-                            .when(!sidebar_on_right, |this| this.left_0())
-                            .occlude()
-                    })
                     .child(sidebar_handle.to_any())
-                    .when(!mobile_web_viewport, |this| this.child(resize_handle))
+                    .child(resize_handle)
                     .into_any_element()
             })
         } else {
             None
         };
 
-        let (left_sidebar, right_sidebar) = if mobile_web_viewport || sidebar_on_right {
+        let (left_sidebar, right_sidebar) = if sidebar_on_right {
             (None, sidebar)
         } else {
             (sidebar, None)

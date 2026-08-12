@@ -145,6 +145,7 @@ impl WebWindowInner {
             self.register_composition_update(),
             self.register_composition_end(),
             self.register_focus(),
+            self.register_canvas_focus(),
             self.register_blur(),
             self.register_pointer_enter(),
         ];
@@ -183,6 +184,21 @@ impl WebWindowInner {
         self.with_callback(|callbacks| &mut callbacks.input, |callback| callback(input))
     }
 
+    fn update_active_status(&self, active: bool) {
+        let changed = {
+            let mut state = self.state.borrow_mut();
+            let changed = state.is_active != active;
+            state.is_active = active;
+            changed
+        };
+        if changed {
+            self.with_callback(
+                |callbacks| &mut callbacks.active_status_change,
+                |callback| callback(active),
+            );
+        }
+    }
+
     /// Records the latest modifier state and reports whether it changed, so
     /// that `ModifiersChanged` is only dispatched on actual transitions
     /// rather than for every key event.
@@ -211,6 +227,7 @@ impl WebWindowInner {
             let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
 
             if event.pointer_type() == "touch" {
+                this.update_active_status(true);
                 this.active_touch.replace(Some(TouchPointerState {
                     pointer_id: event.pointer_id(),
                     start_position: position,
@@ -280,7 +297,6 @@ impl WebWindowInner {
                 } else {
                     // Delay the synthetic click until pointerup so a drag can
                     // become a scroll gesture without first selecting text.
-                    this.input_element.focus().ok();
                     let button = MouseButton::Left;
                     let click_count = this
                         .click_state
@@ -299,6 +315,7 @@ impl WebWindowInner {
                         modifiers,
                         click_count,
                     }));
+                    this.update_touch_input_focus(position);
                 }
                 return;
             }
@@ -737,28 +754,21 @@ impl WebWindowInner {
     fn register_focus(self: &Rc<Self>) -> EventListenerHandle {
         let this = Rc::clone(self);
         self.listen_input("focus", move |_event: JsValue| {
-            {
-                let mut state = this.state.borrow_mut();
-                state.is_active = true;
-            }
-            this.with_callback(
-                |callbacks| &mut callbacks.active_status_change,
-                |callback| callback(true),
-            );
+            this.update_active_status(true);
+        })
+    }
+
+    fn register_canvas_focus(self: &Rc<Self>) -> EventListenerHandle {
+        let this = Rc::clone(self);
+        self.listen("focus", move |_event: JsValue| {
+            this.update_active_status(true);
         })
     }
 
     fn register_blur(self: &Rc<Self>) -> EventListenerHandle {
         let this = Rc::clone(self);
         self.listen_input("blur", move |_event: JsValue| {
-            {
-                let mut state = this.state.borrow_mut();
-                state.is_active = false;
-            }
-            this.with_callback(
-                |callbacks| &mut callbacks.active_status_change,
-                |callback| callback(false),
-            );
+            this.update_active_status(false);
         })
     }
 
