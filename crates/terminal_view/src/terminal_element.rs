@@ -1628,6 +1628,7 @@ impl Element for TerminalElement {
             let terminal_input_handler = TerminalInputHandler {
                 terminal_view: self.terminal_view.clone(),
                 cursor_bounds: layout.ime_cursor_bounds.map(|bounds| bounds + origin),
+                element_bounds: bounds,
                 workspace: self.workspace.clone(),
             };
 
@@ -1792,6 +1793,7 @@ struct TerminalInputHandler {
     terminal_view: Entity<TerminalView>,
     workspace: WeakEntity<Workspace>,
     cursor_bounds: Option<Bounds<Pixels>>,
+    element_bounds: Bounds<Pixels>,
 }
 
 impl InputHandler for TerminalInputHandler {
@@ -1892,8 +1894,8 @@ impl InputHandler for TerminalInputHandler {
         Some(bounds)
     }
 
-    fn element_bounds(&mut self, _window: &mut Window, cx: &mut App) -> Option<Bounds<Pixels>> {
-        Some(self.terminal_view.read(cx).terminal_bounds(cx).bounds)
+    fn element_bounds(&mut self, _window: &mut Window, _cx: &mut App) -> Option<Bounds<Pixels>> {
+        Some(self.element_bounds)
     }
 
     fn apple_press_and_hold_enabled(&mut self) -> bool {
