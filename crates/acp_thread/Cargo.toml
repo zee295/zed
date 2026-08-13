@@ -39,6 +39,7 @@ mime.workspace = true
 parking_lot = { workspace = true, optional = true }
 image.workspace = true
 project.workspace = true
+sandbox.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
@@ -55,10 +56,9 @@ watch.workspace = true
 web-time.workspace = true
 urlencoding.workspace = true
 
-# portable-pty / sandbox need host OS (errno, nix) — not available on browser wasm.
+# portable-pty needs host OS process support.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 portable-pty.workspace = true
-sandbox.workspace = true
 
 [dev-dependencies]
 env_logger.workspace = true

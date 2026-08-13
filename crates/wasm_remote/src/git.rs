@@ -318,8 +318,11 @@ impl GitRepository for RemoteGitRepository {
         let client = self.client.clone();
         let repo_path = self.repo_path.clone();
         let (kind, base, head) = match request {
-            DiffTreeType::MergeBase { base, head } => ("merge_base", base, head),
-            DiffTreeType::Since { base, head } => ("since", base, head),
+            DiffTreeType::MergeBase { base, head } => ("merge_base", base, Some(head)),
+            DiffTreeType::MergeBaseWithWorktree { base } => {
+                ("merge_base_with_worktree", base, None)
+            }
+            DiffTreeType::Since { base, head } => ("since", base, Some(head)),
         };
         async move {
             let raw: String = client

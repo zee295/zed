@@ -21,7 +21,7 @@ use cloud_llm_client::{
     ZED_VERSION_HEADER_NAME,
 };
 use collections::{HashMap, HashSet};
-use copilot::{Copilot, Reinstall, SignIn, SignOut};
+use copilot::{Copilot, Reinstall};
 use credentials_provider::CredentialsProvider;
 use db::kvp::{Dismissable, KeyValueStore};
 use edit_prediction_context::{RelatedExcerptStore, RelatedExcerptStoreEvent, RelatedFile};
@@ -71,7 +71,7 @@ use std::time::Duration;
 use web_time::Instant;
 
 use thiserror::Error;
-use util::ResultExt as _;
+use util::{ResultExt as _, rel_path::RelPath};
 
 pub mod cursor_excerpt;
 pub mod data_collection;
@@ -84,6 +84,7 @@ pub mod ollama;
 mod onboarding_modal;
 pub mod open_ai_response;
 mod prediction;
+pub mod sweep_prompt;
 
 pub mod udiff;
 
@@ -139,6 +140,10 @@ pub struct EditPredictionJumpsFeatureFlag;
 impl FeatureFlag for EditPredictionJumpsFeatureFlag {
     const NAME: &'static str = "edit_prediction_jumps";
     type Value = PresenceFlag;
+
+    fn enabled_for_staff() -> bool {
+        false
+    }
 }
 register_feature_flag!(EditPredictionJumpsFeatureFlag);
 
@@ -189,6 +194,7 @@ pub(crate) struct EditPredictionRejectionPayload {
 pub enum EditPredictionModel {
     Zeta,
     Fim { format: EditPredictionPromptFormat },
+    SweepPrompt,
     Mercury,
 }
 
@@ -198,6 +204,7 @@ pub struct EditPredictionModelInput {
     snapshot: BufferSnapshot,
     position: Anchor,
     events: Vec<Arc<zeta_prompt::Event>>,
+    stored_events: Vec<StoredEvent>,
     related_files: Vec<RelatedFile>,
     editable_context: Option<Task<anyhow::Result<Vec<RelatedFile>>>>,
     mode: PredictEditsMode,
@@ -905,11 +912,14 @@ pub(crate) fn buffer_path_with_id_fallback(
     snapshot: &TextBufferSnapshot,
     cx: &App,
 ) -> Arc<Path> {
-    if let Some(file) = file {
-        file.full_path(cx).into()
-    } else {
-        Path::new(&format!("untitled-{}", snapshot.remote_id())).into()
-    }
+    let Some(file) = file else {
+        return Path::new(&format!("untitled-{}", snapshot.remote_id())).into();
+    };
+    let full_path = file.full_path(cx);
+    let Some(path) = RelPath::new(&full_path, file.path_style(cx)).ok() else {
+        return Path::new(&format!("untitled-{}", snapshot.remote_id())).into();
+    };
+    path.as_std_path().into()
 }
 
 fn predict_edits_request_trigger_from_editor_trigger(
@@ -1185,7 +1195,7 @@ impl EditPredictionStore {
                     .with_down(IconName::ZedPredictDown)
                     .with_error(IconName::ZedPredictError)
             }
-            EditPredictionModel::Fim { .. } => {
+            EditPredictionModel::Fim { .. } | EditPredictionModel::SweepPrompt => {
                 let settings = &all_language_settings(None, cx).edit_predictions;
                 match settings.provider {
                     EditPredictionProvider::Ollama => {
@@ -1870,7 +1880,7 @@ impl EditPredictionStore {
                     zeta::edit_prediction_accepted(self, current_prediction, cx)
                 }
             }
-            EditPredictionModel::Fim { .. } => {}
+            EditPredictionModel::Fim { .. } | EditPredictionModel::SweepPrompt => {}
         }
     }
 
@@ -2281,7 +2291,7 @@ impl EditPredictionStore {
                     cx,
                 );
             }
-            EditPredictionModel::Fim { .. } => {}
+            EditPredictionModel::SweepPrompt | EditPredictionModel::Fim { .. } => {}
         }
     }
 
@@ -2850,6 +2860,7 @@ impl EditPredictionStore {
             snapshot,
             position,
             events,
+            stored_events: stored_events.clone(),
             related_files,
             editable_context,
             mode,
@@ -2895,6 +2906,7 @@ impl EditPredictionStore {
                 )
             }
             EditPredictionModel::Fim { format } => fim::request_prediction(inputs, format, cx),
+            EditPredictionModel::SweepPrompt => sweep_prompt::request_prediction(inputs, cx),
             EditPredictionModel::Mercury => {
                 self.mercury
                     .request_prediction(inputs, self.credentials_provider.clone(), cx)
@@ -3538,19 +3550,9 @@ pub fn init(cx: &mut App) {
             })
         }
 
-        workspace.register_action(|workspace, _: &SignIn, window, cx| {
-            if let Some(copilot) = copilot_for_project(workspace.project(), cx) {
-                copilot_ui::initiate_sign_in(copilot, window, cx);
-            }
-        });
         workspace.register_action(|workspace, _: &Reinstall, window, cx| {
             if let Some(copilot) = copilot_for_project(workspace.project(), cx) {
                 copilot_ui::reinstall_and_sign_in(copilot, window, cx);
-            }
-        });
-        workspace.register_action(|workspace, _: &SignOut, window, cx| {
-            if let Some(copilot) = copilot_for_project(workspace.project(), cx) {
-                copilot_ui::initiate_sign_out(copilot, window, cx);
             }
         });
     })

@@ -1237,15 +1237,8 @@ fn init_app_state(
     let languages = Arc::new(languages);
 
     let clock: Arc<dyn clock::SystemClock> = Arc::new(RealSystemClock);
-    // Browser JS handles are local to one wasm-bindgen worker instance. Keep
-    // fetch promises on the main thread even when a provider starts its HTTP
-    // future on GPUI's background executor; only plain Rust data crosses the
-    // worker boundary.
-    let fetch = gpui_web::FetchHttpClient::new_with_main_thread_dispatcher(
-        cx.background_executor().dispatcher().clone(),
-    );
     let proxy_http = Arc::new(web_proxy_http::ProxyHttpClient::new(
-        Arc::new(fetch),
+        cx.http_client(),
         &server_origin,
     ));
     cx.set_http_client(proxy_http.clone());

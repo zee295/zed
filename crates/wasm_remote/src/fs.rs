@@ -730,6 +730,10 @@ impl Fs for RemoteFs {
         rx
     }
 
+    fn original_path_for_trash_id(&self, _: TrashId) -> Option<std::path::PathBuf> {
+        None
+    }
+
     async fn restore(
         &self,
         item: TrashId,

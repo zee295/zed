@@ -18,9 +18,9 @@ use git::{
     status::{FileStatus, StatusCode, TrackedStatus},
 };
 use gpui::{
-    Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, DefiniteLength, DismissEvent,
-    DragMoveEvent, ElementId, Empty, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
-    MouseButton, MouseDownEvent, PathBuilder, Pixels, Point, ScrollHandle, ScrollStrategy,
+    Action, Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, DefiniteLength,
+    DismissEvent, DragMoveEvent, ElementId, Empty, Entity, EventEmitter, FocusHandle, Focusable,
+    Hsla, MouseButton, MouseDownEvent, PathBuilder, Pixels, Point, ScrollHandle, ScrollStrategy,
     ScrollWheelEvent, SharedString, Subscription, Task, TextStyleRefinement,
     UniformListScrollHandle, WeakEntity, Window, actions, anchored, deferred, point, prelude::*,
     px, uniform_list,
@@ -36,11 +36,9 @@ use project::{
         RepositoryEvent, RepositoryId,
     },
 };
-use search::{
-    SearchOption, SearchOptions, SearchSource, SelectNextMatch, SelectPreviousMatch,
-    ToggleCaseSensitive, buffer_search,
-};
 use smallvec::{SmallVec, smallvec};
+#[cfg(not(target_family = "wasm"))]
+use std::time::Instant;
 use std::{
     cell::Cell,
     ops::Range,
@@ -48,7 +46,12 @@ use std::{
     sync::{Arc, OnceLock},
     time::Duration,
 };
+#[cfg(target_family = "wasm")]
 use web_time::Instant;
+use zed_actions::{
+    buffer_search,
+    search::{SelectNextMatch, SelectPreviousMatch, ToggleCaseSensitive},
+};
 
 use theme::AccentColors;
 use time::{OffsetDateTime, format_description::BorrowedFormatItem};
@@ -2543,14 +2546,6 @@ impl GitGraph {
             .focus_handle(cx)
             .tab_index(1)
             .tab_stop(true);
-        let search_options = {
-            let mut options = SearchOptions::NONE;
-            options.set(
-                SearchOptions::CASE_SENSITIVE,
-                self.search_state.case_sensitive,
-            );
-            options
-        };
 
         h_flex()
             .key_context("GitGraphSearchBar")
@@ -2576,11 +2571,29 @@ impl GitGraph {
                     .bg(color.toolbar_background)
                     .on_action(cx.listener(Self::confirm_search))
                     .child(self.search_state.editor.clone())
-                    .child(SearchOption::CaseSensitive.as_button(
-                        search_options,
-                        SearchSource::Buffer,
-                        query_focus_handle,
-                    )),
+                    .child({
+                        let focus_handle = query_focus_handle.clone();
+                        IconButton::new("git-graph-search-case-sensitive", IconName::CaseSensitive)
+                            .shape(ui::IconButtonShape::Square)
+                            .toggle_state(self.search_state.case_sensitive)
+                            .on_click({
+                                let focus_handle = query_focus_handle.clone();
+                                move |_, window, cx| {
+                                    if !focus_handle.is_focused(window) {
+                                        window.focus(&focus_handle, cx);
+                                    }
+                                    window.dispatch_action(ToggleCaseSensitive.boxed_clone(), cx);
+                                }
+                            })
+                            .tooltip(move |_window, cx| {
+                                Tooltip::for_action_in(
+                                    "Match Case Sensitivity",
+                                    &ToggleCaseSensitive,
+                                    &focus_handle,
+                                    cx,
+                                )
+                            })
+                    }),
             )
             .child(
                 h_flex()
@@ -2973,7 +2986,7 @@ impl GitGraph {
                             })
                             .when_some(remote.clone(), |this, remote| {
                                 let provider_name = remote.host.name();
-                                let icon = crate::get_provider_icon(provider_name.as_str());
+                                let icon = ui::git_hosting_provider_icon(provider_name.as_str());
                                 let parsed_remote = ParsedGitRemote {
                                     owner: remote.owner.as_ref().into(),
                                     repo: remote.repo.as_ref().into(),

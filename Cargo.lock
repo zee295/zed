@@ -493,7 +493,7 @@ dependencies = [
  "futures 0.3.32",
  "fuzzy",
  "git",
- "git_ui",
+ "git_ui_core",
  "gpui",
  "gpui_tokio",
  "heapless",
@@ -2420,7 +2420,7 @@ version = "3.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "89ec27229c38ed0eb3c0feee3d2c1d6a4379ae44f418a29a658890e062d8f365"
 dependencies = [
- "darling 0.20.11",
+ "darling 0.23.0",
  "ident_case",
  "prettyplease",
  "proc-macro2",
@@ -2713,6 +2713,7 @@ dependencies = [
  "postage",
  "project",
  "serde",
+ "serde_json",
  "settings",
  "telemetry",
  "util",
@@ -3541,6 +3542,7 @@ dependencies = [
  "serde_json",
  "settings",
  "smallvec",
+ "smol",
  "telemetry",
  "theme",
  "theme_settings",
@@ -3902,18 +3904,15 @@ dependencies = [
  "anthropic",
  "anyhow",
  "collections",
- "dirs",
- "fs",
+ "credentials_provider",
  "futures 0.3.32",
  "gpui",
  "http_client",
+ "language_model",
  "log",
- "paths",
  "serde",
  "serde_json",
- "settings",
- "sqlez",
- "tempfile",
+ "util",
 ]
 
 [[package]]
@@ -3922,6 +3921,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "copilot",
+ "copilot_chat",
  "gpui",
  "language",
  "log",
@@ -5323,7 +5323,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6135,7 +6135,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6488,6 +6488,7 @@ dependencies = [
  "cloud_api_types",
  "collections",
  "command_palette_hooks",
+ "component",
  "context_server",
  "dap",
  "db",
@@ -6497,6 +6498,7 @@ dependencies = [
  "fs",
  "futures 0.3.32",
  "fuzzy",
+ "git",
  "gpui",
  "language",
  "language_model",
@@ -6700,7 +6702,6 @@ dependencies = [
  "picker_preview",
  "pretty_assertions",
  "project",
- "project_panel",
  "remote_connection",
  "serde",
  "serde_json",
@@ -7229,8 +7230,9 @@ name = "fuzzy"
 version = "0.1.0"
 dependencies = [
  "gpui",
+ "gpui_util",
  "log",
- "util",
+ "path",
 ]
 
 [[package]]
@@ -7240,8 +7242,9 @@ dependencies = [
  "criterion",
  "fuzzy",
  "gpui",
+ "gpui_util",
  "nucleo",
- "util",
+ "path",
 ]
 
 [[package]]
@@ -7408,7 +7411,7 @@ dependencies = [
  "gobject-sys",
  "libc",
  "system-deps",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7493,6 +7496,7 @@ dependencies = [
  "fuzzy",
  "fuzzy_nucleo",
  "git",
+ "git_ui_core",
  "gpui",
  "indoc",
  "itertools 0.14.0",
@@ -7537,6 +7541,49 @@ dependencies = [
  "watch",
  "web-time",
  "windows 0.61.3",
+ "workspace",
+ "zed_actions",
+ "zeroize",
+ "zlog",
+ "ztracing",
+]
+
+[[package]]
+name = "git_ui_core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "askpass",
+ "buffer_diff",
+ "collections",
+ "db",
+ "editor",
+ "fs",
+ "futures 0.3.32",
+ "fuzzy",
+ "git",
+ "gpui",
+ "language",
+ "log",
+ "menu",
+ "notifications",
+ "picker",
+ "project",
+ "proto",
+ "rand 0.9.4",
+ "remote",
+ "remote_connection",
+ "serde",
+ "serde_json",
+ "settings",
+ "task",
+ "terminal",
+ "theme",
+ "theme_settings",
+ "ui",
+ "unindent",
+ "util",
+ "watch",
  "workspace",
  "zed_actions",
  "zeroize",
@@ -8114,7 +8161,7 @@ dependencies = [
  "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm_thread",
+ "wasm_thread 0.3.3 (git+https://github.com/zed-industries/wasm_thread?rev=0cf96c7708dfb97ccf3da50347e25edcf75d6937)",
  "web-sys",
  "web-time",
 ]
@@ -8134,6 +8181,7 @@ dependencies = [
  "itertools 0.14.0",
  "js-sys",
  "log",
+ "naga",
  "parking_lot",
  "pollster 0.4.0",
  "profiling",
@@ -8888,7 +8936,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.56.0",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -9084,6 +9132,7 @@ dependencies = [
  "db",
  "editor",
  "file_icons",
+ "fs",
  "gpui",
  "language",
  "log",
@@ -9091,6 +9140,7 @@ dependencies = [
  "project",
  "serde",
  "settings",
+ "theme",
  "theme_settings",
  "ui",
  "util",
@@ -9954,7 +10004,6 @@ dependencies = [
  "collections",
  "component",
  "convert_case 0.11.0",
- "copilot",
  "copilot_chat",
  "copilot_ui",
  "credentials_provider",
@@ -9977,10 +10026,10 @@ dependencies = [
  "log",
  "menu",
  "mistral",
- "oauth_callback_server",
  "ollama",
  "open_ai",
  "open_router",
+ "openai_subscribed",
  "opencode",
  "parking_lot",
  "pretty_assertions",
@@ -9990,13 +10039,10 @@ dependencies = [
  "serde",
  "serde_json",
  "settings",
- "sha2",
- "smol",
  "strum 0.27.2",
  "tokio",
  "ui",
  "ui_input",
- "url",
  "util",
  "x_ai",
 ]
@@ -11363,7 +11409,7 @@ version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "536bfad37a309d62069485248eeaba1e8d9853aaf951caaeaed0585a95346f08"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11802,7 +11848,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -12529,7 +12575,6 @@ dependencies = [
  "gpui",
  "picker",
  "project",
- "project_panel",
  "schemars 1.0.4",
  "serde",
  "serde_json",
@@ -12555,6 +12600,30 @@ dependencies = [
  "settings",
  "strum 0.27.2",
  "thiserror 2.0.17",
+]
+
+[[package]]
+name = "openai_subscribed"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "credentials_provider",
+ "futures 0.3.32",
+ "gpui",
+ "http_client",
+ "language_model",
+ "log",
+ "oauth_callback_server",
+ "open_ai",
+ "parking_lot",
+ "rand 0.9.4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "smol",
+ "url",
+ "util",
 ]
 
 [[package]]
@@ -14311,16 +14380,17 @@ dependencies = [
  "collections",
  "criterion",
  "editor",
- "feature_flags",
  "file_icons",
  "fs",
  "futures 0.3.32",
  "git",
  "git_ui",
+ "git_ui_core",
  "gpui",
  "itertools 0.14.0",
  "language",
  "log",
+ "markdown",
  "markdown_preview",
  "menu",
  "notifications",
@@ -14329,7 +14399,6 @@ dependencies = [
  "rayon",
  "remote_connection",
  "schemars 1.0.4",
- "search",
  "serde",
  "serde_json",
  "settings",
@@ -14502,7 +14571,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22505a5c94da8e3b7c2996394d1c933236c4d743e81a410bcca4e6989fc066a4"
 dependencies = [
  "bytes 1.11.1",
- "heck 0.4.1",
+ "heck 0.5.0",
  "itertools 0.11.0",
  "log",
  "multimap",
@@ -16012,7 +16081,7 @@ dependencies = [
  "errno 0.3.14",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -16243,6 +16312,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures 0.3.32",
+ "gpui",
  "http_proxy",
  "libc",
  "log",
@@ -16252,6 +16322,7 @@ dependencies = [
  "serde_json",
  "smol",
  "tempfile",
+ "windows-registry 0.6.1",
 ]
 
 [[package]]
@@ -17158,7 +17229,7 @@ dependencies = [
  "feature_flags",
  "fs",
  "git",
- "git_ui",
+ "git_ui_core",
  "gpui",
  "http_client",
  "itertools 0.14.0",
@@ -17417,7 +17488,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -17486,7 +17557,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -17566,7 +17637,7 @@ dependencies = [
  "uuid",
  "wasm-bindgen",
  "wasm_rpc",
- "wasm_thread",
+ "wasm_thread 0.3.3",
  "web-sys",
 ]
 
@@ -18645,7 +18716,7 @@ dependencies = [
  "getrandom 0.4.1",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -19094,7 +19165,7 @@ dependencies = [
  "command_palette_hooks",
  "db",
  "fs",
- "git_ui",
+ "git_ui_core",
  "gpui",
  "icons",
  "livekit_client",
@@ -19586,7 +19657,7 @@ dependencies = [
 [[package]]
 name = "trash"
 version = "5.2.5"
-source = "git+https://github.com/zed-industries/trash-rs?rev=47761739192828a66b11a94ba5420b82d63c03c5#47761739192828a66b11a94ba5420b82d63c03c5"
+source = "git+https://github.com/zed-industries/trash-rs?rev=41c6c800d884a89351f3b8856d12894cccee261d#41c6c800d884a89351f3b8856d12894cccee261d"
 dependencies = [
  "chrono",
  "libc",
@@ -20783,6 +20854,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm_thread"
+version = "0.3.3"
+source = "git+https://github.com/zed-industries/wasm_thread?rev=0cf96c7708dfb97ccf3da50347e25edcf75d6937#0cf96c7708dfb97ccf3da50347e25edcf75d6937"
+dependencies = [
+ "futures 0.3.32",
+ "js-sys",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
 name = "wasmparser"
 version = "0.201.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -21473,6 +21555,7 @@ dependencies = [
  "thiserror 2.0.17",
  "wgpu-core-deps-apple",
  "wgpu-core-deps-emscripten",
+ "wgpu-core-deps-wasm",
  "wgpu-core-deps-windows-linux-android",
  "wgpu-hal",
  "wgpu-naga-bridge",
@@ -21493,6 +21576,15 @@ name = "wgpu-core-deps-emscripten"
 version = "29.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "01e09be551dc939498bdd5f6b2c66e55ab275dad25825267a08605a80fc9f0af"
+dependencies = [
+ "wgpu-hal",
+]
+
+[[package]]
+name = "wgpu-core-deps-wasm"
+version = "29.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af1fb1798be2a912497d4c224f72d39bb0cb34af50e8bcc29865bc339c943059"
 dependencies = [
  "wgpu-hal",
 ]
@@ -21713,7 +21805,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -23378,7 +23470,7 @@ dependencies = [
 
 [[package]]
 name = "zed"
-version = "1.14.0"
+version = "1.15.0"
 dependencies = [
  "acp_thread",
  "acp_tools",
@@ -23440,6 +23532,7 @@ dependencies = [
  "git",
  "git_hosting_providers",
  "git_ui",
+ "git_ui_core",
  "go_to_line",
  "gpui",
  "gpui_platform",
@@ -23492,6 +23585,7 @@ dependencies = [
  "recent_projects",
  "release_channel",
  "remote",
+ "remote_server",
  "repl",
  "reqwest_client",
  "rope",
@@ -23545,6 +23639,7 @@ dependencies = [
  "workspace",
  "zed-reqwest",
  "zed_actions",
+ "zed_credentials_provider",
  "zed_env_vars",
  "zlog",
  "zlog_settings",

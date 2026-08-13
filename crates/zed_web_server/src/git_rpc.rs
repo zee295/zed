@@ -273,6 +273,22 @@ fn status(fs: &FsRpc, params: &Value) -> Result<Value> {
 }
 
 fn diff_tree(fs: &FsRpc, params: &Value) -> Result<Value> {
+    if string(params, "kind") == "merge_base_with_worktree" {
+        return Ok(Value::String(git_text(
+            fs,
+            params,
+            &[
+                "diff",
+                "--raw",
+                "-z",
+                "--abbrev=64",
+                "--no-renames",
+                "--merge-base",
+                string(params, "base"),
+            ],
+        )?));
+    }
+
     let mut args = vec!["diff-tree", "-r", "-z", "--no-renames"];
     if string(params, "kind") == "merge_base" {
         args.push("--merge-base");

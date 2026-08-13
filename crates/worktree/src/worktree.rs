@@ -32,7 +32,7 @@ use gpui::Priority;
 use gpui::{
     App, AppContext as _, AsyncApp, BackgroundExecutor, Context, Entity, EventEmitter, Task,
 };
-use ignore::IgnoreStack;
+pub use ignore::{IgnoreKind, IgnoreStack};
 use language::{ByteContent, DiskState, FILE_ANALYSIS_BYTES, analyze_byte_content};
 
 use async_channel::{self, Sender};
@@ -78,8 +78,6 @@ use util::{
 };
 use web_time::Instant;
 pub use worktree_settings::WorktreeSettings;
-
-use crate::ignore::IgnoreKind;
 
 pub const FS_WATCH_LATENCY: Duration = Duration::from_millis(100);
 const MAX_FS_EVENT_BATCHES: usize = 256;
@@ -3112,10 +3110,19 @@ impl LocalSnapshot {
                 repo_excludes.push(repo_exclude.clone());
             }
 
-            if repo_root.is_none() {
-                let metadata = fs.metadata(&ancestor.join(DOT_GIT)).await.ok().flatten();
-                if metadata.is_some() {
+            let is_repo_root = fs
+                .metadata(&ancestor.join(DOT_GIT))
+                .await
+                .is_ok_and(|metadata| metadata.is_some());
+            if is_repo_root {
+                if repo_root.is_none() {
                     repo_root = Some(Arc::from(ancestor));
+                }
+
+                // Stop at the repository containing the worktree root, but not at
+                // ones nested below it, where its rules still apply.
+                if self.abs_path.as_path().starts_with(ancestor) {
+                    break;
                 }
             }
         }
