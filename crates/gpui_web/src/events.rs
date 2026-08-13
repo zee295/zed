@@ -47,7 +47,7 @@ impl EventListenerHandle {
     /// Needed for events like `wheel` which are passive by default in modern
     /// browsers. Removal does not need to match the `passive` option, so
     /// `Drop` works the same as for [`EventListenerHandle::add`].
-    fn add_non_passive(
+    pub(crate) fn add_non_passive(
         target: &web_sys::EventTarget,
         event_name: &'static str,
         handler: impl FnMut(JsValue) + 'static,
@@ -151,6 +151,7 @@ impl WebWindowInner {
             self.register_blur(),
             self.register_pointer_enter(),
         ];
+        handles.extend(self.register_keyboard_accessory());
         handles.extend(self.register_visibility_change());
         handles.extend(self.register_appearance_change());
         handles.extend(self.register_fullscreen_change());
@@ -184,6 +185,74 @@ impl WebWindowInner {
 
     fn dispatch_input(&self, input: PlatformInput) -> Option<DispatchEventResult> {
         self.with_callback(|callbacks| &mut callbacks.input, |callback| callback(input))
+    }
+
+    fn dispatch_accessory_key(&self, key: &str, modifiers: Modifiers) {
+        let keystroke = Keystroke {
+            modifiers,
+            key: key.into(),
+            key_char: None,
+        };
+        self.dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
+            keystroke: keystroke.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        }));
+        self.dispatch_input(PlatformInput::KeyUp(KeyUpEvent { keystroke }));
+    }
+
+    fn register_keyboard_accessory(self: &Rc<Self>) -> Option<EventListenerHandle> {
+        let root = self.keyboard_accessory_root()?;
+        let this = Rc::clone(self);
+        Some(EventListenerHandle::add_non_passive(
+            root.as_ref(),
+            "pointerdown",
+            move |event: JsValue| {
+                let event: web_sys::PointerEvent = event.unchecked_into();
+                event.prevent_default();
+                event.stop_propagation();
+
+                let Some(target) = event
+                    .target()
+                    .and_then(|target| target.dyn_into::<web_sys::HtmlElement>().ok())
+                else {
+                    return;
+                };
+
+                match target.id().as_str() {
+                    "zed-mobile-keyboard-toggle" => this.toggle_keyboard_accessory(),
+                    "zed-mobile-key-ctrl" => this.toggle_keyboard_accessory_modifier("control"),
+                    "zed-mobile-key-alt" => this.toggle_keyboard_accessory_modifier("alt"),
+                    "zed-mobile-key-escape" => {
+                        let modifiers = this.take_keyboard_accessory_modifiers();
+                        this.dispatch_accessory_key("escape", modifiers);
+                    }
+                    "zed-mobile-key-tab" => {
+                        let modifiers = this.take_keyboard_accessory_modifiers();
+                        this.dispatch_accessory_key("tab", modifiers);
+                    }
+                    "zed-mobile-key-left" => {
+                        let modifiers = this.take_keyboard_accessory_modifiers();
+                        this.dispatch_accessory_key("left", modifiers);
+                    }
+                    "zed-mobile-key-down" => {
+                        let modifiers = this.take_keyboard_accessory_modifiers();
+                        this.dispatch_accessory_key("down", modifiers);
+                    }
+                    "zed-mobile-key-up" => {
+                        let modifiers = this.take_keyboard_accessory_modifiers();
+                        this.dispatch_accessory_key("up", modifiers);
+                    }
+                    "zed-mobile-key-right" => {
+                        let modifiers = this.take_keyboard_accessory_modifiers();
+                        this.dispatch_accessory_key("right", modifiers);
+                    }
+                    _ => return,
+                }
+
+                this.input_element.focus().ok();
+            },
+        ))
     }
 
     pub(crate) fn update_active_status(&self, active: bool) {
@@ -665,6 +734,27 @@ impl WebWindowInner {
                 return;
             }
 
+            let modifiers = this.take_keyboard_accessory_modifiers();
+            if modifiers.modified() {
+                let Some(character) = text.chars().next() else {
+                    return;
+                };
+                let key = match character {
+                    ' ' => "space".to_owned(),
+                    character => character.to_lowercase().collect(),
+                };
+                this.dispatch_accessory_key(&key, modifiers);
+
+                let remainder = &text[character.len_utf8()..];
+                if !remainder.is_empty() {
+                    this.with_input_handler(|handler| {
+                        handler.replace_text_in_range(None, remainder);
+                    });
+                }
+                this.input_element.set_value("");
+                return;
+            }
+
             if this
                 .with_input_handler(|handler| {
                     handler.replace_text_in_range(None, &text);
@@ -693,7 +783,7 @@ impl WebWindowInner {
 
             event.prevent_default();
             let keystroke = Keystroke {
-                modifiers: Modifiers::default(),
+                modifiers: this.take_keyboard_accessory_modifiers(),
                 key: key.into(),
                 key_char: None,
             };
@@ -813,6 +903,7 @@ impl WebWindowInner {
         let this = Rc::clone(self);
         self.listen_input("focus", move |_event: JsValue| {
             this.update_active_status(true);
+            this.show_keyboard_accessory();
         })
     }
 
@@ -827,6 +918,7 @@ impl WebWindowInner {
         let this = Rc::clone(self);
         self.listen_input("blur", move |_event: JsValue| {
             this.update_active_status(false);
+            this.hide_keyboard_accessory();
         })
     }
 

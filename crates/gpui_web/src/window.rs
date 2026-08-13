@@ -60,9 +60,20 @@ pub(crate) struct WebWindowInner {
     pub(crate) notify_scale: Cell<bool>,
     pub(crate) is_composing: Cell<bool>,
     pub(crate) pending_clipboard: Rc<RefCell<Option<ClipboardItem>>>,
+    keyboard_accessory: Option<KeyboardAccessory>,
+    keyboard_accessory_expanded: Cell<bool>,
+    keyboard_accessory_modifiers: Cell<Modifiers>,
     mql_handle: RefCell<Option<MqlHandle>>,
     pending_physical_size: Cell<Option<(u32, u32)>>,
     raf_id: Cell<Option<i32>>,
+}
+
+struct KeyboardAccessory {
+    root: web_sys::HtmlElement,
+    key_row: web_sys::HtmlElement,
+    toggle: web_sys::HtmlElement,
+    control: web_sys::HtmlElement,
+    alt: web_sys::HtmlElement,
 }
 
 pub struct WebWindow {
@@ -149,6 +160,9 @@ impl WebWindow {
             .map_err(|e| anyhow::anyhow!("Failed to append input to body: {e:?}"))?;
         input_element.focus().ok();
 
+        let keyboard_accessory =
+            create_mobile_keyboard_accessory(&document, &browser_window, &body)?;
+
         let device_size = Size {
             width: DevicePixels(0),
             height: DevicePixels(0),
@@ -202,6 +216,9 @@ impl WebWindow {
             notify_scale: Cell::new(false),
             is_composing: Cell::new(false),
             pending_clipboard,
+            keyboard_accessory,
+            keyboard_accessory_expanded: Cell::new(false),
+            keyboard_accessory_modifiers: Cell::new(Modifiers::default()),
             mql_handle: RefCell::new(None),
             pending_physical_size: Cell::new(None),
             raf_id: Cell::new(None),
@@ -491,6 +508,81 @@ impl WebWindowInner {
         Some(result)
     }
 
+    pub(crate) fn keyboard_accessory_root(&self) -> Option<web_sys::HtmlElement> {
+        self.keyboard_accessory
+            .as_ref()
+            .map(|accessory| accessory.root.clone())
+    }
+
+    pub(crate) fn show_keyboard_accessory(&self) {
+        if let Some(accessory) = &self.keyboard_accessory {
+            accessory.root.style().set_property("display", "flex").ok();
+        }
+    }
+
+    pub(crate) fn hide_keyboard_accessory(&self) {
+        let Some(accessory) = &self.keyboard_accessory else {
+            return;
+        };
+        accessory.root.style().set_property("display", "none").ok();
+        self.keyboard_accessory_expanded.set(false);
+        accessory
+            .key_row
+            .style()
+            .set_property("display", "none")
+            .ok();
+        accessory
+            .toggle
+            .set_attribute("aria-expanded", "false")
+            .ok();
+        self.keyboard_accessory_modifiers.set(Modifiers::default());
+        update_keyboard_modifier_button(&accessory.control, false);
+        update_keyboard_modifier_button(&accessory.alt, false);
+    }
+
+    pub(crate) fn toggle_keyboard_accessory(&self) {
+        let Some(accessory) = &self.keyboard_accessory else {
+            return;
+        };
+        let expanded = !self.keyboard_accessory_expanded.get();
+        self.keyboard_accessory_expanded.set(expanded);
+        accessory
+            .key_row
+            .style()
+            .set_property("display", if expanded { "flex" } else { "none" })
+            .ok();
+        accessory
+            .toggle
+            .set_attribute("aria-expanded", if expanded { "true" } else { "false" })
+            .ok();
+    }
+
+    pub(crate) fn toggle_keyboard_accessory_modifier(&self, modifier: &str) {
+        let Some(accessory) = &self.keyboard_accessory else {
+            return;
+        };
+        let mut modifiers = self.keyboard_accessory_modifiers.get();
+        match modifier {
+            "control" => modifiers.control = !modifiers.control,
+            "alt" => modifiers.alt = !modifiers.alt,
+            _ => return,
+        }
+        self.keyboard_accessory_modifiers.set(modifiers);
+        update_keyboard_modifier_button(&accessory.control, modifiers.control);
+        update_keyboard_modifier_button(&accessory.alt, modifiers.alt);
+    }
+
+    pub(crate) fn take_keyboard_accessory_modifiers(&self) -> Modifiers {
+        let modifiers = self
+            .keyboard_accessory_modifiers
+            .replace(Modifiers::default());
+        if let Some(accessory) = &self.keyboard_accessory {
+            update_keyboard_modifier_button(&accessory.control, false);
+            update_keyboard_modifier_button(&accessory.alt, false);
+        }
+        modifiers
+    }
+
     pub(crate) fn update_touch_input_focus(&self, position: Point<Pixels>) {
         // A tap can synchronously move GPUI focus. Draw the invalidated frame now so
         // the platform input handler below represents the control that was tapped.
@@ -515,8 +607,10 @@ impl WebWindowInner {
 
         if accepts_touch_input {
             self.input_element.focus().ok();
+            self.show_keyboard_accessory();
         } else {
             self.input_element.blur().ok();
+            self.hide_keyboard_accessory();
             self.update_active_status(true);
         }
     }
@@ -566,7 +660,270 @@ impl Drop for WebWindow {
         canvas.remove();
         let input_element: &web_sys::Element = self.inner.input_element.as_ref();
         input_element.remove();
+        if let Some(accessory) = &self.inner.keyboard_accessory {
+            let root: &web_sys::Element = accessory.root.as_ref();
+            root.remove();
+        }
     }
+}
+
+fn create_mobile_keyboard_accessory(
+    document: &web_sys::Document,
+    browser_window: &web_sys::Window,
+    body: &web_sys::HtmlElement,
+) -> anyhow::Result<Option<KeyboardAccessory>> {
+    let is_mobile = browser_window
+        .match_media("(any-pointer: coarse) and (max-width: 900px)")
+        .ok()
+        .flatten()
+        .is_some_and(|query| query.matches());
+    if !is_mobile {
+        return Ok(None);
+    }
+
+    let is_dark = matches!(current_appearance(browser_window), WindowAppearance::Dark);
+    let panel_color = if is_dark { "#24272d" } else { "#f1f2f4" };
+    let key_color = if is_dark { "#343840" } else { "#ffffff" };
+    let text_color = if is_dark { "#f2f3f5" } else { "#24272d" };
+    let border_color = if is_dark { "#515762" } else { "#c7cbd1" };
+
+    let root: web_sys::HtmlElement = document
+        .create_element("div")
+        .map_err(|error| anyhow::anyhow!("Failed to create keyboard accessory: {error:?}"))?
+        .dyn_into()
+        .map_err(|error| anyhow::anyhow!("Keyboard accessory is not an HTML element: {error:?}"))?;
+    root.set_id("zed-mobile-keyboard-accessory");
+    root.set_attribute("role", "toolbar").ok();
+    root.set_attribute("aria-label", "Terminal and editor keys")
+        .ok();
+    set_inline_styles(
+        &root,
+        &[
+            ("position", "fixed"),
+            ("right", "8px"),
+            ("bottom", "calc(40px + env(safe-area-inset-bottom, 0px))"),
+            ("z-index", "2147483647"),
+            ("display", "none"),
+            ("align-items", "center"),
+            ("gap", "4px"),
+            ("max-width", "calc(100vw - 16px)"),
+            ("height", "40px"),
+            ("padding", "2px"),
+            ("box-sizing", "border-box"),
+            ("background-color", panel_color),
+            ("border", &format!("1px solid {border_color}")),
+            ("border-radius", "6px"),
+            ("box-shadow", "0 2px 8px rgba(0, 0, 0, 0.28)"),
+            ("font-family", "system-ui, sans-serif"),
+            ("font-size", "13px"),
+            ("font-weight", "500"),
+            ("letter-spacing", "0"),
+            ("touch-action", "manipulation"),
+            ("user-select", "none"),
+            ("-webkit-user-select", "none"),
+            ("-webkit-tap-highlight-color", "transparent"),
+        ],
+    );
+
+    let key_row: web_sys::HtmlElement = document
+        .create_element("div")
+        .map_err(|error| anyhow::anyhow!("Failed to create keyboard key row: {error:?}"))?
+        .dyn_into()
+        .map_err(|error| anyhow::anyhow!("Keyboard key row is not an HTML element: {error:?}"))?;
+    key_row.set_id("zed-mobile-keyboard-keys");
+    set_inline_styles(
+        &key_row,
+        &[
+            ("display", "none"),
+            ("align-items", "center"),
+            ("gap", "4px"),
+            ("flex", "1 1 auto"),
+            ("min-width", "0"),
+            ("overflow-x", "auto"),
+            ("overscroll-behavior", "contain"),
+            ("scrollbar-width", "none"),
+        ],
+    );
+
+    let escape = create_keyboard_button(
+        document,
+        "zed-mobile-key-escape",
+        "Esc",
+        "Escape",
+        key_color,
+        text_color,
+        border_color,
+    )?;
+    let tab = create_keyboard_button(
+        document,
+        "zed-mobile-key-tab",
+        "Tab",
+        "Tab",
+        key_color,
+        text_color,
+        border_color,
+    )?;
+    let control = create_keyboard_button(
+        document,
+        "zed-mobile-key-ctrl",
+        "Ctrl",
+        "Control, applies to the next key",
+        key_color,
+        text_color,
+        border_color,
+    )?;
+    control.set_attribute("aria-pressed", "false").ok();
+    let alt = create_keyboard_button(
+        document,
+        "zed-mobile-key-alt",
+        "Alt",
+        "Alt, applies to the next key",
+        key_color,
+        text_color,
+        border_color,
+    )?;
+    alt.set_attribute("aria-pressed", "false").ok();
+    let left = create_keyboard_button(
+        document,
+        "zed-mobile-key-left",
+        "←",
+        "Left arrow",
+        key_color,
+        text_color,
+        border_color,
+    )?;
+    let down = create_keyboard_button(
+        document,
+        "zed-mobile-key-down",
+        "↓",
+        "Down arrow",
+        key_color,
+        text_color,
+        border_color,
+    )?;
+    let up = create_keyboard_button(
+        document,
+        "zed-mobile-key-up",
+        "↑",
+        "Up arrow",
+        key_color,
+        text_color,
+        border_color,
+    )?;
+    let right = create_keyboard_button(
+        document,
+        "zed-mobile-key-right",
+        "→",
+        "Right arrow",
+        key_color,
+        text_color,
+        border_color,
+    )?;
+
+    for button in [&escape, &tab, &control, &alt, &left, &down, &up, &right] {
+        key_row.append_child(button).map_err(|error| {
+            anyhow::anyhow!("Failed to append keyboard accessory key: {error:?}")
+        })?;
+    }
+
+    let toggle = create_keyboard_button(
+        document,
+        "zed-mobile-keyboard-toggle",
+        "⌨",
+        "Show special keys",
+        key_color,
+        text_color,
+        border_color,
+    )?;
+    toggle
+        .set_attribute("aria-controls", "zed-mobile-keyboard-keys")
+        .ok();
+    toggle.set_attribute("aria-expanded", "false").ok();
+    toggle.style().set_property("font-size", "18px").ok();
+
+    root.append_child(&key_row)
+        .map_err(|error| anyhow::anyhow!("Failed to append keyboard key row: {error:?}"))?;
+    root.append_child(&toggle)
+        .map_err(|error| anyhow::anyhow!("Failed to append keyboard toggle: {error:?}"))?;
+    body.append_child(&root)
+        .map_err(|error| anyhow::anyhow!("Failed to append keyboard accessory: {error:?}"))?;
+
+    Ok(Some(KeyboardAccessory {
+        root,
+        key_row,
+        toggle,
+        control,
+        alt,
+    }))
+}
+
+fn create_keyboard_button(
+    document: &web_sys::Document,
+    id: &str,
+    label: &str,
+    accessible_label: &str,
+    background: &str,
+    foreground: &str,
+    border: &str,
+) -> anyhow::Result<web_sys::HtmlElement> {
+    let button: web_sys::HtmlElement = document
+        .create_element("button")
+        .map_err(|error| anyhow::anyhow!("Failed to create keyboard button: {error:?}"))?
+        .dyn_into()
+        .map_err(|error| anyhow::anyhow!("Keyboard button is not an HTML element: {error:?}"))?;
+    button.set_id(id);
+    button.set_inner_text(label);
+    button.set_attribute("type", "button").ok();
+    button.set_attribute("aria-label", accessible_label).ok();
+    button.set_attribute("title", accessible_label).ok();
+    button
+        .set_attribute("data-inactive-background", background)
+        .ok();
+    set_inline_styles(
+        &button,
+        &[
+            ("flex", "0 0 auto"),
+            ("min-width", "34px"),
+            ("height", "34px"),
+            ("padding", "0 8px"),
+            ("box-sizing", "border-box"),
+            ("background-color", background),
+            ("color", foreground),
+            ("border", &format!("1px solid {border}")),
+            ("border-radius", "4px"),
+            ("font", "inherit"),
+            ("letter-spacing", "0"),
+            ("line-height", "32px"),
+            ("text-align", "center"),
+            ("touch-action", "manipulation"),
+            ("user-select", "none"),
+            ("-webkit-user-select", "none"),
+            ("-webkit-tap-highlight-color", "transparent"),
+        ],
+    );
+    Ok(button)
+}
+
+fn set_inline_styles(element: &web_sys::HtmlElement, styles: &[(&str, &str)]) {
+    for (property, value) in styles {
+        element.style().set_property(property, value).ok();
+    }
+}
+
+fn update_keyboard_modifier_button(button: &web_sys::HtmlElement, active: bool) {
+    button
+        .set_attribute("aria-pressed", if active { "true" } else { "false" })
+        .ok();
+    let inactive_background = button.get_attribute("data-inactive-background");
+    let background = if active {
+        "#477fc2"
+    } else {
+        inactive_background.as_deref().unwrap_or("transparent")
+    };
+    button
+        .style()
+        .set_property("background-color", background)
+        .ok();
 }
 
 fn current_appearance(browser_window: &web_sys::Window) -> WindowAppearance {
@@ -694,10 +1051,12 @@ impl PlatformWindow for WebWindow {
     fn show_soft_keyboard(&self) {
         self.inner.soft_keyboard_requested.set(true);
         self.inner.input_element.focus().ok();
+        self.inner.show_keyboard_accessory();
     }
 
     fn hide_soft_keyboard(&self) {
         self.inner.input_element.blur().ok();
+        self.inner.hide_keyboard_accessory();
     }
 
     fn prompt(
