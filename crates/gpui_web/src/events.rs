@@ -140,6 +140,8 @@ impl WebWindowInner {
             self.register_drop(),
             self.register_key_down(),
             self.register_key_up(),
+            self.register_before_input(),
+            self.register_text_input(),
             self.register_paste(),
             self.register_composition_start(),
             self.register_composition_update(),
@@ -646,6 +648,61 @@ impl WebWindowInner {
                     event.prevent_default();
                 }
             }
+        })
+    }
+
+    fn register_text_input(self: &Rc<Self>) -> EventListenerHandle {
+        let this = Rc::clone(self);
+        self.listen_input("input", move |_event: JsValue| {
+            // Mobile virtual keyboards commonly emit `input` without a usable
+            // `keydown`. Composition text is committed by `compositionend`.
+            if this.is_composing.get() {
+                return;
+            }
+
+            let text = this.input_element.value();
+            if text.is_empty() {
+                return;
+            }
+
+            if this
+                .with_input_handler(|handler| {
+                    handler.replace_text_in_range(None, &text);
+                })
+                .is_some()
+            {
+                this.input_element.set_value("");
+            }
+        })
+    }
+
+    fn register_before_input(self: &Rc<Self>) -> EventListenerHandle {
+        let this = Rc::clone(self);
+        self.listen_input("beforeinput", move |event: JsValue| {
+            let event: web_sys::InputEvent = event.unchecked_into();
+            if this.is_composing.get() || event.is_composing() {
+                return;
+            }
+
+            let key = match event.input_type().as_str() {
+                "deleteContentBackward" | "deleteWordBackward" => "backspace",
+                "deleteContentForward" | "deleteWordForward" => "delete",
+                "insertLineBreak" | "insertParagraph" => "enter",
+                _ => return,
+            };
+
+            event.prevent_default();
+            let keystroke = Keystroke {
+                modifiers: Modifiers::default(),
+                key: key.into(),
+                key_char: None,
+            };
+            this.dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
+                keystroke: keystroke.clone(),
+                is_held: false,
+                prefer_character_input: false,
+            }));
+            this.dispatch_input(PlatformInput::KeyUp(KeyUpEvent { keystroke }));
         })
     }
 
