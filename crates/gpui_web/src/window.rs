@@ -55,6 +55,7 @@ pub(crate) struct WebWindowInner {
     pub(crate) click_state: RefCell<ClickState>,
     pub(crate) pressed_button: Cell<Option<MouseButton>>,
     pub(crate) active_touch: RefCell<Option<TouchPointerState>>,
+    pub(crate) soft_keyboard_requested: Cell<bool>,
     pub(crate) last_physical_size: Cell<(u32, u32)>,
     pub(crate) notify_scale: Cell<bool>,
     pub(crate) is_composing: Cell<bool>,
@@ -196,6 +197,7 @@ impl WebWindow {
             click_state: RefCell::new(ClickState::default()),
             pressed_button: Cell::new(None),
             active_touch: RefCell::new(None),
+            soft_keyboard_requested: Cell::new(false),
             last_physical_size: Cell::new((0, 0)),
             notify_scale: Cell::new(false),
             is_composing: Cell::new(false),
@@ -497,18 +499,19 @@ impl WebWindowInner {
             |callback| {
                 callback(RequestFrameOptions {
                     require_presentation: false,
-                    force_render: true,
+                    force_render: false,
                 })
             },
         );
 
-        let accepts_touch_input = self
-            .with_input_handler(|handler| {
-                handler
-                    .element_bounds()
-                    .is_some_and(|bounds| bounds.contains(&position))
-            })
-            .unwrap_or(false);
+        let accepts_touch_input = self.soft_keyboard_requested.replace(false)
+            || self
+                .with_input_handler(|handler| {
+                    handler
+                        .element_bounds()
+                        .is_some_and(|bounds| bounds.contains(&position))
+                })
+                .unwrap_or(false);
 
         if accepts_touch_input {
             self.input_element.focus().ok();
@@ -686,6 +689,15 @@ impl PlatformWindow for WebWindow {
 
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
         self.inner.state.borrow_mut().input_handler.take()
+    }
+
+    fn show_soft_keyboard(&self) {
+        self.inner.soft_keyboard_requested.set(true);
+        self.inner.input_element.focus().ok();
+    }
+
+    fn hide_soft_keyboard(&self) {
+        self.inner.input_element.blur().ok();
     }
 
     fn prompt(

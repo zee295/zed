@@ -979,6 +979,7 @@ impl TerminalElement {
 
             move |e, window, cx| {
                 window.focus(&focus, cx);
+                window.show_soft_keyboard();
 
                 let scroll_top = terminal_view.read(cx).scroll_top;
                 terminal.update(cx, |terminal, cx| {

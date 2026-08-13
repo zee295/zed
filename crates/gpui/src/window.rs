@@ -2788,6 +2788,13 @@ impl Window {
         self.last_input_modality == InputModality::Keyboard
     }
 
+    /// Requests that the platform display its software keyboard.
+    ///
+    /// Browser platforms must call this synchronously from a user gesture.
+    pub fn show_soft_keyboard(&self) {
+        self.platform_window.show_soft_keyboard();
+    }
+
     /// The current state of the keyboard's capslock
     pub fn capslock(&self) -> Capslock {
         self.capslock

@@ -228,6 +228,7 @@ impl WebWindowInner {
 
             if event.pointer_type() == "touch" {
                 this.update_active_status(true);
+                this.soft_keyboard_requested.set(false);
                 this.active_touch.replace(Some(TouchPointerState {
                     pointer_id: event.pointer_id(),
                     start_position: position,
