@@ -22,6 +22,7 @@ use wasm_rpc::RpcClient;
 use crate::{PtyEvent, TerminalBackendEvent, TerminalBounds};
 
 const RESUME_KEY_ENV: &str = "ZED_WEB_TERMINAL_RESUME_KEY";
+const MOBILE_MEDIA_QUERY: &str = "(any-pointer: coarse) and (max-width: 900px)";
 static NEXT_NOTIFICATION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Handle to a server-side PTY.
@@ -98,6 +99,7 @@ impl RemotePty {
                     "notification_id": notification_id,
                     "cols": initial_bounds.num_columns(),
                     "rows": initial_bounds.num_lines(),
+                    "compact_prompt": compact_prompt_requested(),
                 }),
             )
             .await
@@ -216,6 +218,12 @@ impl RemotePty {
                 .await;
         });
     }
+}
+
+fn compact_prompt_requested() -> bool {
+    web_sys::window()
+        .and_then(|window| window.match_media(MOBILE_MEDIA_QUERY).ok().flatten())
+        .is_some_and(|query| query.matches())
 }
 
 fn persistent_notification_id(resume_key: &str) -> String {

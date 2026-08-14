@@ -5043,7 +5043,11 @@ impl Window {
                     PlatformInput::FileDrop(FileDropEvent::Ended)
                 }
             },
-            PlatformInput::Touch(touch) => PlatformInput::Touch(touch),
+            PlatformInput::Touch(touch) => {
+                self.mouse_position = touch.position;
+                self.reset_cursor_style(cx);
+                PlatformInput::Touch(touch)
+            }
             PlatformInput::KeyDown(_) | PlatformInput::KeyUp(_) => event,
         };
 

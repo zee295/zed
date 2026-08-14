@@ -4,7 +4,7 @@ use gpui::{
     Capslock, ClipboardEntry, ClipboardItem, DispatchEventResult, Image, ImageFormat, KeyDownEvent,
     KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
     MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, PlatformInput,
-    Point, ScrollDelta, ScrollWheelEvent, TouchPhase, point, px,
+    Point, ScrollDelta, ScrollWheelEvent, TouchEvent, TouchId, TouchPhase, point, px,
 };
 use wasm_bindgen::prelude::*;
 
@@ -94,6 +94,7 @@ pub(crate) struct TouchPointerState {
     start_position: Point<Pixels>,
     last_position: Point<Pixels>,
     scrolling: bool,
+    resizing: bool,
 }
 
 const TOUCH_SCROLL_THRESHOLD: f32 = 6.0;
@@ -300,15 +301,41 @@ impl WebWindowInner {
             if event.pointer_type() == "touch" {
                 this.update_active_status(true);
                 this.soft_keyboard_requested.set(false);
+                {
+                    let mut current_state = this.state.borrow_mut();
+                    current_state.mouse_position = position;
+                    current_state.modifiers = modifiers;
+                }
+                this.dispatch_input(PlatformInput::Touch(TouchEvent {
+                    id: TouchId(event.pointer_id() as u64),
+                    phase: TouchPhase::Started,
+                    position,
+                    force: None,
+                }));
+
+                let resizing = body_cursor_is_resize(&this.browser_window);
+                if resizing {
+                    let button = MouseButton::Left;
+                    this.pressed_button.set(Some(button));
+                    let click_count = this
+                        .click_state
+                        .borrow_mut()
+                        .register_click(position, js_sys::Date::now());
+                    this.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
+                        button,
+                        position,
+                        modifiers,
+                        click_count,
+                        first_mouse: false,
+                    }));
+                }
                 this.active_touch.replace(Some(TouchPointerState {
                     pointer_id: event.pointer_id(),
                     start_position: position,
                     last_position: position,
                     scrolling: false,
+                    resizing,
                 }));
-                let mut current_state = this.state.borrow_mut();
-                current_state.mouse_position = position;
-                current_state.modifiers = modifiers;
                 return;
             }
 
@@ -359,7 +386,15 @@ impl WebWindowInner {
                     current_state.modifiers = modifiers;
                 }
 
-                if touch.scrolling {
+                if touch.resizing {
+                    this.pressed_button.set(None);
+                    this.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
+                        button: MouseButton::Left,
+                        position,
+                        modifiers,
+                        click_count: this.click_state.borrow().current_count,
+                    }));
+                } else if touch.scrolling {
                     this.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
                         position,
                         delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
@@ -389,6 +424,12 @@ impl WebWindowInner {
                     }));
                     this.update_touch_input_focus(position);
                 }
+                this.dispatch_input(PlatformInput::Touch(TouchEvent {
+                    id: TouchId(event.pointer_id() as u64),
+                    phase: TouchPhase::Ended,
+                    position,
+                    force: None,
+                }));
                 return;
             }
 
@@ -423,7 +464,15 @@ impl WebWindowInner {
             }
 
             this.canvas.release_pointer_capture(event.pointer_id()).ok();
-            if touch.scrolling {
+            if touch.resizing {
+                this.pressed_button.set(None);
+                this.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
+                    button: MouseButton::Left,
+                    position: touch.last_position,
+                    modifiers: Modifiers::default(),
+                    click_count: this.click_state.borrow().current_count,
+                }));
+            } else if touch.scrolling {
                 this.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
                     position: touch.last_position,
                     delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
@@ -431,6 +480,12 @@ impl WebWindowInner {
                     touch_phase: TouchPhase::Cancelled,
                 }));
             }
+            this.dispatch_input(PlatformInput::Touch(TouchEvent {
+                id: TouchId(event.pointer_id() as u64),
+                phase: TouchPhase::Cancelled,
+                position: touch.last_position,
+                force: None,
+            }));
         })
     }
 
@@ -449,6 +504,22 @@ impl WebWindowInner {
                     return;
                 };
                 if touch.pointer_id != event.pointer_id() {
+                    return;
+                }
+
+                if touch.resizing {
+                    touch.last_position = position;
+                    drop(active_touch);
+                    {
+                        let mut current_state = this.state.borrow_mut();
+                        current_state.mouse_position = position;
+                        current_state.modifiers = modifiers;
+                    }
+                    this.dispatch_input(PlatformInput::MouseMove(MouseMoveEvent {
+                        position,
+                        pressed_button: Some(MouseButton::Left),
+                        modifiers,
+                    }));
                     return;
                 }
 
@@ -935,6 +1006,30 @@ impl WebWindowInner {
             );
         })
     }
+}
+
+fn body_cursor_is_resize(browser_window: &web_sys::Window) -> bool {
+    let Some(cursor) = browser_window
+        .document()
+        .and_then(|document| document.body())
+        .and_then(|body| body.style().get_property_value("cursor").ok())
+    else {
+        return false;
+    };
+
+    matches!(
+        cursor.as_str(),
+        "ew-resize"
+            | "ns-resize"
+            | "col-resize"
+            | "row-resize"
+            | "w-resize"
+            | "e-resize"
+            | "n-resize"
+            | "s-resize"
+            | "nesw-resize"
+            | "nwse-resize"
+    )
 }
 
 fn clipboard_image_files(

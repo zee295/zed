@@ -18786,6 +18786,7 @@ dependencies = [
  "vte",
  "wasm-bindgen-futures",
  "wasm_rpc",
+ "web-sys",
  "web-time",
  "windows 0.61.3",
 ]

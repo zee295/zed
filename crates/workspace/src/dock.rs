@@ -23,6 +23,8 @@ use ui::{
 use util::ResultExt as _;
 
 pub(crate) const RESIZE_HANDLE_SIZE: Pixels = px(6.);
+const MOBILE_RESIZE_HANDLE_SIZE: Pixels = px(18.);
+const MOBILE_VIEWPORT_MAX_WIDTH: Pixels = px(900.);
 
 pub enum PanelEvent {
     ZoomIn,
@@ -364,6 +366,7 @@ pub struct PanelSizeState {
 struct PanelEntry {
     panel: Arc<dyn PanelHandle>,
     size_state: PanelSizeState,
+    size_before_auto_clamp: Option<Option<Pixels>>,
     _subscriptions: [Subscription; 4],
 }
 
@@ -391,6 +394,7 @@ fn resize_panel_entry(
     window: &mut Window,
     cx: &mut App,
 ) -> (&'static str, PanelSizeState) {
+    entry.size_before_auto_clamp = None;
     let size = size.map(|size| size.max(RESIZE_HANDLE_SIZE).round());
     let uses_flexible_width = panel_uses_flexible_width(position, entry.panel.as_ref(), window, cx);
     if uses_flexible_width {
@@ -690,6 +694,7 @@ impl Dock {
                         .find(|entry| entry.panel.panel_id() == panel_id)
                     {
                         entry.size_state.size = None;
+                        entry.size_before_auto_clamp = None;
                         entry.panel.size_state_changed(window, cx);
                         cx.notify();
                     }
@@ -779,6 +784,7 @@ impl Dock {
             PanelEntry {
                 panel: Arc::new(panel.clone()),
                 size_state,
+                size_before_auto_clamp: None,
                 _subscriptions: subscriptions,
             },
         );
@@ -955,6 +961,7 @@ impl Dock {
             .find(|entry| entry.panel.panel_id() == panel.panel_id())
         {
             entry.size_state = size_state;
+            entry.size_before_auto_clamp = None;
             cx.notify();
             true
         } else {
@@ -977,6 +984,7 @@ impl Dock {
         else {
             return;
         };
+        entry.size_before_auto_clamp = None;
         let currently_flexible = entry.panel.has_flexible_size(window, cx);
         if currently_flexible {
             entry.size_state.size = current_size;
@@ -1089,7 +1097,7 @@ impl Dock {
 
     pub fn clamp_panel_size(&mut self, max_size: Pixels, window: &Window, cx: &mut Context<Self>) {
         let max_size = (max_size - RESIZE_HANDLE_SIZE).abs();
-        let mut clamped = false;
+        let mut changed = false;
         for entry in &mut self.panel_entries {
             let uses_flexible_width =
                 panel_uses_flexible_width(self.position, entry.panel.as_ref(), window, cx);
@@ -1097,16 +1105,27 @@ impl Dock {
                 continue;
             }
 
-            let size = entry
-                .size_state
-                .size
+            let desired_size = entry
+                .size_before_auto_clamp
+                .unwrap_or(entry.size_state.size)
                 .unwrap_or_else(|| entry.panel.default_size(window, cx));
-            if size > max_size {
-                entry.size_state.size = Some(max_size.max(RESIZE_HANDLE_SIZE));
-                clamped = true;
+            if desired_size > max_size {
+                if entry.size_before_auto_clamp.is_none() {
+                    entry.size_before_auto_clamp = Some(entry.size_state.size);
+                }
+                let clamped_size = max_size.max(RESIZE_HANDLE_SIZE);
+                if entry.size_state.size != Some(clamped_size) {
+                    entry.size_state.size = Some(clamped_size);
+                    changed = true;
+                }
+            } else if let Some(size_before_auto_clamp) = entry.size_before_auto_clamp.take()
+                && entry.size_state.size != size_before_auto_clamp
+            {
+                entry.size_state.size = size_before_auto_clamp;
+                changed = true;
             }
         }
-        if clamped {
+        if changed {
             cx.notify();
         }
     }
@@ -1131,10 +1150,17 @@ impl Dock {
 }
 
 impl Render for Dock {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dispatch_context = Self::dispatch_context();
         if let Some(entry) = self.visible_entry() {
             let position = self.position;
+            let resize_handle_size = if cfg!(target_family = "wasm")
+                && window.viewport_size().width <= MOBILE_VIEWPORT_MAX_WIDTH
+            {
+                MOBILE_RESIZE_HANDLE_SIZE
+            } else {
+                RESIZE_HANDLE_SIZE
+            };
             let create_resize_handle = || {
                 let handle = div()
                     .id("resize-handle")
@@ -1167,28 +1193,28 @@ impl Render for Dock {
                     DockPosition::Left => deferred(
                         handle
                             .absolute()
-                            .right(-RESIZE_HANDLE_SIZE / 2.)
+                            .right(-resize_handle_size / 2.)
                             .top(px(0.))
                             .h_full()
-                            .w(RESIZE_HANDLE_SIZE)
+                            .w(resize_handle_size)
                             .cursor_col_resize(),
                     ),
                     DockPosition::Bottom => deferred(
                         handle
                             .absolute()
-                            .top(-RESIZE_HANDLE_SIZE / 2.)
+                            .top(-resize_handle_size / 2.)
                             .left(px(0.))
                             .w_full()
-                            .h(RESIZE_HANDLE_SIZE)
+                            .h(resize_handle_size)
                             .cursor_row_resize(),
                     ),
                     DockPosition::Right => deferred(
                         handle
                             .absolute()
                             .top(px(0.))
-                            .left(-RESIZE_HANDLE_SIZE / 2.)
+                            .left(-resize_handle_size / 2.)
                             .h_full()
-                            .w(RESIZE_HANDLE_SIZE)
+                            .w(resize_handle_size)
                             .cursor_col_resize(),
                     ),
                 }

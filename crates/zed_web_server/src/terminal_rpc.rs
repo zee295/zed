@@ -1,6 +1,8 @@
 use std::{
     collections::HashMap,
+    fs,
     io::{Read as _, Write as _},
+    path::Path,
     sync::{Arc, Mutex},
 };
 
@@ -33,6 +35,7 @@ struct TerminalEntry {
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     output: Arc<Mutex<TerminalOutput>>,
     resume_key: Option<String>,
+    _startup_dir: Option<tempfile::TempDir>,
 }
 
 struct TerminalOutput {
@@ -123,11 +126,6 @@ impl TerminalManager {
             program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
         }
         let mut command = CommandBuilder::new(&program);
-        if args.is_empty() {
-            command.arg("-i");
-        } else {
-            command.args(args);
-        }
         let working_directory = params
             .get("working_directory")
             .and_then(Value::as_str)
@@ -159,6 +157,21 @@ impl TerminalManager {
                 }
             }
         }
+        let startup_dir = if args.is_empty()
+            && params
+                .get("compact_prompt")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        {
+            configure_compact_prompt(&mut command, &program)?
+        } else {
+            if args.is_empty() {
+                command.arg("-i");
+            } else {
+                command.args(args);
+            }
+            None
+        };
         #[cfg(unix)]
         if let Some(bridge) = &self.open_url_bridge {
             bridge.configure_pty_command(&mut command)?;
@@ -221,6 +234,7 @@ impl TerminalManager {
                 killer: Mutex::new(killer),
                 output,
                 resume_key,
+                _startup_dir: startup_dir,
             },
         );
         Ok(json!({"term_id": term_id, "resumed": false}))
@@ -383,6 +397,46 @@ impl TerminalManager {
     }
 }
 
+fn configure_compact_prompt(
+    command: &mut CommandBuilder,
+    program: &str,
+) -> Result<Option<tempfile::TempDir>> {
+    let shell_name = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program);
+
+    match shell_name {
+        "bash" => {
+            let startup_dir = tempfile::tempdir()?;
+            let startup_file = startup_dir.path().join(".bashrc");
+            fs::write(
+                &startup_file,
+                "[ -r \"$HOME/.bashrc\" ] && . \"$HOME/.bashrc\"\nPS1='\\W\\$ '\n",
+            )?;
+            command.arg("--rcfile");
+            command.arg(startup_file);
+            command.arg("-i");
+            Ok(Some(startup_dir))
+        }
+        "zsh" => {
+            let startup_dir = tempfile::tempdir()?;
+            fs::write(
+                startup_dir.path().join(".zshrc"),
+                "[[ -r \"$HOME/.zshrc\" ]] && source \"$HOME/.zshrc\"\nif (( EUID == 0 )); then PROMPT='%1~# '; else PROMPT='%1~$ '; fi\nRPROMPT=''\n",
+            )?;
+            command.env("ZDOTDIR", startup_dir.path());
+            command.arg("-i");
+            Ok(Some(startup_dir))
+        }
+        _ => {
+            command.env("PS1", "${PWD##*/}$ ");
+            command.arg("-i");
+            Ok(None)
+        }
+    }
+}
+
 impl Drop for TerminalManager {
     fn drop(&mut self) {
         for (_, terminal) in self.terminals.drain() {
@@ -445,7 +499,7 @@ fn notify(outgoing: &mpsc::UnboundedSender<Message>, method: &str, params: Value
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, thread, time::Duration};
+    use std::{fs, sync::Arc, thread, time::Duration};
 
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use serde_json::json;
@@ -467,6 +521,55 @@ mod tests {
     #[test]
     fn preserves_user_npm_prefix() {
         assert!(!is_external_agent_npm_prefix("/Users/zee/.npm-global"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uses_compact_prompt_for_interactive_bash() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let project_dir = root.path().join("project");
+        let home_dir = root.path().join("home");
+        fs::create_dir_all(&project_dir)?;
+        fs::create_dir_all(&home_dir)?;
+        fs::write(home_dir.join(".bashrc"), "")?;
+
+        let fs = Arc::new(FsRpc::new(root.path().to_path_buf(), false)?);
+        let (outgoing, _notifications) = mpsc::unbounded_channel();
+        let mut terminals = TerminalManager::new(fs, outgoing);
+        let opened = terminals.dispatch(
+            "Terminal::open",
+            &json!({
+                "shell": { "program": "/bin/bash", "args": [] },
+                "working_directory": "/workspace/project",
+                "env": { "HOME": home_dir.to_string_lossy() },
+                "compact_prompt": true
+            }),
+        )?;
+        let term_id = opened["term_id"].as_u64().unwrap();
+
+        for _ in 0..100 {
+            let history = terminals
+                .terminals
+                .get(&term_id)
+                .unwrap()
+                .output
+                .lock()
+                .unwrap()
+                .history
+                .clone();
+            if history
+                .windows(b"project$ ".len())
+                .any(|window| window == b"project$ ")
+                || history
+                    .windows(b"project# ".len())
+                    .any(|window| window == b"project# ")
+            {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        anyhow::bail!("interactive Bash did not render the compact prompt")
     }
 
     #[test]

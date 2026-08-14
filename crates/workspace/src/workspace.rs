@@ -14468,6 +14468,14 @@ mod tests {
                         .and_then(|state| state.size),
                     Some(max_size - dock::RESIZE_HANDLE_SIZE)
                 );
+
+                dock.clamp_panel_size(px(500.), window, cx);
+                assert_eq!(
+                    dock.stored_panel_size_state(&bottom_panel)
+                        .and_then(|state| state.size),
+                    None,
+                    "growing the viewport should restore the pre-clamp default size"
+                );
             });
             workspace.right_dock().update(cx, |dock, cx| {
                 dock.clamp_panel_size(max_size, window, cx);
