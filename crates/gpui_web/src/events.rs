@@ -150,6 +150,7 @@ impl WebWindowInner {
             self.register_pointer_down(),
             self.register_pointer_up(),
             self.register_pointer_cancel(),
+            self.register_lost_pointer_capture(),
             self.register_pointer_move(),
             self.register_pointer_leave(),
             self.register_wheel(),
@@ -167,6 +168,7 @@ impl WebWindowInner {
             self.register_focus(),
             self.register_canvas_focus(),
             self.register_blur(),
+            self.register_window_blur(),
             self.register_pointer_enter(),
         ];
         handles.extend(self.register_keyboard_accessory());
@@ -205,6 +207,42 @@ impl WebWindowInner {
         self.with_callback(|callbacks| &mut callbacks.input, |callback| callback(input))
     }
 
+    pub(crate) fn cancel_active_touch(&self, pointer_id: Option<i32>) {
+        let Some(touch) = self.active_touch.take() else {
+            return;
+        };
+        if pointer_id.is_some_and(|pointer_id| touch.pointer_id != pointer_id) {
+            self.active_touch.replace(Some(touch));
+            return;
+        }
+
+        self.canvas.release_pointer_capture(touch.pointer_id).ok();
+        let modifiers = self.state.borrow().modifiers;
+        if touch.resizing {
+            self.pressed_button.set(None);
+            self.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
+                button: MouseButton::Left,
+                position: touch.last_position,
+                modifiers,
+                click_count: self.click_state.borrow().current_count,
+            }));
+        } else if touch.scrolling {
+            self.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                position: touch.last_position,
+                delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
+                modifiers,
+                touch_phase: TouchPhase::Cancelled,
+            }));
+        }
+        self.dispatch_input(PlatformInput::Touch(TouchEvent {
+            id: TouchId(touch.pointer_id as u64),
+            phase: TouchPhase::Cancelled,
+            position: touch.last_position,
+            force: None,
+        }));
+        self.update_hover_status(false);
+    }
+
     fn finish_touch_momentum(&self, generation: u64, phase: TouchPhase) {
         let Some(momentum) = self.touch_momentum.get() else {
             return;
@@ -222,7 +260,7 @@ impl WebWindowInner {
         }));
     }
 
-    fn cancel_touch_momentum(&self) {
+    pub(crate) fn cancel_touch_momentum(&self) {
         let Some(momentum) = self.touch_momentum.get() else {
             return;
         };
@@ -242,7 +280,11 @@ impl WebWindowInner {
         let (velocity_x, velocity_y) =
             clamp_touch_velocity(velocity_x, velocity_y, TOUCH_MOMENTUM_MAX_SPEED);
         let speed = velocity_x.hypot(velocity_y);
-        if !(0.0..=TOUCH_MOMENTUM_RELEASE_AGE_MS).contains(&release_age_ms) || speed < min_velocity
+        if !release_age_ms.is_finite()
+            || !velocity_x.is_finite()
+            || !velocity_y.is_finite()
+            || !(0.0..=TOUCH_MOMENTUM_RELEASE_AGE_MS).contains(&release_age_ms)
+            || speed < min_velocity
         {
             self.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
                 position,
@@ -286,6 +328,10 @@ impl WebWindowInner {
             let elapsed_ms = last_timestamp
                 .map(|last_timestamp| timestamp - last_timestamp)
                 .unwrap_or(1000.0 / 60.0);
+            if !elapsed_ms.is_finite() {
+                this.finish_touch_momentum(generation, TouchPhase::Ended);
+                return;
+            }
             if elapsed_ms <= 0.0 {
                 this.schedule_touch_momentum_frame(
                     generation,
@@ -436,18 +482,16 @@ impl WebWindowInner {
             let event: web_sys::PointerEvent = event.unchecked_into();
             event.prevent_default();
 
-            // Capture the pointer so drags that leave the canvas keep
-            // delivering pointermove/pointerup here; otherwise a release
-            // outside the canvas is never seen and `pressed_button` stays
-            // stuck. The capture is released implicitly on pointerup.
-            this.canvas.set_pointer_capture(event.pointer_id()).ok();
-
             let button = dom_mouse_button_to_gpui(event.button());
             let position = pointer_position_in_element(&event);
             let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
 
             if event.pointer_type() == "touch" {
+                this.cancel_active_touch(None);
                 this.cancel_touch_momentum();
+                // Capture only after stale touch state is cleared: pointer ids
+                // may be reused after a missed release.
+                this.canvas.set_pointer_capture(event.pointer_id()).ok();
                 this.update_active_status(true);
                 this.soft_keyboard_requested.set(false);
                 {
@@ -455,6 +499,7 @@ impl WebWindowInner {
                     current_state.mouse_position = position;
                     current_state.modifiers = modifiers;
                 }
+                this.update_hover_status(true);
                 this.dispatch_input(PlatformInput::Touch(TouchEvent {
                     id: TouchId(event.pointer_id() as u64),
                     phase: TouchPhase::Started,
@@ -462,7 +507,7 @@ impl WebWindowInner {
                     force: None,
                 }));
 
-                let resizing = body_cursor_is_resize(&this.browser_window);
+                let resizing = css_cursor_is_resize(this.last_cursor_css.get());
                 if resizing {
                     let button = MouseButton::Left;
                     this.pressed_button.set(Some(button));
@@ -491,6 +536,9 @@ impl WebWindowInner {
                 return;
             }
 
+            // Capture the pointer so drags that leave the canvas keep
+            // delivering pointermove/pointerup here.
+            this.canvas.set_pointer_capture(event.pointer_id()).ok();
             this.input_element.focus().ok();
             let time = js_sys::Date::now();
 
@@ -531,6 +579,7 @@ impl WebWindowInner {
                     this.active_touch.replace(Some(touch));
                     return;
                 }
+                this.canvas.release_pointer_capture(event.pointer_id()).ok();
 
                 {
                     let mut current_state = this.state.borrow_mut();
@@ -583,6 +632,7 @@ impl WebWindowInner {
                     position,
                     force: None,
                 }));
+                this.update_hover_status(false);
                 return;
             }
 
@@ -608,37 +658,15 @@ impl WebWindowInner {
         let this = Rc::clone(self);
         self.listen("pointercancel", move |event: JsValue| {
             let event: web_sys::PointerEvent = event.unchecked_into();
-            let Some(touch) = this.active_touch.take() else {
-                return;
-            };
-            if touch.pointer_id != event.pointer_id() {
-                this.active_touch.replace(Some(touch));
-                return;
-            }
+            this.cancel_active_touch(Some(event.pointer_id()));
+        })
+    }
 
-            this.canvas.release_pointer_capture(event.pointer_id()).ok();
-            if touch.resizing {
-                this.pressed_button.set(None);
-                this.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
-                    button: MouseButton::Left,
-                    position: touch.last_position,
-                    modifiers: Modifiers::default(),
-                    click_count: this.click_state.borrow().current_count,
-                }));
-            } else if touch.scrolling {
-                this.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
-                    position: touch.last_position,
-                    delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
-                    modifiers: Modifiers::default(),
-                    touch_phase: TouchPhase::Cancelled,
-                }));
-            }
-            this.dispatch_input(PlatformInput::Touch(TouchEvent {
-                id: TouchId(event.pointer_id() as u64),
-                phase: TouchPhase::Cancelled,
-                position: touch.last_position,
-                force: None,
-            }));
+    fn register_lost_pointer_capture(self: &Rc<Self>) -> EventListenerHandle {
+        let this = Rc::clone(self);
+        self.listen("lostpointercapture", move |event: JsValue| {
+            let event: web_sys::PointerEvent = event.unchecked_into();
+            this.cancel_active_touch(Some(event.pointer_id()));
         })
     }
 
@@ -769,13 +797,11 @@ impl WebWindowInner {
                 current_state.modifiers = modifiers;
                 current_state.is_hovered = false;
             }
-
             this.dispatch_input(PlatformInput::MouseExited(MouseExitEvent {
                 position,
                 pressed_button: current_pressed,
                 modifiers,
             }));
-
             this.with_callback(
                 |callbacks| &mut callbacks.hover_status_change,
                 |callback| callback(false),
@@ -1173,32 +1199,44 @@ impl WebWindowInner {
         })
     }
 
+    fn register_window_blur(self: &Rc<Self>) -> EventListenerHandle {
+        let this = Rc::clone(self);
+        EventListenerHandle::add(
+            self.browser_window.as_ref(),
+            "blur",
+            move |_event: JsValue| {
+                this.cancel_active_touch(None);
+                this.cancel_touch_momentum();
+            },
+        )
+    }
+
     fn register_pointer_enter(self: &Rc<Self>) -> EventListenerHandle {
         let this = Rc::clone(self);
         self.listen("pointerenter", move |_event: JsValue| {
-            {
-                let mut state = this.state.borrow_mut();
-                state.is_hovered = true;
-            }
-            this.with_callback(
-                |callbacks| &mut callbacks.hover_status_change,
-                |callback| callback(true),
-            );
+            this.update_hover_status(true);
         })
+    }
+
+    fn update_hover_status(&self, hovered: bool) {
+        let changed = {
+            let mut state = self.state.borrow_mut();
+            let changed = state.is_hovered != hovered;
+            state.is_hovered = hovered;
+            changed
+        };
+        if changed {
+            self.with_callback(
+                |callbacks| &mut callbacks.hover_status_change,
+                |callback| callback(hovered),
+            );
+        }
     }
 }
 
-fn body_cursor_is_resize(browser_window: &web_sys::Window) -> bool {
-    let Some(cursor) = browser_window
-        .document()
-        .and_then(|document| document.body())
-        .and_then(|body| body.style().get_property_value("cursor").ok())
-    else {
-        return false;
-    };
-
+fn css_cursor_is_resize(cursor: &str) -> bool {
     matches!(
-        cursor.as_str(),
+        cursor,
         "ew-resize"
             | "ns-resize"
             | "col-resize"
@@ -1437,6 +1475,9 @@ fn pointer_position_in_element(event: &web_sys::PointerEvent) -> Point<Pixels> {
 }
 
 fn clamp_touch_velocity(velocity_x: f32, velocity_y: f32, max_speed: f32) -> (f32, f32) {
+    if !velocity_x.is_finite() || !velocity_y.is_finite() {
+        return (0.0, 0.0);
+    }
     let speed = velocity_x.hypot(velocity_y);
     if speed <= max_speed {
         (velocity_x, velocity_y)

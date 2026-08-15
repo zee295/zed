@@ -64,6 +64,7 @@ pub(crate) struct WebWindowInner {
     pub(crate) notify_scale: Cell<bool>,
     pub(crate) is_composing: Cell<bool>,
     pub(crate) pending_clipboard: Rc<RefCell<Option<ClipboardItem>>>,
+    pub(crate) last_cursor_css: Rc<Cell<&'static str>>,
     keyboard_accessory: Option<KeyboardAccessory>,
     keyboard_accessory_expanded: Cell<bool>,
     keyboard_accessory_modifiers: Cell<Modifiers>,
@@ -141,6 +142,7 @@ impl WebWindow {
         lifecycle: Rc<Cell<WebWindowLifecycle>>,
         active_window: Rc<RefCell<Option<AnyWindowHandle>>>,
         pending_clipboard: Rc<RefCell<Option<ClipboardItem>>>,
+        last_cursor_css: Rc<Cell<&'static str>>,
     ) -> anyhow::Result<Self> {
         let document = browser_window
             .document()
@@ -221,6 +223,7 @@ impl WebWindow {
             notify_scale: Cell::new(false),
             is_composing: Cell::new(false),
             pending_clipboard,
+            last_cursor_css,
             keyboard_accessory,
             keyboard_accessory_expanded: Cell::new(false),
             keyboard_accessory_modifiers: Cell::new(Modifiers::default()),
@@ -472,6 +475,11 @@ impl WebWindowInner {
                         state_str == "visible"
                     })
                     .unwrap_or(true);
+
+                if !is_visible {
+                    this.cancel_active_touch(None);
+                    this.cancel_touch_momentum();
+                }
 
                 {
                     let mut state = this.state.borrow_mut();

@@ -388,6 +388,7 @@ impl Platform for WebPlatform {
             self.window_lifecycle.clone(),
             self.active_window.clone(),
             self.pending_clipboard.clone(),
+            self.last_cursor_css.clone(),
         );
         match window {
             Ok(window) => {
