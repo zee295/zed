@@ -1,10 +1,11 @@
 use std::rc::Rc;
 
 use gpui::{
-    Capslock, ClipboardEntry, ClipboardItem, DispatchEventResult, Image, ImageFormat, KeyDownEvent,
-    KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
-    MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, PlatformInput,
-    Point, ScrollDelta, ScrollWheelEvent, TouchEvent, TouchId, TouchPhase, point, px,
+    Capslock, ClipboardEntry, ClipboardItem, DispatchEventResult, GestureTuning, Image,
+    ImageFormat, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
+    MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
+    Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent, TouchEvent, TouchId, TouchPhase,
+    point, px,
 };
 use wasm_bindgen::prelude::*;
 
@@ -93,11 +94,27 @@ pub(crate) struct TouchPointerState {
     pointer_id: i32,
     start_position: Point<Pixels>,
     last_position: Point<Pixels>,
+    last_move_time: f64,
+    // CSS pixels per millisecond, smoothed across recent pointer moves.
+    velocity_x: f32,
+    velocity_y: f32,
     scrolling: bool,
     resizing: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct TouchMomentumState {
+    generation: u64,
+    position: Point<Pixels>,
+    modifiers: Modifiers,
+}
+
 const TOUCH_SCROLL_THRESHOLD: f32 = 6.0;
+const TOUCH_VELOCITY_SMOOTHING: f32 = 0.35;
+const TOUCH_MOMENTUM_MAX_SPEED: f32 = 4.0;
+const TOUCH_MOMENTUM_MAX_FRAME_MS: f32 = 32.0;
+const TOUCH_MOMENTUM_MAX_GAP_MS: f64 = 100.0;
+const TOUCH_MOMENTUM_RELEASE_AGE_MS: f64 = 80.0;
 
 impl Default for ClickState {
     fn default() -> Self {
@@ -186,6 +203,137 @@ impl WebWindowInner {
 
     fn dispatch_input(&self, input: PlatformInput) -> Option<DispatchEventResult> {
         self.with_callback(|callbacks| &mut callbacks.input, |callback| callback(input))
+    }
+
+    fn finish_touch_momentum(&self, generation: u64, phase: TouchPhase) {
+        let Some(momentum) = self.touch_momentum.get() else {
+            return;
+        };
+        if momentum.generation != generation {
+            return;
+        }
+
+        self.touch_momentum.set(None);
+        self.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+            position: momentum.position,
+            delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
+            modifiers: momentum.modifiers,
+            touch_phase: phase,
+        }));
+    }
+
+    fn cancel_touch_momentum(&self) {
+        let Some(momentum) = self.touch_momentum.get() else {
+            return;
+        };
+        self.finish_touch_momentum(momentum.generation, TouchPhase::Cancelled);
+    }
+
+    fn start_touch_momentum(
+        self: &Rc<Self>,
+        position: Point<Pixels>,
+        modifiers: Modifiers,
+        velocity_x: f32,
+        velocity_y: f32,
+        release_age_ms: f64,
+    ) {
+        let tuning = GestureTuning::default();
+        let min_velocity = tuning.min_fling_velocity / 1000.0;
+        let (velocity_x, velocity_y) =
+            clamp_touch_velocity(velocity_x, velocity_y, TOUCH_MOMENTUM_MAX_SPEED);
+        let speed = velocity_x.hypot(velocity_y);
+        if !(0.0..=TOUCH_MOMENTUM_RELEASE_AGE_MS).contains(&release_age_ms) || speed < min_velocity
+        {
+            self.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                position,
+                delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
+                modifiers,
+                touch_phase: TouchPhase::Ended,
+            }));
+            return;
+        }
+
+        let generation = self.touch_momentum_generation.get().wrapping_add(1);
+        self.touch_momentum_generation.set(generation);
+        self.touch_momentum.set(Some(TouchMomentumState {
+            generation,
+            position,
+            modifiers,
+        }));
+        self.schedule_touch_momentum_frame(generation, velocity_x, velocity_y, None);
+    }
+
+    fn schedule_touch_momentum_frame(
+        self: &Rc<Self>,
+        generation: u64,
+        mut velocity_x: f32,
+        mut velocity_y: f32,
+        last_timestamp: Option<f64>,
+    ) {
+        let weak = Rc::downgrade(self);
+        let callback = Closure::once_into_js(move |timestamp: f64| {
+            let Some(this) = weak.upgrade() else {
+                return;
+            };
+            if this
+                .touch_momentum
+                .get()
+                .is_none_or(|momentum| momentum.generation != generation)
+            {
+                return;
+            }
+
+            let elapsed_ms = last_timestamp
+                .map(|last_timestamp| timestamp - last_timestamp)
+                .unwrap_or(1000.0 / 60.0);
+            if elapsed_ms <= 0.0 {
+                this.schedule_touch_momentum_frame(
+                    generation,
+                    velocity_x,
+                    velocity_y,
+                    Some(timestamp),
+                );
+                return;
+            }
+            if elapsed_ms > TOUCH_MOMENTUM_MAX_GAP_MS {
+                this.finish_touch_momentum(generation, TouchPhase::Ended);
+                return;
+            }
+
+            let frame_ms = (elapsed_ms as f32).min(TOUCH_MOMENTUM_MAX_FRAME_MS);
+            let tuning = GestureTuning::default();
+            let decay = tuning.momentum_decay_per_ms.powf(frame_ms);
+            velocity_x *= decay;
+            velocity_y *= decay;
+
+            let min_velocity = tuning.min_fling_velocity / 1000.0;
+            if velocity_x.hypot(velocity_y) < min_velocity {
+                this.finish_touch_momentum(generation, TouchPhase::Ended);
+                return;
+            }
+
+            let Some(momentum) = this.touch_momentum.get() else {
+                return;
+            };
+            this.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                position: momentum.position,
+                delta: ScrollDelta::Pixels(point(
+                    px(velocity_x * frame_ms),
+                    px(velocity_y * frame_ms),
+                )),
+                modifiers: momentum.modifiers,
+                touch_phase: TouchPhase::Moved,
+            }));
+            this.schedule_touch_momentum_frame(generation, velocity_x, velocity_y, Some(timestamp));
+        });
+
+        if self
+            .browser_window
+            .request_animation_frame(callback.unchecked_ref())
+            .is_err()
+        {
+            self.finish_touch_momentum(generation, TouchPhase::Ended);
+        }
     }
 
     fn dispatch_accessory_key(&self, key: &str, modifiers: Modifiers) {
@@ -299,6 +447,7 @@ impl WebWindowInner {
             let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
 
             if event.pointer_type() == "touch" {
+                this.cancel_touch_momentum();
                 this.update_active_status(true);
                 this.soft_keyboard_requested.set(false);
                 {
@@ -333,6 +482,9 @@ impl WebWindowInner {
                     pointer_id: event.pointer_id(),
                     start_position: position,
                     last_position: position,
+                    last_move_time: event.time_stamp(),
+                    velocity_x: 0.0,
+                    velocity_y: 0.0,
                     scrolling: false,
                     resizing,
                 }));
@@ -395,12 +547,13 @@ impl WebWindowInner {
                         click_count: this.click_state.borrow().current_count,
                     }));
                 } else if touch.scrolling {
-                    this.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                    this.start_touch_momentum(
                         position,
-                        delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
                         modifiers,
-                        touch_phase: TouchPhase::Ended,
-                    }));
+                        touch.velocity_x,
+                        touch.velocity_y,
+                        event.time_stamp() - touch.last_move_time,
+                    );
                 } else {
                     // Delay the synthetic click until pointerup so a drag can
                     // become a scroll gesture without first selecting text.
@@ -528,10 +681,14 @@ impl WebWindowInner {
                 let distance = total_x.hypot(total_y);
                 if !touch.scrolling && distance < TOUCH_SCROLL_THRESHOLD {
                     touch.last_position = position;
+                    touch.last_move_time = event.time_stamp();
+                    touch.velocity_x = 0.0;
+                    touch.velocity_y = 0.0;
                     return;
                 }
 
-                let touch_phase = if touch.scrolling {
+                let was_scrolling = touch.scrolling;
+                let touch_phase = if was_scrolling {
                     TouchPhase::Moved
                 } else {
                     touch.scrolling = true;
@@ -541,7 +698,30 @@ impl WebWindowInner {
                     position.x - touch.last_position.x,
                     position.y - touch.last_position.y,
                 );
+                let elapsed_ms = event.time_stamp() - touch.last_move_time;
+                if elapsed_ms > 0.0 && elapsed_ms <= TOUCH_MOMENTUM_MAX_GAP_MS {
+                    let instantaneous_x = f32::from(delta.x) / elapsed_ms as f32;
+                    let instantaneous_y = f32::from(delta.y) / elapsed_ms as f32;
+                    if was_scrolling {
+                        touch.velocity_x = touch.velocity_x * (1.0 - TOUCH_VELOCITY_SMOOTHING)
+                            + instantaneous_x * TOUCH_VELOCITY_SMOOTHING;
+                        touch.velocity_y = touch.velocity_y * (1.0 - TOUCH_VELOCITY_SMOOTHING)
+                            + instantaneous_y * TOUCH_VELOCITY_SMOOTHING;
+                    } else {
+                        touch.velocity_x = instantaneous_x;
+                        touch.velocity_y = instantaneous_y;
+                    }
+                    (touch.velocity_x, touch.velocity_y) = clamp_touch_velocity(
+                        touch.velocity_x,
+                        touch.velocity_y,
+                        TOUCH_MOMENTUM_MAX_SPEED,
+                    );
+                } else {
+                    touch.velocity_x = 0.0;
+                    touch.velocity_y = 0.0;
+                }
                 touch.last_position = position;
+                touch.last_move_time = event.time_stamp();
                 drop(active_touch);
 
                 {
@@ -1254,6 +1434,16 @@ fn compute_key_char(
 fn pointer_position_in_element(event: &web_sys::PointerEvent) -> Point<Pixels> {
     let mouse_event: &web_sys::MouseEvent = event.as_ref();
     mouse_position_in_element(mouse_event)
+}
+
+fn clamp_touch_velocity(velocity_x: f32, velocity_y: f32, max_speed: f32) -> (f32, f32) {
+    let speed = velocity_x.hypot(velocity_y);
+    if speed <= max_speed {
+        (velocity_x, velocity_y)
+    } else {
+        let scale = max_speed / speed;
+        (velocity_x * scale, velocity_y * scale)
+    }
 }
 
 fn mouse_position_in_element(event: &web_sys::MouseEvent) -> Point<Pixels> {
