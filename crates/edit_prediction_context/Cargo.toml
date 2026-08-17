@@ -28,6 +28,7 @@ telemetry.workspace = true
 text.workspace = true
 tree-sitter = { workspace = true, features = ["wasm"] }
 util.workspace = true
+web-time.workspace = true
 zeta_prompt.workspace = true
 
 [dev-dependencies]

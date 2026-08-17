@@ -221,6 +221,7 @@ substantial CPU, memory, and build time.
 
 ```sh
 cargo test -p zed_web_server --bin zed-web-server
+./web/check-wasm-time.sh
 cargo +nightly check -p zed_web_workspace \
   --target wasm32-unknown-unknown \
   -Z build-std=std,panic_abort
@@ -254,6 +255,13 @@ After reviewing the result:
 The helper rebases the small web patch stack instead of creating recurring
 upstream merge commits. After each update, run server tests, the WASM check, a
 production image build, and browser tests before pushing `zed-web`.
+
+`std::time::Instant` compiles for `wasm32-unknown-unknown` but panics when
+`Instant::now()` runs. During every upstream update, preserve existing
+`web_time::Instant` substitutions and convert new runtime code linked into
+`zed_web_workspace`. `web/check-wasm-time.sh` records the remaining native-only
+and test-only uses and fails when an upstream update introduces another one.
+Review every allowlist change rather than accepting it mechanically.
 
 Release images are tagged with both the web branch revision and the upstream
 base revision through `build-info.json`.

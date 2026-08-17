@@ -46,6 +46,8 @@ jobs:
         run: ./script/download-wasi-sdk
       - name: Test Rust backend
         run: rustup run 1.95.0 cargo test -p zed_web_server --bin zed-web-server
+      - name: Audit WASM clock usage
+        run: ./web/check-wasm-time.sh
       - name: Check WASM frontend
         env:
           CC_wasm32_unknown_unknown: ${{ github.workspace }}/target/wasi-sdk/bin/clang

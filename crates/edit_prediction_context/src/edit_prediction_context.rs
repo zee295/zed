@@ -8,16 +8,11 @@ use gpui::{
 use language::{Anchor, Bias, Buffer, BufferSnapshot, OffsetRangeExt as _, Point, ToOffset as _};
 use project::{EditPredictionDefinition, Project, ProjectPath};
 use smallvec::SmallVec;
-use std::{
-    collections::hash_map,
-    ops::Range,
-    path::Path,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::hash_map, ops::Range, path::Path, sync::Arc, time::Duration};
 use util::paths::PathStyle;
 use util::rel_path::RelPath;
 use util::{RangeExt as _, ResultExt};
+use web_time::Instant;
 
 mod assemble_excerpts;
 mod bm25_context;

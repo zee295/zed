@@ -3,8 +3,9 @@ use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     rc::Rc,
-    time::{Duration, Instant},
+    time::Duration,
 };
+use web_time::Instant;
 
 use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System};
 

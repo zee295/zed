@@ -31,3 +31,4 @@ percent-encoding.workspace = true
 proxyvars.workspace = true
 thiserror.workspace = true
 url.workspace = true
+web-time.workspace = true

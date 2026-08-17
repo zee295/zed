@@ -7,9 +7,10 @@ use crate::{
 };
 use editor::Editor;
 use gpui::{AppContext, Context, Entity, Subscription, Task};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use text::BufferSnapshot;
 use ui::{SharedString, table_row::TableRow};
+use web_time::Instant;
 
 pub(crate) const REPARSE_DEBOUNCE: Duration = Duration::from_millis(200);
 

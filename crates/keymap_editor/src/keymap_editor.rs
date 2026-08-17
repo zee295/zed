@@ -4,8 +4,9 @@ use std::{
     ops::{Not as _, Range},
     rc::Rc,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
+use web_time::Instant;
 
 mod action_completion_provider;
 mod ui_components;

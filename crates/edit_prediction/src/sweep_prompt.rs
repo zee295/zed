@@ -4,7 +4,8 @@ use language::{
     BufferSnapshot, OffsetRangeExt as _, Point, ToOffset as _, ToPoint as _,
     language_settings::all_language_settings,
 };
-use std::{fmt::Write as _, ops::Range, path::Path, sync::Arc, time::Instant};
+use std::{fmt::Write as _, ops::Range, path::Path, sync::Arc};
+use web_time::Instant;
 use zeta_prompt::{RelatedFile, Zeta2PromptInput, filter_redundant_excerpts};
 
 use crate::{

@@ -3413,6 +3413,7 @@ dependencies = [
  "serde",
  "serde_json",
  "text",
+ "web-time",
  "zed_credentials_provider",
  "zeta_prompt",
 ]
@@ -4602,6 +4603,7 @@ dependencies = [
  "picker",
  "text",
  "ui",
+ "web-time",
  "workspace",
 ]
 
@@ -5686,6 +5688,7 @@ dependencies = [
  "text",
  "tree-sitter",
  "util",
+ "web-time",
  "zeta_prompt",
 ]
 
@@ -8770,6 +8773,7 @@ dependencies = [
  "proxyvars",
  "thiserror 2.0.17",
  "url",
+ "web-time",
 ]
 
 [[package]]
@@ -9727,6 +9731,7 @@ dependencies = [
  "ui",
  "ui_input",
  "util",
+ "web-time",
  "workspace",
  "zed_actions",
 ]
@@ -10129,6 +10134,7 @@ dependencies = [
  "tree-sitter",
  "ui",
  "util",
+ "web-time",
  "workspace",
  "zed_actions",
  "zlog",
@@ -16618,6 +16624,7 @@ dependencies = [
  "unindent",
  "util",
  "util_macros",
+ "web-time",
  "workspace",
  "zed_actions",
  "ztracing",

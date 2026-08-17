@@ -14,12 +14,9 @@ use language::{
 use language_model::{ApiKeyState, AuthenticateError, EnvVar, env_var};
 use serde::{Deserialize, Serialize};
 
-use std::{
-    ops::Range,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{ops::Range, sync::Arc, time::Duration};
 use text::ToOffset;
+use web_time::Instant;
 
 pub const CODESTRAL_API_URL: &str = "https://codestral.mistral.ai";
 pub const DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(150);

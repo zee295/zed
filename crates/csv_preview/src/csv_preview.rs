@@ -3,10 +3,8 @@ use feature_flags::{FeatureFlag, FeatureFlagAppExt as _, PresenceFlag, register_
 use gpui::{
     AppContext, Entity, EventEmitter, FocusHandle, Focusable, ListAlignment, Task, actions,
 };
-use std::{
-    collections::HashMap,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, time::Duration};
+use web_time::Instant;
 
 use crate::table_data_engine::{DisplayToDataMapping, TableDataEngine};
 use ui::{
@@ -54,7 +52,7 @@ pub struct CsvPreviewView {
     /// pass, so it tracks the real row height instead of a hardcoded guess.
     pub(crate) row_height: Pixels,
     /// Time when the last parsing operation ended, used for smart debouncing
-    pub(crate) last_parse_end_time: Option<std::time::Instant>,
+    pub(crate) last_parse_end_time: Option<Instant>,
 }
 
 pub fn init(cx: &mut App) {

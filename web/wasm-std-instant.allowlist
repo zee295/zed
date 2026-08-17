@@ -1,0 +1,47 @@
+2 crates/acp_thread/src/acp_thread.rs:std::time::Instant
+2 crates/agent/src/tests/mod.rs:std::time::Instant
+1 crates/agent/src/tools/evals/fixtures/disable_cursor_blinking/before.rs:use std::{ any::TypeId, borrow::Cow, cell::RefCell, cmp::{self, Ordering, Reverse}, mem, num::NonZeroU32, ops::{ControlFlow, Deref, DerefMut, Not as _, Range, RangeInclusive}, path::{Path, PathBuf}, rc::Rc, time::{Duration, Instant}, };
+1 crates/agent_ui/src/agent_panel.rs:std::time::Instant
+1 crates/agent_ui/src/agent_panel.rs:use std::time::Instant;
+1 crates/alacritty_terminal/src/event_loop.rs:std::time::Instant
+1 crates/alacritty_terminal/src/event_loop.rs:use std::time::Instant;
+1 crates/alacritty_terminal/src/tty/unix.rs:use std::time::{Duration, Instant};
+1 crates/editor/src/editor.rs:std::time::Instant
+1 crates/editor/src/editor.rs:use std::time::Instant;
+1 crates/editor/src/editor_tests.rs:use std::{cell::RefCell, future::Future, rc::Rc, sync::atomic::AtomicBool, time::Instant};
+1 crates/editor/src/element/mouse.rs:std::time::Instant
+1 crates/editor/src/element/mouse.rs:use std::time::Instant;
+1 crates/editor/src/scroll.rs:std::time::Instant
+1 crates/editor/src/scroll.rs:use std::time::Instant;
+1 crates/git_ui/src/git_graph.rs:std::time::Instant
+1 crates/git_ui/src/git_graph.rs:use std::time::Instant;
+1 crates/gpui/src/executor.rs:std::time::Instant
+1 crates/gpui/src/platform_scheduler.rs:std::time::Instant
+1 crates/gpui/src/platform_scheduler.rs:use std::time::Instant as StdInstant;
+1 crates/language/src/buffer.rs:std::time::Instant
+1 crates/language/src/buffer.rs:use std::time::Instant;
+1 crates/language/src/buffer_tests.rs:use std::{ env, ops::Range, sync::LazyLock, time::{Duration, Instant}, };
+1 crates/multi_buffer/src/multi_buffer_tests.rs:use std::time::{Duration, Instant};
+1 crates/multi_buffer/src/transaction.rs:std::time::Instant
+1 crates/multi_buffer/src/transaction.rs:use std::time::Instant;
+1 crates/project/src/agent_registry_store.rs:std::time::Instant
+1 crates/project/src/agent_registry_store.rs:use std::time::Instant;
+1 crates/project/src/buffer_store.rs:std::time::Instant
+1 crates/project/src/buffer_store.rs:use std::time::Instant;
+1 crates/project/src/git_store.rs:std::time::Instant
+1 crates/project/src/git_store.rs:use std::time::Instant;
+1 crates/project/src/git_store/job_debug_queue.rs:std::time::Instant
+1 crates/project/src/git_store/job_debug_queue.rs:use std::time::Instant;
+1 crates/project/src/lsp_store.rs:std::time::Instant
+1 crates/project/src/lsp_store.rs:use std::time::Instant;
+5 crates/recent_projects/src/remote_connections.rs:std::time::Instant
+1 crates/sandbox/src/macos_seatbelt.rs:use std::time::{Duration, Instant};
+4 crates/sidebar/src/sidebar_tests.rs:std::time::Instant
+1 crates/terminal/src/alacritty/hyperlinks.rs:std::time::Instant
+1 crates/terminal/src/terminal.rs:std::time::Instant
+1 crates/terminal_view/src/terminal_element.rs:std::time::Instant
+1 crates/text/src/tests.rs:use std::{ cmp::Ordering, env, iter::Iterator, time::{Duration, Instant}, };
+1 crates/text/src/text.rs:std::time::Instant
+1 crates/text/src/text.rs:use std::time::Instant;
+2 crates/util/src/command/darwin.rs:std::time::Instant
+1 crates/util/src/process.rs:use std::time::{Duration, Instant};

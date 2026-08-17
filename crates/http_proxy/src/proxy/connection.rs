@@ -23,8 +23,9 @@ use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs as _};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use url::Url;
+use web_time::Instant;
 
 /// Buffer size for each direction of bidir copy. 64 KiB is the sweet spot
 /// for most networks — large enough to keep the pipe full, small enough
