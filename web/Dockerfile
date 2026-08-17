@@ -13,6 +13,7 @@ ARG TARGETARCH
 ARG WEB_REVISION=unknown
 ARG UPSTREAM_REVISION=unknown
 ARG BROTLI_QUALITY=11
+ARG CARGO_BUILD_JOBS=2
 
 WORKDIR /src
 COPY script/linux /tmp/install-zed-linux
@@ -32,6 +33,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     WEB_REVISION="${WEB_REVISION}" \
     UPSTREAM_REVISION="${UPSTREAM_REVISION}" \
     BROTLI_QUALITY="${BROTLI_QUALITY}" \
+    CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS}" \
     RUST_STABLE_TOOLCHAIN="${RUST_VERSION}" \
     ./web/build.sh
 

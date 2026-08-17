@@ -65,9 +65,11 @@ jobs:
           - architecture: amd64
             runner: ubuntu-24.04
             platform: linux/amd64
+            cargo_jobs: 2
           - architecture: arm64
             runner: ubuntu-24.04-arm
             platform: linux/arm64
+            cargo_jobs: 4
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
     steps:
@@ -91,6 +93,7 @@ jobs:
           push: true
           tags: ghcr.io/${{ github.repository_owner }}/zed-web:${{ github.sha }}-${{ matrix.architecture }}
           build-args: |
+            CARGO_BUILD_JOBS=${{ matrix.cargo_jobs }}
             WEB_REVISION=${{ github.sha }}
             UPSTREAM_REVISION=${{ steps.revisions.outputs.upstream }}
           cache-from: type=gha,scope=zed-web-${{ matrix.architecture }}
