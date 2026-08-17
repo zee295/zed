@@ -1,6 +1,7 @@
 use crate::display::WebDisplay;
 use crate::events::{
-    ClickState, EventListenerHandle, TouchPointerState, WebEventListeners, is_mac_platform,
+    ClickState, EventListenerHandle, TouchMomentumState, TouchPointerState, WebEventListeners,
+    is_mac_platform,
 };
 use crate::platform::WebWindowLifecycle;
 use std::sync::Arc;
@@ -56,6 +57,7 @@ pub(crate) struct WebWindowInner {
     pub(crate) click_state: RefCell<ClickState>,
     pub(crate) pressed_button: Cell<Option<MouseButton>>,
     pub(crate) active_touch: RefCell<Option<TouchPointerState>>,
+    pub(crate) touch_momentum: Cell<Option<TouchMomentumState>>,
     pub(crate) soft_keyboard_requested: Cell<bool>,
     pub(crate) last_physical_size: Cell<(u32, u32)>,
     pub(crate) notify_scale: Cell<bool>,
@@ -213,6 +215,7 @@ impl WebWindow {
             click_state: RefCell::new(ClickState::default()),
             pressed_button: Cell::new(None),
             active_touch: RefCell::new(None),
+            touch_momentum: Cell::new(None),
             soft_keyboard_requested: Cell::new(false),
             last_physical_size: Cell::new((0, 0)),
             notify_scale: Cell::new(false),
@@ -380,10 +383,10 @@ impl WebWindowInner {
         let raf_handle_inner = Rc::clone(&raf_handle);
 
         let this = Rc::clone(self);
-        let closure = Closure::new(move |_timestamp| {
-            // Coalesce high-frequency touch moves into one GPUI scroll update
-            // per rendered frame, especially while dynamic lists remeasure.
-            this.flush_active_touch_scroll(None);
+        let closure = Closure::new(move |timestamp| {
+            // Momentum shares the platform's frame callback so input cannot
+            // re-enter GPUI through an independent animation-frame callback.
+            this.tick_touch_momentum(timestamp);
             this.with_callback(
                 |callbacks| &mut callbacks.request_frame,
                 |callback| {
@@ -476,6 +479,7 @@ impl WebWindowInner {
 
                 if !is_visible {
                     this.cancel_active_touch(None);
+                    this.cancel_touch_momentum();
                 }
 
                 {
