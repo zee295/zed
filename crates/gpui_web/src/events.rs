@@ -104,9 +104,11 @@ pub(crate) struct TouchPointerState {
 
 #[derive(Clone, Copy)]
 pub(crate) struct TouchMomentumState {
-    generation: u64,
     position: Point<Pixels>,
     modifiers: Modifiers,
+    velocity_x: f32,
+    velocity_y: f32,
+    last_timestamp: Option<f64>,
 }
 
 const TOUCH_SCROLL_THRESHOLD: f32 = 6.0;
@@ -243,15 +245,11 @@ impl WebWindowInner {
         self.update_hover_status(false);
     }
 
-    fn finish_touch_momentum(&self, generation: u64, phase: TouchPhase) {
-        let Some(momentum) = self.touch_momentum.get() else {
+    fn finish_touch_momentum(&self, phase: TouchPhase) {
+        let Some(momentum) = self.touch_momentum.take() else {
             return;
         };
-        if momentum.generation != generation {
-            return;
-        }
 
-        self.touch_momentum.set(None);
         self.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
             position: momentum.position,
             delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
@@ -261,14 +259,11 @@ impl WebWindowInner {
     }
 
     pub(crate) fn cancel_touch_momentum(&self) {
-        let Some(momentum) = self.touch_momentum.get() else {
-            return;
-        };
-        self.finish_touch_momentum(momentum.generation, TouchPhase::Cancelled);
+        self.finish_touch_momentum(TouchPhase::Cancelled);
     }
 
     fn start_touch_momentum(
-        self: &Rc<Self>,
+        &self,
         position: Point<Pixels>,
         modifiers: Modifiers,
         velocity_x: f32,
@@ -295,91 +290,57 @@ impl WebWindowInner {
             return;
         }
 
-        let generation = self.touch_momentum_generation.get().wrapping_add(1);
-        self.touch_momentum_generation.set(generation);
         self.touch_momentum.set(Some(TouchMomentumState {
-            generation,
             position,
             modifiers,
+            velocity_x,
+            velocity_y,
+            last_timestamp: None,
         }));
-        self.schedule_touch_momentum_frame(generation, velocity_x, velocity_y, None);
     }
 
-    fn schedule_touch_momentum_frame(
-        self: &Rc<Self>,
-        generation: u64,
-        mut velocity_x: f32,
-        mut velocity_y: f32,
-        last_timestamp: Option<f64>,
-    ) {
-        let weak = Rc::downgrade(self);
-        let callback = Closure::once_into_js(move |timestamp: f64| {
-            let Some(this) = weak.upgrade() else {
-                return;
-            };
-            if this
-                .touch_momentum
-                .get()
-                .is_none_or(|momentum| momentum.generation != generation)
-            {
-                return;
-            }
-
-            let elapsed_ms = last_timestamp
-                .map(|last_timestamp| timestamp - last_timestamp)
-                .unwrap_or(1000.0 / 60.0);
-            if !elapsed_ms.is_finite() {
-                this.finish_touch_momentum(generation, TouchPhase::Ended);
-                return;
-            }
-            if elapsed_ms <= 0.0 {
-                this.schedule_touch_momentum_frame(
-                    generation,
-                    velocity_x,
-                    velocity_y,
-                    Some(timestamp),
-                );
-                return;
-            }
-            if elapsed_ms > TOUCH_MOMENTUM_MAX_GAP_MS {
-                this.finish_touch_momentum(generation, TouchPhase::Ended);
-                return;
-            }
-
-            let frame_ms = (elapsed_ms as f32).min(TOUCH_MOMENTUM_MAX_FRAME_MS);
-            let tuning = GestureTuning::default();
-            let decay = tuning.momentum_decay_per_ms.powf(frame_ms);
-            velocity_x *= decay;
-            velocity_y *= decay;
-
-            let min_velocity = tuning.min_fling_velocity / 1000.0;
-            if velocity_x.hypot(velocity_y) < min_velocity {
-                this.finish_touch_momentum(generation, TouchPhase::Ended);
-                return;
-            }
-
-            let Some(momentum) = this.touch_momentum.get() else {
-                return;
-            };
-            this.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
-                position: momentum.position,
-                delta: ScrollDelta::Pixels(point(
-                    px(velocity_x * frame_ms),
-                    px(velocity_y * frame_ms),
-                )),
-                modifiers: momentum.modifiers,
-                touch_phase: TouchPhase::Moved,
-            }));
-            this.schedule_touch_momentum_frame(generation, velocity_x, velocity_y, Some(timestamp));
-        });
-
-        if self
-            .browser_window
-            .request_animation_frame(callback.unchecked_ref())
-            .is_err()
-        {
-            self.finish_touch_momentum(generation, TouchPhase::Ended);
+    pub(crate) fn tick_touch_momentum(&self, timestamp: f64) {
+        let Some(mut momentum) = self.touch_momentum.get() else {
+            return;
+        };
+        let elapsed_ms = momentum
+            .last_timestamp
+            .map(|last_timestamp| timestamp - last_timestamp)
+            .unwrap_or(1000.0 / 60.0);
+        if !elapsed_ms.is_finite() || elapsed_ms > TOUCH_MOMENTUM_MAX_GAP_MS {
+            self.finish_touch_momentum(TouchPhase::Ended);
+            return;
         }
+        if elapsed_ms <= 0.0 {
+            return;
+        }
+
+        let frame_ms = (elapsed_ms as f32).min(TOUCH_MOMENTUM_MAX_FRAME_MS);
+        let tuning = GestureTuning::default();
+        let decay = tuning.momentum_decay_per_ms.powf(frame_ms);
+        momentum.velocity_x *= decay;
+        momentum.velocity_y *= decay;
+
+        let min_velocity = tuning.min_fling_velocity / 1000.0;
+        if !momentum.velocity_x.is_finite()
+            || !momentum.velocity_y.is_finite()
+            || momentum.velocity_x.hypot(momentum.velocity_y) < min_velocity
+        {
+            self.finish_touch_momentum(TouchPhase::Ended);
+            return;
+        }
+
+        momentum.last_timestamp = Some(timestamp);
+        self.touch_momentum.set(Some(momentum));
+        self.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+            position: momentum.position,
+            delta: ScrollDelta::Pixels(point(
+                px(momentum.velocity_x * frame_ms),
+                px(momentum.velocity_y * frame_ms),
+            )),
+            modifiers: momentum.modifiers,
+            touch_phase: TouchPhase::Moved,
+        }));
     }
 
     fn dispatch_accessory_key(&self, key: &str, modifiers: Modifiers) {

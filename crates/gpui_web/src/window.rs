@@ -58,7 +58,6 @@ pub(crate) struct WebWindowInner {
     pub(crate) pressed_button: Cell<Option<MouseButton>>,
     pub(crate) active_touch: RefCell<Option<TouchPointerState>>,
     pub(crate) touch_momentum: Cell<Option<TouchMomentumState>>,
-    pub(crate) touch_momentum_generation: Cell<u64>,
     pub(crate) soft_keyboard_requested: Cell<bool>,
     pub(crate) last_physical_size: Cell<(u32, u32)>,
     pub(crate) notify_scale: Cell<bool>,
@@ -86,7 +85,7 @@ pub struct WebWindow {
     display: Rc<dyn PlatformDisplay>,
     lifecycle: Rc<Cell<WebWindowLifecycle>>,
     active_window: Rc<RefCell<Option<AnyWindowHandle>>>,
-    _raf_closure: Closure<dyn FnMut()>,
+    _raf_closure: Closure<dyn FnMut(f64)>,
     _resize_observer: Option<web_sys::ResizeObserver>,
     _resize_observer_closure: Closure<dyn FnMut(js_sys::Array)>,
     _event_listeners: WebEventListeners,
@@ -217,7 +216,6 @@ impl WebWindow {
             pressed_button: Cell::new(None),
             active_touch: RefCell::new(None),
             touch_momentum: Cell::new(None),
-            touch_momentum_generation: Cell::new(0),
             soft_keyboard_requested: Cell::new(false),
             last_physical_size: Cell::new((0, 0)),
             notify_scale: Cell::new(false),
@@ -380,12 +378,15 @@ impl WebWindowInner {
         Some(result)
     }
 
-    fn create_raf_closure(self: &Rc<Self>) -> Closure<dyn FnMut()> {
+    fn create_raf_closure(self: &Rc<Self>) -> Closure<dyn FnMut(f64)> {
         let raf_handle: Rc<RefCell<Option<js_sys::Function>>> = Rc::new(RefCell::new(None));
         let raf_handle_inner = Rc::clone(&raf_handle);
 
         let this = Rc::clone(self);
-        let closure = Closure::new(move || {
+        let closure = Closure::new(move |timestamp| {
+            // Momentum shares the platform's frame callback so input cannot
+            // re-enter GPUI through an independent animation-frame callback.
+            this.tick_touch_momentum(timestamp);
             this.with_callback(
                 |callbacks| &mut callbacks.request_frame,
                 |callback| {
@@ -410,7 +411,7 @@ impl WebWindowInner {
         closure
     }
 
-    fn schedule_raf(&self, closure: &Closure<dyn FnMut()>) {
+    fn schedule_raf(&self, closure: &Closure<dyn FnMut(f64)>) {
         self.raf_id.set(
             self.browser_window
                 .request_animation_frame(closure.as_ref().unchecked_ref())

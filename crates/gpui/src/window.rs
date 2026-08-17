@@ -5045,6 +5045,7 @@ impl Window {
             },
             PlatformInput::Touch(touch) => {
                 self.mouse_position = touch.position;
+                self.mouse_hit_test = self.rendered_frame.hit_test(touch.position);
                 self.reset_cursor_style(cx);
                 PlatformInput::Touch(touch)
             }

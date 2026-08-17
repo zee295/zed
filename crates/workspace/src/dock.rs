@@ -23,7 +23,7 @@ use ui::{
 use util::ResultExt as _;
 
 pub(crate) const RESIZE_HANDLE_SIZE: Pixels = px(6.);
-const MOBILE_RESIZE_HANDLE_SIZE: Pixels = px(18.);
+const MOBILE_RESIZE_HANDLE_SIZE: Pixels = px(32.);
 const MOBILE_VIEWPORT_MAX_WIDTH: Pixels = px(900.);
 
 pub enum PanelEvent {
