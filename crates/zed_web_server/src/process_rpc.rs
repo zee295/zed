@@ -1,17 +1,19 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env,
+    io::Write as _,
     path::PathBuf,
     process::{Command, Stdio},
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
-
-#[cfg(target_os = "linux")]
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context as _, Result, bail};
 use axum::extract::ws::Message;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use flate2::{Compression, write::ZlibEncoder};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -27,6 +29,7 @@ const PROCESS_IDENTITY_ENV: &str = "ZED_WEB_PROCESS_IDENTITY";
 const MAX_DEFERRED_ACP_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ACP_OUTPUT_BATCH_BYTES: usize = 128 * 1024;
 const ACP_OUTPUT_BATCH_DELAY: std::time::Duration = std::time::Duration::from_millis(4);
+const MIN_COMPRESSIBLE_ACP_OUTPUT_BYTES: usize = 1024;
 
 pub fn handles(method: &str) -> bool {
     matches!(method, "Process::output" | "Process::status")
@@ -60,6 +63,7 @@ struct ProcessEntry {
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     stdin_rewriter: Mutex<FrameRewriter>,
     acp_activity: Arc<StdMutex<AcpActivity>>,
+    compressed_output: Arc<AtomicBool>,
     sanitize_lldb: bool,
     #[cfg(target_os = "linux")]
     process_group_id: Option<u32>,
@@ -307,6 +311,7 @@ impl ProcessManager {
             .is_some_and(|name| name.contains("lldb-dap"));
         let mut process_environment = environment(params);
         let kind = ProcessKind::from_environment(&mut process_environment);
+        let supports_compressed_output = bool_param(params, "supports_compressed_output");
         let logical_id = process_environment.remove(PROCESS_IDENTITY_ENV);
         let cwd = params
             .get("cwd")
@@ -330,6 +335,7 @@ impl ProcessManager {
                         ProcessKind::AcpAgent,
                         identity,
                         owner_generation,
+                        supports_compressed_output,
                     ) {
                         return Ok(json!({"proc_id": proc_id}));
                     }
@@ -339,6 +345,7 @@ impl ProcessManager {
                         ProcessKind::McpServer,
                         identity,
                         owner_generation,
+                        supports_compressed_output,
                     ) {
                         return Ok(json!({"proc_id": proc_id}));
                     }
@@ -389,6 +396,7 @@ impl ProcessManager {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let acp_activity = Arc::new(StdMutex::new(AcpActivity::default()));
+        let compressed_output = Arc::new(AtomicBool::new(supports_compressed_output));
         let outgoing = self.outgoing.clone();
         let stdout_task = stdout.map(|stdout| {
             tokio::spawn(pump_output(
@@ -398,6 +406,7 @@ impl ProcessManager {
                 outgoing.clone(),
                 None,
                 (kind == ProcessKind::AcpAgent).then(|| acp_activity.clone()),
+                (kind == ProcessKind::AcpAgent).then(|| compressed_output.clone()),
             ))
         });
         let stderr_task = stderr.map(|stderr| {
@@ -406,6 +415,7 @@ impl ProcessManager {
                 proc_id,
                 "Process::stderr",
                 outgoing.clone(),
+                None,
                 None,
                 None,
             ))
@@ -447,6 +457,7 @@ impl ProcessManager {
                 stdin,
                 stdin_rewriter: Mutex::new(FrameRewriter::new(Vec::new(), Vec::new())),
                 acp_activity,
+                compressed_output,
                 sanitize_lldb,
                 #[cfg(target_os = "linux")]
                 process_group_id,
@@ -553,6 +564,7 @@ impl ProcessManager {
         kind: ProcessKind,
         identity: &ProcessIdentity,
         owner_generation: u64,
+        supports_compressed_output: bool,
     ) -> Option<u64> {
         let proc_id = self.processes.iter().find_map(|(proc_id, entry)| {
             (entry.disconnected
@@ -564,6 +576,9 @@ impl ProcessManager {
         let entry = self.processes.get_mut(&proc_id)?;
         entry.owner_generation = owner_generation;
         entry.disconnected = false;
+        entry
+            .compressed_output
+            .store(supports_compressed_output, Ordering::Relaxed);
         tracing::info!(
             proc_id,
             ?kind,
@@ -580,18 +595,24 @@ impl ProcessManager {
             .context("missing process ids")?;
         let mut attached = Vec::new();
         let mut missing = Vec::new();
+        let supports_compressed_output = bool_param(params, "supports_compressed_output");
         for proc_id in proc_ids.iter().filter_map(Value::as_u64) {
             if let Some(entry) = self.processes.get_mut(&proc_id) {
                 entry.owner_generation = owner_generation;
                 entry.disconnected = false;
+                entry
+                    .compressed_output
+                    .store(supports_compressed_output, Ordering::Relaxed);
                 if entry.kind == ProcessKind::AcpAgent
                     && let Ok(mut activity) = entry.acp_activity.lock()
                 {
                     for frame in activity.resume_existing_client() {
-                        notify(
+                        notify_process_output(
                             &self.outgoing,
                             "Process::stdout",
-                            json!({"proc_id": proc_id, "data": BASE64.encode(frame)}),
+                            proc_id,
+                            frame,
+                            supports_compressed_output,
                         );
                     }
                 }
@@ -939,9 +960,18 @@ async fn pump_output(
     outgoing: mpsc::UnboundedSender<Message>,
     rewrite: Option<(Vec<u8>, Vec<u8>)>,
     acp_activity: Option<Arc<StdMutex<AcpActivity>>>,
+    compressed_output: Option<Arc<AtomicBool>>,
 ) {
     if let Some(activity) = acp_activity {
-        pump_acp_output(&mut stream, proc_id, method, outgoing, activity).await;
+        pump_acp_output(
+            &mut stream,
+            proc_id,
+            method,
+            outgoing,
+            activity,
+            compressed_output.expect("ACP output compression state must be present"),
+        )
+        .await;
         return;
     }
 
@@ -984,6 +1014,7 @@ async fn pump_acp_output(
     method: &'static str,
     outgoing: mpsc::UnboundedSender<Message>,
     activity: Arc<StdMutex<AcpActivity>>,
+    compressed_output: Arc<AtomicBool>,
 ) {
     let mut read_buffer = [0_u8; 4096];
     let mut output_batch = Vec::new();
@@ -996,7 +1027,13 @@ async fn pump_acp_output(
             {
                 Ok(read) => read,
                 Err(_) => {
-                    flush_acp_output(&outgoing, proc_id, method, &mut output_batch);
+                    flush_acp_output(
+                        &outgoing,
+                        proc_id,
+                        method,
+                        &mut output_batch,
+                        compressed_output.load(Ordering::Relaxed),
+                    );
                     continue;
                 }
             }
@@ -1016,12 +1053,24 @@ async fn pump_acp_output(
         for chunk in routed {
             output_batch.extend_from_slice(&chunk);
             if output_batch.len() >= MAX_ACP_OUTPUT_BATCH_BYTES {
-                flush_acp_output(&outgoing, proc_id, method, &mut output_batch);
+                flush_acp_output(
+                    &outgoing,
+                    proc_id,
+                    method,
+                    &mut output_batch,
+                    compressed_output.load(Ordering::Relaxed),
+                );
             }
         }
     }
 
-    flush_acp_output(&outgoing, proc_id, method, &mut output_batch);
+    flush_acp_output(
+        &outgoing,
+        proc_id,
+        method,
+        &mut output_batch,
+        compressed_output.load(Ordering::Relaxed),
+    );
 }
 
 fn flush_acp_output(
@@ -1029,11 +1078,41 @@ fn flush_acp_output(
     proc_id: u64,
     method: &'static str,
     output_batch: &mut Vec<u8>,
+    compress: bool,
 ) {
     if output_batch.is_empty() {
         return;
     }
     let data = std::mem::take(output_batch);
+    notify_process_output(outgoing, method, proc_id, data, compress);
+}
+
+fn notify_process_output(
+    outgoing: &mpsc::UnboundedSender<Message>,
+    method: &'static str,
+    proc_id: u64,
+    data: Vec<u8>,
+    compress: bool,
+) {
+    if compress && data.len() >= MIN_COMPRESSIBLE_ACP_OUTPUT_BYTES {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        if encoder.write_all(&data).is_ok()
+            && let Ok(compressed) = encoder.finish()
+            && compressed.len() < data.len()
+        {
+            notify(
+                outgoing,
+                method,
+                json!({
+                    "proc_id": proc_id,
+                    "data": BASE64.encode(compressed),
+                    "encoding": "zlib",
+                }),
+            );
+            return;
+        }
+    }
+
     notify(
         outgoing,
         method,
@@ -1157,17 +1236,21 @@ fn sanitize_lldb_frame(frame: Vec<u8>) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        io::Read as _,
+        sync::{Arc, atomic::AtomicBool},
+    };
 
     use anyhow::Result;
     use axum::extract::ws::Message;
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use flate2::read::ZlibDecoder;
     use serde_json::json;
     use tokio::{io::AsyncWriteExt as _, sync::mpsc};
 
     use super::{
-        AcpActivity, FrameRewriter, OrphanedProcessReap, ProcessManager, pump_output,
-        rewrite_process_value, sanitize_lldb_frame,
+        AcpActivity, FrameRewriter, OrphanedProcessReap, ProcessManager, notify_process_output,
+        pump_output, rewrite_process_value, sanitize_lldb_frame,
     };
     use crate::fs_rpc::FsRpc;
 
@@ -1260,6 +1343,7 @@ mod tests {
             outgoing,
             None,
             Some(activity),
+            Some(Arc::new(AtomicBool::new(false))),
         ));
         let mut expected = Vec::new();
         for index in 0..64 {
@@ -1299,6 +1383,32 @@ mod tests {
         writer.shutdown().await?;
         pump.await?;
         assert!(notifications.try_recv().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn compresses_acp_output_when_the_client_supports_it() -> anyhow::Result<()> {
+        let (outgoing, mut notifications) = mpsc::unbounded_channel::<Message>();
+        let expected = br#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"claude-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"repeated history content repeated history content"}}}}
+"#
+        .repeat(64);
+
+        notify_process_output(&outgoing, "Process::stdout", 91, expected.clone(), true);
+
+        let Message::Text(notification) = notifications.try_recv()? else {
+            anyhow::bail!("expected ACP stdout notification");
+        };
+        let notification: serde_json::Value = serde_json::from_str(&notification)?;
+        assert_eq!(notification["params"]["encoding"], "zlib");
+        let compressed = BASE64.decode(
+            notification["params"]["data"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("missing ACP output data"))?,
+        )?;
+        let mut decoded = Vec::new();
+        ZlibDecoder::new(compressed.as_slice()).read_to_end(&mut decoded)?;
+        assert_eq!(decoded, expected);
+        assert!(compressed.len() < decoded.len());
         Ok(())
     }
 

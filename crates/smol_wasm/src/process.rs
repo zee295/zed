@@ -9,6 +9,8 @@
 use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::io;
+#[cfg(target_family = "wasm")]
+use std::io::Read as _;
 use std::pin::Pin;
 use std::process::{ExitStatus, Output};
 use std::sync::{Arc, Mutex};
@@ -110,7 +112,7 @@ pub fn set_remote_client(client: RpcClient) {
         };
         if let Some(io) = router_stdout.lock().unwrap().by_id.get(&payload.proc_id) {
             let mut io = io.lock().unwrap();
-            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&payload.data) {
+            if let Some(bytes) = decode_process_output(&payload.data, payload.encoding.as_deref()) {
                 io.stdout_buf.extend(bytes);
                 if let Some(waker) = io.stdout_waker.take() {
                     waker.wake();
@@ -177,7 +179,10 @@ pub fn set_remote_client(client: RpcClient) {
             let response = reconnect_client
                 .call::<_, AttachProcessesResponse>(
                     "Process::attach",
-                    &AttachProcessesRequest { proc_ids },
+                    &AttachProcessesRequest {
+                        proc_ids,
+                        supports_compressed_output: true,
+                    },
                 )
                 .await;
             let Ok(response) = response else {
@@ -194,6 +199,24 @@ pub fn set_remote_client(client: RpcClient) {
     REMOTE.with(|remote| {
         *remote.borrow_mut() = Some(RemoteState { client, router });
     });
+}
+
+#[cfg(target_family = "wasm")]
+fn decode_process_output(data: &str, encoding: Option<&str>) -> Option<Vec<u8>> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .ok()?;
+    match encoding {
+        None => Some(bytes),
+        Some("zlib") => {
+            let mut decoded = Vec::new();
+            flate2::read::ZlibDecoder::new(bytes.as_slice())
+                .read_to_end(&mut decoded)
+                .ok()?;
+            Some(decoded)
+        }
+        Some(_) => None,
+    }
 }
 
 #[cfg(target_family = "wasm")]
@@ -396,6 +419,7 @@ impl Command {
                 stdin_pipe: self.stdin_cfg.is_some(),
                 stdout_pipe: self.stdout_cfg.is_some(),
                 stderr_pipe: self.stderr_cfg.is_some(),
+                supports_compressed_output: true,
             };
 
             let io = Arc::new(Mutex::new(ProcessIo::new()));
@@ -792,12 +816,14 @@ struct SpawnRequest {
     stdin_pipe: bool,
     stdout_pipe: bool,
     stderr_pipe: bool,
+    supports_compressed_output: bool,
 }
 
 #[cfg(target_family = "wasm")]
 #[derive(Serialize)]
 struct AttachProcessesRequest {
     proc_ids: Vec<u64>,
+    supports_compressed_output: bool,
 }
 
 #[cfg(target_family = "wasm")]
@@ -830,6 +856,7 @@ struct ProcIdRequest {
 struct StdoutNotification {
     proc_id: u64,
     data: String,
+    encoding: Option<String>,
 }
 
 #[cfg(target_family = "wasm")]
