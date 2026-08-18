@@ -53,7 +53,7 @@ web-sys = { version = "0.3", features = [
     "FileList",
     "HtmlCanvasElement",
     "HtmlElement",
-    "HtmlInputElement",
+    "HtmlTextAreaElement",
     "InputEvent",
     "IdleDeadline",
     "IdleRequestOptions",
@@ -63,6 +63,7 @@ web-sys = { version = "0.3", features = [
     "MediaQueryListEvent",
     "MouseEvent",
     "Navigator",
+    "Performance",
     "PointerEvent",
     "ResizeObserver",
     "ResizeObserverBoxOptions",
@@ -81,3 +82,4 @@ web-sys = { version = "0.3", features = [
     "WheelEvent",
     "Window",
 ] }
+unicode-segmentation.workspace = true

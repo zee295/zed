@@ -49,7 +49,7 @@ pub(crate) struct WebWindowMutableState {
 pub(crate) struct WebWindowInner {
     pub(crate) browser_window: web_sys::Window,
     pub(crate) canvas: web_sys::HtmlCanvasElement,
-    pub(crate) input_element: web_sys::HtmlInputElement,
+    pub(crate) input_element: web_sys::HtmlTextAreaElement,
     pub(crate) has_device_pixel_support: bool,
     pub(crate) is_mac: bool,
     pub(crate) state: RefCell<WebWindowMutableState>,
@@ -62,7 +62,7 @@ pub(crate) struct WebWindowInner {
     pub(crate) last_physical_size: Cell<(u32, u32)>,
     pub(crate) notify_scale: Cell<bool>,
     pub(crate) is_composing: Cell<bool>,
-    pub(crate) committed_composition_text: RefCell<Option<String>>,
+    pub(crate) native_text_input: RefCell<NativeTextInputState>,
     pub(crate) uses_native_text_input: bool,
     pub(crate) pending_clipboard: Rc<RefCell<Option<ClipboardItem>>>,
     pub(crate) last_cursor_css: Rc<Cell<&'static str>>,
@@ -72,6 +72,12 @@ pub(crate) struct WebWindowInner {
     mql_handle: RefCell<Option<MqlHandle>>,
     pending_physical_size: Cell<Option<(u32, u32)>>,
     raf_id: Cell<Option<i32>>,
+}
+
+#[derive(Default)]
+pub(crate) struct NativeTextInputState {
+    pub(crate) value: String,
+    pub(crate) document_start_utf16: Option<usize>,
 }
 
 struct KeyboardAccessory {
@@ -164,11 +170,11 @@ impl WebWindow {
         };
         let renderer = WgpuRenderer::new_from_surface(context, surface, renderer_config)?;
 
-        let input_element: web_sys::HtmlInputElement = document
-            .create_element("input")
-            .map_err(|e| anyhow::anyhow!("Failed to create input element: {e:?}"))?
+        let input_element: web_sys::HtmlTextAreaElement = document
+            .create_element("textarea")
+            .map_err(|e| anyhow::anyhow!("Failed to create textarea element: {e:?}"))?
             .dyn_into()
-            .map_err(|e| anyhow::anyhow!("Created element is not an input: {e:?}"))?;
+            .map_err(|e| anyhow::anyhow!("Created element is not a textarea: {e:?}"))?;
         let input_style = input_element.style();
         input_style.set_property("position", "fixed").ok();
         input_style.set_property("top", "0").ok();
@@ -176,6 +182,9 @@ impl WebWindow {
         input_style.set_property("width", "1px").ok();
         input_style.set_property("height", "1px").ok();
         input_style.set_property("opacity", "0").ok();
+        input_style.set_property("font-size", "16px").ok();
+        input_style.set_property("resize", "none").ok();
+        input_element.set_wrap("off");
         body.append_child(&input_element)
             .map_err(|e| anyhow::anyhow!("Failed to append input to body: {e:?}"))?;
         input_element.focus().ok();
@@ -227,7 +236,7 @@ impl WebWindow {
             last_physical_size: Cell::new((0, 0)),
             notify_scale: Cell::new(false),
             is_composing: Cell::new(false),
-            committed_composition_text: RefCell::new(None),
+            native_text_input: RefCell::new(NativeTextInputState::default()),
             uses_native_text_input,
             pending_clipboard,
             last_cursor_css,
@@ -533,6 +542,74 @@ impl WebWindowInner {
         Some(result)
     }
 
+    pub(crate) fn reset_native_text_input(&self) {
+        if !self.uses_native_text_input {
+            return;
+        }
+
+        self.input_element.set_value("");
+        self.input_element.set_selection_range(0, 0).ok();
+        *self.native_text_input.borrow_mut() = NativeTextInputState::default();
+    }
+
+    pub(crate) fn sync_native_text_input_context(&self) {
+        const CONTEXT_UTF16: usize = 1024;
+
+        if !self.uses_native_text_input || self.is_composing.get() {
+            return;
+        }
+
+        let context = self
+            .with_input_handler(|handler| {
+                let selection = handler.selected_text_range(true)?;
+                let proposed_range = selection.range.start.saturating_sub(CONTEXT_UTF16)
+                    ..selection.range.end.saturating_add(CONTEXT_UTF16);
+                let mut adjusted_range = None;
+                let value = handler.text_for_range(proposed_range.clone(), &mut adjusted_range)?;
+                let document_range = adjusted_range.unwrap_or(proposed_range);
+                if selection.range.start < document_range.start
+                    || selection.range.end > document_range.end
+                {
+                    return None;
+                }
+
+                Some((
+                    value,
+                    document_range.start,
+                    selection.range.start - document_range.start,
+                    selection.range.end - document_range.start,
+                    selection.reversed,
+                ))
+            })
+            .flatten();
+
+        let Some((value, document_start_utf16, selection_start, selection_end, reversed)) = context
+        else {
+            self.reset_native_text_input();
+            return;
+        };
+
+        let (Ok(selection_start), Ok(selection_end)) =
+            (u32::try_from(selection_start), u32::try_from(selection_end))
+        else {
+            self.reset_native_text_input();
+            return;
+        };
+
+        self.input_element.set_value(&value);
+        self.input_element
+            .set_selection_range_with_direction(
+                selection_start,
+                selection_end,
+                if reversed { "backward" } else { "forward" },
+            )
+            .ok();
+        *self.native_text_input.borrow_mut() = NativeTextInputState {
+            value,
+            document_start_utf16: Some(document_start_utf16),
+        };
+    }
+
     pub(crate) fn keyboard_accessory_root(&self) -> Option<web_sys::HtmlElement> {
         self.keyboard_accessory
             .as_ref()
@@ -631,9 +708,11 @@ impl WebWindowInner {
                 .unwrap_or(false);
 
         if accepts_touch_input {
+            self.sync_native_text_input_context();
             self.input_element.focus().ok();
             self.show_keyboard_accessory();
         } else {
+            self.reset_native_text_input();
             self.input_element.blur().ok();
             self.hide_keyboard_accessory();
             self.update_active_status(true);
@@ -1077,6 +1156,7 @@ impl PlatformWindow for WebWindow {
 
     fn show_soft_keyboard(&self) {
         self.inner.soft_keyboard_requested.set(true);
+        self.inner.sync_native_text_input_context();
         self.inner.input_element.focus().ok();
         self.inner.show_keyboard_accessory();
     }

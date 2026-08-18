@@ -8161,6 +8161,7 @@ dependencies = [
  "log",
  "parking_lot",
  "raw-window-handle",
+ "unicode-segmentation",
  "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",

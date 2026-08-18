@@ -7,6 +7,7 @@ use gpui::{
     Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent, TouchEvent, TouchId, TouchPhase,
     point, px,
 };
+use unicode_segmentation::UnicodeSegmentation;
 use wasm_bindgen::prelude::*;
 
 use crate::window::WebWindowInner;
@@ -406,6 +407,7 @@ impl WebWindowInner {
                     _ => return,
                 }
 
+                this.sync_native_text_input_context();
                 this.input_element.focus().ok();
             },
         ))
@@ -865,6 +867,20 @@ impl WebWindowInner {
                 && key_char.is_some()
                 && keystroke_inserts_text(&modifiers, this.is_mac);
 
+            let unmodified_edit_key = !modifiers.control
+                && !modifiers.alt
+                && !modifiers.platform
+                && !modifiers.function
+                && matches!(key.as_str(), "backspace" | "delete");
+            if this.uses_native_text_input
+                && ((key_char.is_some() && keystroke_inserts_text(&modifiers, this.is_mac))
+                    || unmodified_edit_key)
+            {
+                // Let the focused textarea perform the edit. Its `input` event
+                // carries the final value after IME/autocorrect processing.
+                return;
+            }
+
             let keystroke = Keystroke {
                 modifiers,
                 key: key.clone(),
@@ -880,6 +896,7 @@ impl WebWindowInner {
             if let Some(result) = result {
                 if !result.propagate {
                     event.prevent_default();
+                    this.sync_native_text_input_context();
                     return;
                 }
             }
@@ -908,6 +925,7 @@ impl WebWindowInner {
                     | "escape"
             ) {
                 event.prevent_default();
+                this.sync_native_text_input_context();
             }
 
             if keystroke_inserts_text(&modifiers, this.is_mac)
@@ -970,33 +988,23 @@ impl WebWindowInner {
         let this = Rc::clone(self);
         self.listen_input("input", move |event: JsValue| {
             let event: web_sys::InputEvent = event.unchecked_into();
-            // Mobile virtual keyboards commonly emit `input` without a usable
-            // `keydown`. Composition text is committed by `compositionend`.
             if this.is_composing.get() || event.is_composing() {
                 return;
             }
 
-            let event_text = event.data().filter(|text| !text.is_empty());
-            let input_value = this.input_element.value();
-
-            if let Some(composition_text) = this.committed_composition_text.borrow_mut().take()
-                && (event.input_type().contains("Composition")
-                    || event_text.as_deref() == Some(composition_text.as_str())
-                    || (event_text.is_none() && input_value == composition_text))
-            {
-                this.input_element.set_value("");
+            let new_value = this.input_element.value();
+            let (old_value, document_start_utf16) = {
+                let state = this.native_text_input.borrow();
+                (state.value.clone(), state.document_start_utf16)
+            };
+            let Some(edit) = native_text_edit(&old_value, &new_value) else {
                 return;
-            }
-
-            let text = event_text.as_deref().unwrap_or(&input_value);
-            if text.is_empty() {
-                return;
-            }
-            this.input_element.set_value("");
+            };
 
             let modifiers = this.take_keyboard_accessory_modifiers();
             if modifiers.modified() {
-                let Some(character) = text.chars().next() else {
+                let Some(character) = edit.replacement.chars().next() else {
+                    this.sync_native_text_input_context();
                     return;
                 };
                 let key = match character {
@@ -1004,19 +1012,31 @@ impl WebWindowInner {
                     character => character.to_lowercase().collect(),
                 };
                 this.dispatch_accessory_key(&key, modifiers);
-
-                let remainder = &text[character.len_utf8()..];
-                if !remainder.is_empty() {
-                    this.with_input_handler(|handler| {
-                        handler.replace_text_in_range(None, remainder);
-                    });
-                }
+                this.sync_native_text_input_context();
                 return;
             }
 
-            this.with_input_handler(|handler| {
-                handler.replace_text_in_range(None, text);
-            });
+            if let Some(document_start_utf16) = document_start_utf16 {
+                let replacement_range = document_start_utf16 + edit.old_range_utf16.start
+                    ..document_start_utf16 + edit.old_range_utf16.end;
+                this.with_input_handler(|handler| {
+                    handler.replace_text_in_range(Some(replacement_range), &edit.replacement);
+                });
+            } else {
+                for _ in 0..edit.removed_graphemes {
+                    this.dispatch_accessory_key("backspace", Modifiers::default());
+                }
+                if !edit.replacement.is_empty() {
+                    this.with_input_handler(|handler| {
+                        handler.replace_text_in_range(None, &edit.replacement);
+                    });
+                }
+            }
+
+            *this.native_text_input.borrow_mut() = crate::window::NativeTextInputState {
+                value: new_value,
+                document_start_utf16,
+            };
         })
     }
 
@@ -1025,6 +1045,40 @@ impl WebWindowInner {
         self.listen_input("beforeinput", move |event: JsValue| {
             let event: web_sys::InputEvent = event.unchecked_into();
             if this.is_composing.get() || event.is_composing() {
+                return;
+            }
+
+            if this.uses_native_text_input {
+                let input_type = event.input_type();
+                if matches!(input_type.as_str(), "insertLineBreak" | "insertParagraph") {
+                    event.prevent_default();
+                    this.dispatch_accessory_key("enter", this.take_keyboard_accessory_modifiers());
+                    this.sync_native_text_input_context();
+                    return;
+                }
+                let selection_start = this.input_element.selection_start().ok().flatten();
+                let selection_end = this.input_element.selection_end().ok().flatten();
+                let text_length = this.input_element.text_length();
+                let cannot_mutate_native_value = match input_type.as_str() {
+                    "deleteContentBackward" | "deleteWordBackward" => {
+                        selection_start == Some(0) && selection_end == Some(0)
+                    }
+                    "deleteContentForward" | "deleteWordForward" => {
+                        selection_start == Some(text_length) && selection_end == Some(text_length)
+                    }
+                    _ => false,
+                };
+
+                if cannot_mutate_native_value {
+                    event.prevent_default();
+                    let key = if input_type.contains("Backward") {
+                        "backspace"
+                    } else {
+                        "delete"
+                    };
+                    this.dispatch_accessory_key(key, this.take_keyboard_accessory_modifiers());
+                    this.sync_native_text_input_context();
+                }
                 return;
             }
 
@@ -1117,6 +1171,7 @@ impl WebWindowInner {
             this.with_input_handler(|handler| {
                 handler.paste_text(&text);
             });
+            this.sync_native_text_input_context();
         })
     }
 
@@ -1124,7 +1179,6 @@ impl WebWindowInner {
         let this = Rc::clone(self);
         self.listen_input("compositionstart", move |_event: JsValue| {
             this.is_composing.set(true);
-            this.committed_composition_text.borrow_mut().take();
         })
     }
 
@@ -1146,13 +1200,12 @@ impl WebWindowInner {
             let event: web_sys::CompositionEvent = event.unchecked_into();
             let data = event.data().unwrap_or_default();
             this.is_composing.set(false);
-            *this.committed_composition_text.borrow_mut() =
-                (!data.is_empty()).then(|| data.clone());
             this.with_input_handler(|handler| {
                 handler.replace_text_in_range(None, &data);
                 handler.unmark_text();
             });
-            this.input_element.set_value("");
+            let mut state = this.native_text_input.borrow_mut();
+            state.value = this.input_element.value();
         })
     }
 
@@ -1263,6 +1316,90 @@ fn clipboard_image_files(
             Some((file, format))
         })
         .collect()
+}
+
+struct NativeTextEdit {
+    old_range_utf16: std::ops::Range<usize>,
+    replacement: String,
+    removed_graphemes: usize,
+}
+
+/// Computes the single replacement that turns one native textarea value into
+/// another. DOM text offsets are UTF-16, while the retained strings remain
+/// valid UTF-8 and grapheme counts drive terminal backspaces.
+fn native_text_edit(old_value: &str, new_value: &str) -> Option<NativeTextEdit> {
+    if old_value == new_value {
+        return None;
+    }
+
+    let mut old_prefix_bytes = 0;
+    let mut new_prefix_bytes = 0;
+    let mut prefix_utf16 = 0;
+    for (old_character, new_character) in old_value.chars().zip(new_value.chars()) {
+        if old_character != new_character {
+            break;
+        }
+        old_prefix_bytes += old_character.len_utf8();
+        new_prefix_bytes += new_character.len_utf8();
+        prefix_utf16 += old_character.len_utf16();
+    }
+
+    let old_tail = &old_value[old_prefix_bytes..];
+    let new_tail = &new_value[new_prefix_bytes..];
+    let mut old_suffix_bytes = 0;
+    let mut new_suffix_bytes = 0;
+    let mut suffix_utf16 = 0;
+    for (old_character, new_character) in old_tail.chars().rev().zip(new_tail.chars().rev()) {
+        if old_character != new_character {
+            break;
+        }
+        old_suffix_bytes += old_character.len_utf8();
+        new_suffix_bytes += new_character.len_utf8();
+        suffix_utf16 += old_character.len_utf16();
+    }
+
+    let old_replacement_end = old_value.len() - old_suffix_bytes;
+    let new_replacement_end = new_value.len() - new_suffix_bytes;
+    let removed_text = &old_value[old_prefix_bytes..old_replacement_end];
+
+    Some(NativeTextEdit {
+        old_range_utf16: prefix_utf16
+            ..old_value
+                .encode_utf16()
+                .count()
+                .saturating_sub(suffix_utf16),
+        replacement: new_value[new_prefix_bytes..new_replacement_end].to_owned(),
+        removed_graphemes: removed_text.graphemes(true).count(),
+    })
+}
+
+#[cfg(test)]
+mod native_text_edit_tests {
+    use super::native_text_edit;
+
+    #[test]
+    fn keeps_the_first_character_after_space() {
+        let edit = native_text_edit("hello ", "hello w").unwrap();
+        assert_eq!(edit.old_range_utf16, 6..6);
+        assert_eq!(edit.replacement, "w");
+        assert_eq!(edit.removed_graphemes, 0);
+    }
+
+    #[test]
+    fn applies_keyboard_suggestion_as_replacement() {
+        let edit = native_text_edit("say teh ", "say the ").unwrap();
+        assert_eq!(edit.old_range_utf16, 5..7);
+        assert_eq!(edit.replacement, "he");
+        assert_eq!(edit.removed_graphemes, 2);
+    }
+
+    #[test]
+    fn reports_utf16_ranges_and_graphemes() {
+        let edit = native_text_edit("a\u{1f44d}", "a\u{1f44d}\u{1f3fd}").unwrap();
+        assert_eq!(edit.old_range_utf16, 3..3);
+        assert_eq!(edit.replacement, "\u{1f3fd}");
+        assert_eq!(edit.removed_graphemes, 0);
+    }
 }
 
 fn dom_key_to_gpui_key(event: &web_sys::KeyboardEvent) -> String {
