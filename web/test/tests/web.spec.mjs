@@ -103,7 +103,7 @@ test("accepts pasted images exposed only through clipboard files", async ({
   await openWorkspace(page, baseURL);
 
   const pasteResult = await page.evaluate(async () => {
-    const input = document.querySelector("input");
+    const input = document.querySelector("textarea");
     const transfer = new DataTransfer();
     const png = Uint8Array.from(atob(
       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAF/gL+XhN4WQAAAABJRU5ErkJggg==",
