@@ -25,6 +25,8 @@ use crate::fs_rpc::FsRpc;
 const PROCESS_KIND_ENV: &str = "ZED_WEB_PROCESS_KIND";
 const PROCESS_IDENTITY_ENV: &str = "ZED_WEB_PROCESS_IDENTITY";
 const MAX_DEFERRED_ACP_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ACP_OUTPUT_BATCH_BYTES: usize = 128 * 1024;
+const ACP_OUTPUT_BATCH_DELAY: std::time::Duration = std::time::Duration::from_millis(4);
 
 pub fn handles(method: &str) -> bool {
     matches!(method, "Process::output" | "Process::status")
@@ -938,6 +940,11 @@ async fn pump_output(
     rewrite: Option<(Vec<u8>, Vec<u8>)>,
     acp_activity: Option<Arc<StdMutex<AcpActivity>>>,
 ) {
+    if let Some(activity) = acp_activity {
+        pump_acp_output(&mut stream, proc_id, method, outgoing, activity).await;
+        return;
+    }
+
     let mut buffer = [0_u8; 4096];
     let mut rewriter = rewrite.map(|(source, target)| FrameRewriter::new(source, target));
     loop {
@@ -947,26 +954,17 @@ async fn pump_output(
         if count == 0 {
             break;
         }
-        let routed = if let Some(activity) = &acp_activity {
-            activity
-                .lock()
-                .map(|mut activity| activity.route_output(&buffer[..count]))
-                .unwrap_or_default()
-        } else {
-            vec![buffer[..count].to_vec()]
-        };
-        for routed_chunk in routed {
-            let chunks = rewriter
-                .as_mut()
-                .map(|rewriter| rewriter.feed(&routed_chunk))
-                .unwrap_or_else(|| vec![routed_chunk]);
-            for chunk in chunks {
-                notify(
-                    &outgoing,
-                    method,
-                    json!({"proc_id": proc_id, "data": BASE64.encode(chunk)}),
-                );
-            }
+        let chunk = buffer[..count].to_vec();
+        let chunks = rewriter
+            .as_mut()
+            .map(|rewriter| rewriter.feed(&chunk))
+            .unwrap_or_else(|| vec![chunk]);
+        for chunk in chunks {
+            notify(
+                &outgoing,
+                method,
+                json!({"proc_id": proc_id, "data": BASE64.encode(chunk)}),
+            );
         }
     }
     if let Some(rewriter) = rewriter
@@ -978,6 +976,69 @@ async fn pump_output(
             json!({"proc_id": proc_id, "data": BASE64.encode(chunk)}),
         );
     }
+}
+
+async fn pump_acp_output(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+    proc_id: u64,
+    method: &'static str,
+    outgoing: mpsc::UnboundedSender<Message>,
+    activity: Arc<StdMutex<AcpActivity>>,
+) {
+    let mut read_buffer = [0_u8; 4096];
+    let mut output_batch = Vec::new();
+
+    loop {
+        let read = if output_batch.is_empty() {
+            stream.read(&mut read_buffer).await
+        } else {
+            match tokio::time::timeout(ACP_OUTPUT_BATCH_DELAY, stream.read(&mut read_buffer)).await
+            {
+                Ok(read) => read,
+                Err(_) => {
+                    flush_acp_output(&outgoing, proc_id, method, &mut output_batch);
+                    continue;
+                }
+            }
+        };
+
+        let Ok(count) = read else {
+            break;
+        };
+        if count == 0 {
+            break;
+        }
+
+        let routed = activity
+            .lock()
+            .map(|mut activity| activity.route_output(&read_buffer[..count]))
+            .unwrap_or_default();
+        for chunk in routed {
+            output_batch.extend_from_slice(&chunk);
+            if output_batch.len() >= MAX_ACP_OUTPUT_BATCH_BYTES {
+                flush_acp_output(&outgoing, proc_id, method, &mut output_batch);
+            }
+        }
+    }
+
+    flush_acp_output(&outgoing, proc_id, method, &mut output_batch);
+}
+
+fn flush_acp_output(
+    outgoing: &mpsc::UnboundedSender<Message>,
+    proc_id: u64,
+    method: &'static str,
+    output_batch: &mut Vec<u8>,
+) {
+    if output_batch.is_empty() {
+        return;
+    }
+    let data = std::mem::take(output_batch);
+    notify(
+        outgoing,
+        method,
+        json!({"proc_id": proc_id, "data": BASE64.encode(data)}),
+    );
 }
 
 fn notify(outgoing: &mpsc::UnboundedSender<Message>, method: &str, params: Value) {
@@ -1102,11 +1163,11 @@ mod tests {
     use axum::extract::ws::Message;
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use serde_json::json;
-    use tokio::sync::mpsc;
+    use tokio::{io::AsyncWriteExt as _, sync::mpsc};
 
     use super::{
-        AcpActivity, FrameRewriter, OrphanedProcessReap, ProcessManager, rewrite_process_value,
-        sanitize_lldb_frame,
+        AcpActivity, FrameRewriter, OrphanedProcessReap, ProcessManager, pump_output,
+        rewrite_process_value, sanitize_lldb_frame,
     };
     use crate::fs_rpc::FsRpc;
 
@@ -1183,6 +1244,62 @@ mod tests {
 "#,
         );
         assert_eq!(live.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn batches_bursty_acp_output_without_changing_the_stream() -> anyhow::Result<()> {
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        let (outgoing, mut notifications) = mpsc::unbounded_channel::<Message>();
+        let activity = Arc::new(std::sync::Mutex::new(AcpActivity::default()));
+        let proc_id = 73;
+
+        let pump = tokio::spawn(pump_output(
+            reader,
+            proc_id,
+            "Process::stdout",
+            outgoing,
+            None,
+            Some(activity),
+        ));
+        let mut expected = Vec::new();
+        for index in 0..64 {
+            expected.extend(serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "claude-session",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": { "type": "text", "text": index.to_string() },
+                    },
+                },
+            }))?);
+            expected.push(b'\n');
+        }
+        writer.write_all(&expected).await?;
+        let notification =
+            tokio::time::timeout(std::time::Duration::from_millis(100), notifications.recv())
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("ACP output channel closed before the idle flush")
+                })?;
+        let Message::Text(notification) = notification else {
+            anyhow::bail!("expected ACP stdout notification");
+        };
+        let notification: serde_json::Value = serde_json::from_str(&notification)?;
+        assert_eq!(notification["method"], "Process::stdout");
+        assert_eq!(notification["params"]["proc_id"], proc_id);
+        let output = BASE64.decode(
+            notification["params"]["data"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("missing ACP output data"))?,
+        )?;
+        assert_eq!(output, expected);
+
+        writer.shutdown().await?;
+        pump.await?;
+        assert!(notifications.try_recv().is_err());
+        Ok(())
     }
 
     #[cfg(unix)]
