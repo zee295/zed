@@ -861,6 +861,9 @@ impl WebWindowInner {
 
             let is_held = event.repeat();
             let key_char = compute_key_char(&event, &key, &modifiers);
+            let prefer_character_input = this.uses_native_text_input
+                && key_char.is_some()
+                && keystroke_inserts_text(&modifiers, this.is_mac);
 
             let keystroke = Keystroke {
                 modifiers,
@@ -871,7 +874,7 @@ impl WebWindowInner {
             let result = this.dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
                 keystroke,
                 is_held,
-                prefer_character_input: false,
+                prefer_character_input,
             }));
 
             if let Some(result) = result {
@@ -882,7 +885,9 @@ impl WebWindowInner {
             }
 
             if this.is_composing.get() || event.is_composing() {
-                event.prevent_default();
+                if !this.uses_native_text_input {
+                    event.prevent_default();
+                }
                 return;
             }
 
@@ -908,6 +913,9 @@ impl WebWindowInner {
             if keystroke_inserts_text(&modifiers, this.is_mac)
                 && let Some(text) = key_char
             {
+                if this.uses_native_text_input {
+                    return;
+                }
                 this.with_input_handler(|handler| {
                     handler.replace_text_in_range(None, &text);
                 });
@@ -960,17 +968,31 @@ impl WebWindowInner {
 
     fn register_text_input(self: &Rc<Self>) -> EventListenerHandle {
         let this = Rc::clone(self);
-        self.listen_input("input", move |_event: JsValue| {
+        self.listen_input("input", move |event: JsValue| {
+            let event: web_sys::InputEvent = event.unchecked_into();
             // Mobile virtual keyboards commonly emit `input` without a usable
             // `keydown`. Composition text is committed by `compositionend`.
-            if this.is_composing.get() {
+            if this.is_composing.get() || event.is_composing() {
                 return;
             }
 
-            let text = this.input_element.value();
+            let event_text = event.data().filter(|text| !text.is_empty());
+            let input_value = this.input_element.value();
+
+            if let Some(composition_text) = this.committed_composition_text.borrow_mut().take()
+                && (event.input_type().contains("Composition")
+                    || event_text.as_deref() == Some(composition_text.as_str())
+                    || (event_text.is_none() && input_value == composition_text))
+            {
+                this.input_element.set_value("");
+                return;
+            }
+
+            let text = event_text.as_deref().unwrap_or(&input_value);
             if text.is_empty() {
                 return;
             }
+            this.input_element.set_value("");
 
             let modifiers = this.take_keyboard_accessory_modifiers();
             if modifiers.modified() {
@@ -989,18 +1011,12 @@ impl WebWindowInner {
                         handler.replace_text_in_range(None, remainder);
                     });
                 }
-                this.input_element.set_value("");
                 return;
             }
 
-            if this
-                .with_input_handler(|handler| {
-                    handler.replace_text_in_range(None, &text);
-                })
-                .is_some()
-            {
-                this.input_element.set_value("");
-            }
+            this.with_input_handler(|handler| {
+                handler.replace_text_in_range(None, text);
+            });
         })
     }
 
@@ -1108,6 +1124,7 @@ impl WebWindowInner {
         let this = Rc::clone(self);
         self.listen_input("compositionstart", move |_event: JsValue| {
             this.is_composing.set(true);
+            this.committed_composition_text.borrow_mut().take();
         })
     }
 
@@ -1129,6 +1146,8 @@ impl WebWindowInner {
             let event: web_sys::CompositionEvent = event.unchecked_into();
             let data = event.data().unwrap_or_default();
             this.is_composing.set(false);
+            *this.committed_composition_text.borrow_mut() =
+                (!data.is_empty()).then(|| data.clone());
             this.with_input_handler(|handler| {
                 handler.replace_text_in_range(None, &data);
                 handler.unmark_text();

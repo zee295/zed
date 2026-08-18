@@ -62,6 +62,8 @@ pub(crate) struct WebWindowInner {
     pub(crate) last_physical_size: Cell<(u32, u32)>,
     pub(crate) notify_scale: Cell<bool>,
     pub(crate) is_composing: Cell<bool>,
+    pub(crate) committed_composition_text: RefCell<Option<String>>,
+    pub(crate) uses_native_text_input: bool,
     pub(crate) pending_clipboard: Rc<RefCell<Option<ClipboardItem>>>,
     pub(crate) last_cursor_css: Rc<Cell<&'static str>>,
     keyboard_accessory: Option<KeyboardAccessory>,
@@ -178,6 +180,11 @@ impl WebWindow {
             .map_err(|e| anyhow::anyhow!("Failed to append input to body: {e:?}"))?;
         input_element.focus().ok();
 
+        let uses_native_text_input = browser_window
+            .match_media("(any-pointer: coarse)")
+            .ok()
+            .flatten()
+            .is_some_and(|query| query.matches());
         let keyboard_accessory =
             create_mobile_keyboard_accessory(&document, &browser_window, &body)?;
         let display: Rc<dyn PlatformDisplay> = Rc::new(WebDisplay::new(browser_window.clone()));
@@ -220,6 +227,8 @@ impl WebWindow {
             last_physical_size: Cell::new((0, 0)),
             notify_scale: Cell::new(false),
             is_composing: Cell::new(false),
+            committed_composition_text: RefCell::new(None),
+            uses_native_text_input,
             pending_clipboard,
             last_cursor_css,
             keyboard_accessory,
