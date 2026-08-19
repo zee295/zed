@@ -10,7 +10,7 @@ use gpui::{
 use unicode_segmentation::UnicodeSegmentation;
 use wasm_bindgen::prelude::*;
 
-use crate::window::WebWindowInner;
+use crate::window::{NativeTextInputMode, WebWindowInner};
 
 pub struct WebEventListeners {
     _handles: Vec<EventListenerHandle>,
@@ -350,6 +350,12 @@ impl WebWindowInner {
             key: key.into(),
             key_char: None,
         };
+        let handled_by_input = self
+            .with_input_handler(|handler| handler.dispatch_key(&keystroke))
+            .unwrap_or(false);
+        if handled_by_input {
+            return;
+        }
         self.dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
             keystroke: keystroke.clone(),
             is_held: false,
@@ -993,9 +999,9 @@ impl WebWindowInner {
             }
 
             let new_value = this.input_element.value();
-            let (old_value, document_start_utf16) = {
+            let (old_value, document_start_utf16, mode) = {
                 let state = this.native_text_input.borrow();
-                (state.value.clone(), state.document_start_utf16)
+                (state.value.clone(), state.document_start_utf16, state.mode)
             };
             let Some(edit) = native_text_edit(&old_value, &new_value) else {
                 return;
@@ -1026,9 +1032,19 @@ impl WebWindowInner {
                 for _ in 0..edit.removed_graphemes {
                     this.dispatch_accessory_key("backspace", Modifiers::default());
                 }
-                if !edit.replacement.is_empty() {
+                let replacement = if mode == NativeTextInputMode::Terminal
+                    && event.input_type() == "insertText"
+                {
+                    event
+                        .data()
+                        .filter(|text| !text.is_empty())
+                        .unwrap_or(edit.replacement)
+                } else {
+                    edit.replacement
+                };
+                if !replacement.is_empty() {
                     this.with_input_handler(|handler| {
-                        handler.replace_text_in_range(None, &edit.replacement);
+                        handler.replace_text_in_range(None, &replacement);
                     });
                 }
             }
@@ -1036,6 +1052,7 @@ impl WebWindowInner {
             *this.native_text_input.borrow_mut() = crate::window::NativeTextInputState {
                 value: new_value,
                 document_start_utf16,
+                mode,
             };
         })
     }
@@ -1049,6 +1066,10 @@ impl WebWindowInner {
             }
 
             if this.uses_native_text_input {
+                // Touch focus can move after the pointer frame that selected the prior
+                // input handler. Refresh before the browser mutates the textarea so a
+                // newly focused terminal gets raw-input attributes on its first key.
+                this.sync_native_text_input_context();
                 let input_type = event.input_type();
                 if matches!(input_type.as_str(), "insertLineBreak" | "insertParagraph") {
                     event.prevent_default();

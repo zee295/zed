@@ -1523,6 +1523,14 @@ impl PlatformInputHandler {
             .ok();
     }
 
+    /// Sends a non-text key supplied by a platform text-input accessory directly to the
+    /// active input handler. Returns whether the handler consumed the key.
+    pub fn dispatch_key(&mut self, keystroke: &Keystroke) -> bool {
+        self.cx
+            .update(|window, cx| self.handler.dispatch_key(keystroke, window, cx))
+            .unwrap_or(false)
+    }
+
     /// Inserts text supplied by a platform paste event.
     pub fn paste_text(&mut self, text: &str) {
         self.cx
@@ -1742,6 +1750,19 @@ pub trait InputHandler: 'static {
         window: &mut Window,
         cx: &mut App,
     );
+
+    /// Handle a non-text key supplied by a platform text-input accessory.
+    ///
+    /// Most text controls receive these through the normal focused key dispatch path.
+    /// Specialized inputs such as terminals can override this to consume the key directly.
+    fn dispatch_key(
+        &mut self,
+        _keystroke: &Keystroke,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> bool {
+        false
+    }
 
     /// Insert text supplied by a platform paste event.
     ///

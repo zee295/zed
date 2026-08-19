@@ -3,10 +3,10 @@ use gpui::{
     AbsoluteLength, AnyElement, App, AvailableSpace, Bounds, ContentMask, Context, DispatchPhase,
     Element, ElementId, Entity, FocusHandle, Font, FontFeatures, FontStyle, FontWeight,
     GlobalElementId, HighlightStyle, Hitbox, Hsla, InputHandler, InteractiveElement, Interactivity,
-    IntoElement, LayoutId, Length, ModifiersChangedEvent, MouseButton, MouseMoveEvent, Pixels,
-    Point as GpuiPoint, StatefulInteractiveElement, StrikethroughStyle, Styled, TextRun, TextStyle,
-    UTF16Selection, UnderlineStyle, WeakEntity, WhiteSpace, Window, div, fill, point, px, relative,
-    size,
+    IntoElement, Keystroke, LayoutId, Length, ModifiersChangedEvent, MouseButton, MouseMoveEvent,
+    Pixels, Point as GpuiPoint, StatefulInteractiveElement, StrikethroughStyle, Styled, TextRun,
+    TextStyle, UTF16Selection, UnderlineStyle, WeakEntity, WhiteSpace, Window, div, fill, point,
+    px, relative, size,
 };
 use itertools::Itertools;
 use language::CursorShape as EditorCursorShape;
@@ -1855,6 +1855,12 @@ impl InputHandler for TerminalInputHandler {
                 telemetry.log_edit_event("terminal", project.is_via_remote_server());
             })
             .ok();
+    }
+
+    fn dispatch_key(&mut self, keystroke: &Keystroke, _window: &mut Window, cx: &mut App) -> bool {
+        self.terminal_view.update(cx, |view, view_cx| {
+            view.process_keystroke(keystroke, view_cx)
+        })
     }
 
     fn paste_text(&mut self, text: &str, _window: &mut Window, cx: &mut App) {

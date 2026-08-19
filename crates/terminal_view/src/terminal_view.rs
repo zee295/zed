@@ -1270,7 +1270,11 @@ impl TerminalView {
     /// In vi mode, explicitly triggers a re-render because vi navigation (like j/k)
     /// updates the cursor locally without sending data to the shell, so there's no
     /// shell output to automatically trigger a re-render.
-    fn process_keystroke(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn process_keystroke(
+        &mut self,
+        keystroke: &Keystroke,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let (handled, vi_mode_enabled) = self.terminal.update(cx, |term, cx| {
             (
                 term.try_keystroke(keystroke, TerminalSettings::get_global(cx).option_as_meta),

@@ -78,6 +78,15 @@ pub(crate) struct WebWindowInner {
 pub(crate) struct NativeTextInputState {
     pub(crate) value: String,
     pub(crate) document_start_utf16: Option<usize>,
+    pub(crate) mode: NativeTextInputMode,
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+pub(crate) enum NativeTextInputMode {
+    #[default]
+    Inactive,
+    Document,
+    Terminal,
 }
 
 struct KeyboardAccessory {
@@ -552,11 +561,38 @@ impl WebWindowInner {
         *self.native_text_input.borrow_mut() = NativeTextInputState::default();
     }
 
+    fn configure_native_text_input(&self, mode: NativeTextInputMode) {
+        let terminal = mode == NativeTextInputMode::Terminal;
+        for (attribute, value) in [
+            ("autocomplete", "off"),
+            ("autocapitalize", "none"),
+            ("autocorrect", "off"),
+            ("spellcheck", "false"),
+        ] {
+            if terminal {
+                self.input_element.set_attribute(attribute, value).ok();
+            } else {
+                self.input_element.remove_attribute(attribute).ok();
+            }
+        }
+    }
+
     pub(crate) fn sync_native_text_input_context(&self) {
         const CONTEXT_UTF16: usize = 1024;
 
         if !self.uses_native_text_input || self.is_composing.get() {
             return;
+        }
+
+        enum InputContext {
+            Document {
+                value: String,
+                document_start_utf16: usize,
+                selection_start: usize,
+                selection_end: usize,
+                reversed: bool,
+            },
+            Terminal,
         }
 
         let context = self
@@ -565,7 +601,11 @@ impl WebWindowInner {
                 let proposed_range = selection.range.start.saturating_sub(CONTEXT_UTF16)
                     ..selection.range.end.saturating_add(CONTEXT_UTF16);
                 let mut adjusted_range = None;
-                let value = handler.text_for_range(proposed_range.clone(), &mut adjusted_range)?;
+                let Some(value) =
+                    handler.text_for_range(proposed_range.clone(), &mut adjusted_range)
+                else {
+                    return Some(InputContext::Terminal);
+                };
                 let document_range = adjusted_range.unwrap_or(proposed_range);
                 if selection.range.start < document_range.start
                     || selection.range.end > document_range.end
@@ -573,29 +613,53 @@ impl WebWindowInner {
                     return None;
                 }
 
-                Some((
+                Some(InputContext::Document {
                     value,
-                    document_range.start,
-                    selection.range.start - document_range.start,
-                    selection.range.end - document_range.start,
-                    selection.reversed,
-                ))
+                    document_start_utf16: document_range.start,
+                    selection_start: selection.range.start - document_range.start,
+                    selection_end: selection.range.end - document_range.start,
+                    reversed: selection.reversed,
+                })
             })
             .flatten();
 
-        let Some((value, document_start_utf16, selection_start, selection_end, reversed)) = context
-        else {
-            self.reset_native_text_input();
+        let Some(context) = context else {
+            self.configure_native_text_input(NativeTextInputMode::Inactive);
+            return self.reset_native_text_input();
+        };
+
+        if matches!(context, InputContext::Terminal) {
+            self.configure_native_text_input(NativeTextInputMode::Terminal);
+            self.input_element.set_value("");
+            self.input_element.set_selection_range(0, 0).ok();
+            *self.native_text_input.borrow_mut() = NativeTextInputState {
+                value: String::new(),
+                document_start_utf16: None,
+                mode: NativeTextInputMode::Terminal,
+            };
             return;
+        }
+
+        let InputContext::Document {
+            value,
+            document_start_utf16,
+            selection_start,
+            selection_end,
+            reversed,
+        } = context
+        else {
+            unreachable!()
         };
 
         let (Ok(selection_start), Ok(selection_end)) =
             (u32::try_from(selection_start), u32::try_from(selection_end))
         else {
+            self.configure_native_text_input(NativeTextInputMode::Inactive);
             self.reset_native_text_input();
             return;
         };
 
+        self.configure_native_text_input(NativeTextInputMode::Document);
         self.input_element.set_value(&value);
         self.input_element
             .set_selection_range_with_direction(
@@ -607,6 +671,7 @@ impl WebWindowInner {
         *self.native_text_input.borrow_mut() = NativeTextInputState {
             value,
             document_start_utf16: Some(document_start_utf16),
+            mode: NativeTextInputMode::Document,
         };
     }
 
