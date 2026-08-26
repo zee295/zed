@@ -20,7 +20,8 @@ revision() {
 }
 
 web_revision="$(revision "${WEB_REVISION:-unknown}" rev-parse HEAD)"
-upstream_revision="$(revision "${UPSTREAM_REVISION:-unknown}" merge-base HEAD upstream/main)"
+recorded_upstream_revision="$(tr -d '[:space:]' < "${web_dir}/upstream-revision")"
+upstream_revision="$(revision "${UPSTREAM_REVISION:-${recorded_upstream_revision}}" merge-base HEAD upstream/main)"
 
 rm -rf "${dist_dir}"
 mkdir -p "${dist_dir}/bin" "${static_dir}"
