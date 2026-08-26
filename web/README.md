@@ -253,8 +253,10 @@ After reviewing the result:
 ```
 
 The helper rebases the small web patch stack instead of creating recurring
-upstream merge commits. After each update, run server tests, the WASM check, a
-production image build, and browser tests before pushing `zed-web`.
+upstream merge commits and records the exact base in `web/upstream-revision`.
+Commit that file with every upstream update. After each update, run server
+tests, the WASM check, a production image build, and browser tests before
+pushing `zed-web`.
 
 `std::time::Instant` compiles for `wasm32-unknown-unknown` but panics when
 `Instant::now()` runs. During every upstream update, preserve existing

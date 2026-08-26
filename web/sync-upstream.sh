@@ -64,4 +64,5 @@ fi
 cleanup
 trap - EXIT
 git -C "${repo}" rebase --onto "${target}" "${base}" "${branch}"
-echo "Rebase complete. Run the validation commands in web/README.md."
+printf '%s\n' "${target}" > "${repo}/web/upstream-revision"
+echo "Rebase complete. Commit web/upstream-revision after running the validation commands in web/README.md."

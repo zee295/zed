@@ -87,16 +87,15 @@ jobs:
       - name: Resolve upstream revision
         id: revisions
         run: |
-          upstream_tag="$(
-            git tag --merged HEAD --list 'v[0-9]*' --sort=-version:refname |
-              grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
-              head -n 1
-          )"
-          if [[ -z "${upstream_tag}" ]]; then
-            echo "no upstream release tag is reachable from HEAD" >&2
+          upstream_revision="$(tr -d '[:space:]' < web/upstream-revision)"
+          if [[ ! "${upstream_revision}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "web/upstream-revision must contain one full commit SHA" >&2
             exit 2
           fi
-          upstream_revision="$(git rev-list -n 1 "${upstream_tag}")"
+          if ! git merge-base --is-ancestor "${upstream_revision}" HEAD; then
+            echo "recorded upstream revision is not reachable from HEAD" >&2
+            exit 2
+          fi
           echo "upstream=${upstream_revision}" >> "$GITHUB_OUTPUT"
       - uses: docker/build-push-action@v6
         with:
