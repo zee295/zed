@@ -1106,7 +1106,7 @@ inherits = "release"
 debug = false
 strip = "symbols"
 opt-level = "z"
-lto = "fat"
+lto = "thin"
 codegen-units = 1
 
 [profile.release.package]
