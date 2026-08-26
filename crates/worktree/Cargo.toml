@@ -34,7 +34,6 @@ web-time.workspace = true
 anyhow.workspace = true
 async-channel.workspace = true
 async-lock.workspace = true
-chardetng.workspace = true
 clock.workspace = true
 collections.workspace = true
 encoding_rs.workspace = true

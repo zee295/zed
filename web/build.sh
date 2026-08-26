@@ -9,8 +9,9 @@ native_target="${ZED_WEB_NATIVE_TARGET:-${repo_dir}/target/web-native}"
 wasm_target="${CARGO_TARGET_DIR:-${repo_dir}/target/web-wasm}"
 wasi_sdk="${WASI_SDK_PATH:-${repo_dir}/target/wasi-sdk}"
 profile="${ZED_WEB_PROFILE:-web-release}"
-stable_toolchain="${RUST_STABLE_TOOLCHAIN:-1.95.0}"
+stable_toolchain="${RUST_STABLE_TOOLCHAIN:-1.97.1}"
 nightly_toolchain="${RUST_NIGHTLY_TOOLCHAIN:-nightly}"
+wasm_bindgen_version="${WASM_BINDGEN_VERSION:-0.2.127}"
 
 revision() {
     local fallback="$1"
@@ -54,6 +55,14 @@ rustup run "${nightly_toolchain}" cargo build \
     --target wasm32-unknown-unknown \
     --profile "${profile}" \
     -Z build-std=std,panic_abort
+
+installed_wasm_bindgen_version="$(wasm-bindgen --version 2>/dev/null | awk '{print $2}' || true)"
+if [[ "${installed_wasm_bindgen_version}" != "${wasm_bindgen_version}" ]]; then
+    printf 'wasm-bindgen-cli %s is required (found %s)\n' \
+        "${wasm_bindgen_version}" \
+        "${installed_wasm_bindgen_version:-not installed}" >&2
+    exit 1
+fi
 
 wasm-bindgen \
     --target web \

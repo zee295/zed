@@ -1309,7 +1309,7 @@ fn init_app_state(
     editor::init(cx);
     image_viewer::init(cx);
     markdown_preview::init(cx);
-    csv_preview::init(cx);
+    tabular_data_preview::init(cx);
     svg_preview::init(cx);
     diagnostics::init(cx);
     host_debug_adapter::init(cx);

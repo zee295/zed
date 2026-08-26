@@ -7,7 +7,7 @@ use fs::{FakeFs, Fs};
 use gpui::{App, BorrowAppContext, Context, Entity, VisualTestContext, Window};
 use project::Project;
 use serde_json::{Value, json};
-use settings::SettingsStore;
+use settings::{SettingsStore, SplicingVec};
 use std::path::Path;
 use std::sync::Arc;
 use workspace::{Item, MultiWorkspace, register_project_item};
@@ -33,7 +33,7 @@ fn path(path: impl AsRef<str>) -> String {
     {
         let mut path = path.replace("/", "\\");
         if path.starts_with("\\") {
-            path = format!("C:{}", &path);
+            path = format!("C:{path}");
         }
         path
     }
@@ -617,10 +617,10 @@ async fn excluded_create_is_not_recorded(cx: &mut gpui::TestAppContext) {
     cx.update_app(|cx| {
         cx.update_global::<SettingsStore, _>(|store, cx| {
             store.update_user_settings(cx, |settings| {
-                settings.project.worktree.file_scan_exclusions = Some(vec![
+                settings.project.worktree.file_scan_exclusions = Some(SplicingVec::from(vec![
                     "**/token.secret".to_string(),
                     "**/banana.secret".to_string(),
-                ]);
+                ]));
             });
         });
 

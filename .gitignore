@@ -31,6 +31,7 @@
 /crates/project_panel/benches/linux_repo_snapshot.txt
 /dev.zed.Zed*.json
 /node_modules/
+/web/test/node_modules/
 /plugins/bin
 /script/node_modules
 /snap
@@ -49,6 +50,11 @@ crates/docs_preprocessor/actions.json
 /web/dist/
 /web/workspace/
 **/test-results/
+/.config/zed/
+/.zed/extensions/
+/.zed/remote.sqlite*
+/.zed/web-auth-token
+/.zed/web-workspace-state.json
 
 # Visual test baseline images (these will be stored outside
 # the repo in the future, but we don't haven't decided exactly

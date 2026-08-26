@@ -1,8 +1,8 @@
 use std::rc::Rc;
 
 use gpui::{
-    Capslock, ClipboardEntry, ClipboardItem, DispatchEventResult, GestureTuning, Image,
-    ImageFormat, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
+    Capslock, ClipboardEntry, ClipboardItem, ClipboardString, DispatchEventResult, GestureTuning,
+    Image, ImageFormat, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
     Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent, TouchEvent, TouchId, TouchPhase,
     point, px,
@@ -298,6 +298,7 @@ impl WebWindowInner {
             velocity_y,
             last_timestamp: None,
         }));
+        self.wake_frame_loop();
     }
 
     pub(crate) fn tick_touch_momentum(&self, timestamp: f64) {
@@ -1130,6 +1131,12 @@ impl WebWindowInner {
     /// read API cannot fit that synchronous signature, while `ClipboardEvent`
     /// exposes `clipboardData` synchronously inside the event. It fires for
     /// any browser-initiated paste (keyboard, menu bar, context menu).
+    ///
+    /// Text-only pastes reach the input handler synchronously. Pasted image
+    /// files only expose their bytes through asynchronous blob reads, so
+    /// pastes containing images are delivered once those reads resolve — to
+    /// whichever input handler is focused at that point, matching how an
+    /// application-level paste action would behave.
     fn register_paste(self: &Rc<Self>) -> EventListenerHandle {
         let this = Rc::clone(self);
         self.listen_input("paste", move |event: JsValue| {
@@ -1137,62 +1144,58 @@ impl WebWindowInner {
             let Some(clipboard_data) = event.clipboard_data() else {
                 return;
             };
+            let text = clipboard_data
+                .get_data("text/plain")
+                .ok()
+                .filter(|text| !text.is_empty());
 
+            // File handles must be collected synchronously: the browser
+            // clears `clipboardData`'s item list once this handler returns,
+            // while the `File`s themselves stay readable afterwards.
             let image_files = clipboard_image_files(&clipboard_data);
-            if !image_files.is_empty() {
-                event.prevent_default();
-                let this = Rc::clone(&this);
-                wasm_bindgen_futures::spawn_local(async move {
-                    let mut entries = Vec::with_capacity(image_files.len());
-                    for (file, format) in image_files {
-                        match wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await {
-                            Ok(buffer) => {
-                                let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
-                                entries
-                                    .push(ClipboardEntry::Image(Image::from_bytes(format, bytes)));
-                            }
-                            Err(error) => {
-                                log::warn!("failed to read pasted browser image: {error:?}");
-                            }
+
+            if text.is_none() && image_files.is_empty() {
+                return;
+            }
+            event.prevent_default();
+
+            if image_files.is_empty() {
+                if let Some(text) = text {
+                    this.with_input_handler(|handler| {
+                        handler.paste(ClipboardItem::new_string(text));
+                    });
+                    this.sync_native_text_input_context();
+                }
+                return;
+            }
+
+            let this = Rc::clone(&this);
+            wasm_bindgen_futures::spawn_local(async move {
+                let mut entries = Vec::new();
+                if let Some(text) = text {
+                    entries.push(ClipboardEntry::String(ClipboardString::new(text)));
+                }
+                for (file, format) in image_files {
+                    match crate::platform::read_blob_bytes(&file).await {
+                        Ok(bytes) => {
+                            entries.push(ClipboardEntry::Image(Image::from_bytes(format, bytes)));
+                        }
+                        Err(error) => {
+                            log::error!(
+                                "failed to read pasted image: {}",
+                                crate::platform::js_error_message(&error)
+                            );
                         }
                     }
-
-                    if entries.is_empty() {
-                        return;
-                    }
-
-                    *this.pending_clipboard.borrow_mut() = Some(ClipboardItem { entries });
-                    let modifiers = if this.is_mac {
-                        Modifiers::command()
-                    } else {
-                        Modifiers::control()
-                    };
-                    this.dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
-                        keystroke: Keystroke {
-                            modifiers,
-                            key: "v".into(),
-                            key_char: None,
-                        },
-                        is_held: false,
-                        prefer_character_input: false,
-                    }));
-                    this.pending_clipboard.borrow_mut().take();
+                }
+                if entries.is_empty() {
+                    return;
+                }
+                this.with_input_handler(|handler| {
+                    handler.paste(ClipboardItem { entries });
                 });
-                return;
-            }
-
-            let Ok(text) = clipboard_data.get_data("text/plain") else {
-                return;
-            };
-            if text.is_empty() {
-                return;
-            }
-
-            event.prevent_default();
-            this.with_input_handler(|handler| {
-                handler.paste_text(&text);
+                this.sync_native_text_input_context();
             });
-            this.sync_native_text_input_context();
         })
     }
 

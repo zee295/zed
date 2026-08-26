@@ -104,9 +104,9 @@ async function prepareSqlRpcBridge() {
 // Once we've got it, initialize it all with the `wasm_bindgen` global we imported via
 // `importScripts`.
 self.onmessage = event => {
-    let [ module, memory, work ] = event.data;
+    const [module_or_path, memory, work] = event.data;
 
-    Promise.all([wasm_bindgen(module, memory), prepareSqlRpcBridge()]).catch(err => {
+    Promise.all([wasm_bindgen({ module_or_path, memory }), prepareSqlRpcBridge()]).catch(err => {
         console.log(err);
 
         // Propagate to main `onerror`:

@@ -64,7 +64,10 @@ test("boots GPUI and reconnects after an offline transition", async ({
   await expect
     .poll(() => page.evaluate(() => self.__zedRpcConnectionState))
     .toBe("open");
-  expect(errors.filter((error) => !error.includes("WebSocket"))).toEqual([]);
+  expect(errors.filter((error) =>
+    !error.includes("WebSocket") &&
+    !error.includes("ERR_INTERNET_DISCONNECTED")
+  )).toEqual([]);
   await context.close();
 });
 

@@ -39,13 +39,13 @@ jobs:
         run: ./script/linux
       - name: Install Rust toolchains
         run: |
-          rustup toolchain install 1.95.0
+          rustup toolchain install 1.97.1
           rustup toolchain install nightly --component rust-src
           rustup target add wasm32-unknown-unknown --toolchain nightly
       - name: Install WASI SDK
         run: ./script/download-wasi-sdk
       - name: Test Rust backend
-        run: rustup run 1.95.0 cargo test -p zed_web_server --bin zed-web-server
+        run: rustup run 1.97.1 cargo test -p zed_web_server --bin zed-web-server
       - name: Audit WASM clock usage
         run: ./web/check-wasm-time.sh
       - name: Check WASM frontend

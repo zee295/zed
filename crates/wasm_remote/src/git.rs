@@ -133,8 +133,8 @@ struct CommitDataResponse {
 #[derive(Deserialize)]
 struct CommitFileResponse {
     path: String,
-    old_text: Option<String>,
-    new_text: Option<String>,
+    old_content: Option<Vec<u8>>,
+    new_content: Option<Vec<u8>>,
     is_binary: bool,
 }
 
@@ -143,6 +143,22 @@ struct BlameResponse {
     entries: Vec<BlameEntry>,
     messages: HashMap<String, String>,
     tag_names: HashMap<String, Vec<String>>,
+}
+
+fn blame_from_response(response: BlameResponse) -> Result<git::blame::Blame> {
+    Ok(git::blame::Blame {
+        entries: response.entries,
+        messages: response
+            .messages
+            .into_iter()
+            .map(|(sha, message)| Ok((sha.parse::<Oid>()?, message)))
+            .collect::<Result<HashMap<_, _>>>()?,
+        tag_names: response
+            .tag_names
+            .into_iter()
+            .map(|(sha, names)| Ok((sha.parse::<Oid>()?, names)))
+            .collect::<Result<HashMap<_, _>>>()?,
+    })
 }
 
 fn log_source_arg(source: LogSource) -> serde_json::Value {
@@ -188,7 +204,7 @@ fn reset_mode_label(mode: ResetMode) -> &'static str {
 }
 
 impl GitRepository for RemoteGitRepository {
-    fn load_blob_content(&self, oid: git::Oid) -> BoxFuture<'_, Result<String>> {
+    fn load_blob_content(&self, oid: git::Oid) -> BoxFuture<'_, Result<Vec<u8>>> {
         let client = self.client.clone();
         let repo_path = self.repo_path.clone();
         async move {
@@ -208,7 +224,7 @@ impl GitRepository for RemoteGitRepository {
     fn set_index_text(
         &self,
         path: RepoPath,
-        content: Option<String>,
+        content: Option<Vec<u8>>,
         env: Arc<HashMap<String, String>>,
         is_executable: bool,
     ) -> BoxFuture<'_, Result<()>> {
@@ -263,7 +279,10 @@ impl GitRepository for RemoteGitRepository {
         .boxed()
     }
 
-    fn load_revisions(&self, revisions: Vec<String>) -> BoxFuture<'_, Result<Vec<Option<String>>>> {
+    fn load_revisions(
+        &self,
+        revisions: Vec<String>,
+    ) -> BoxFuture<'_, Result<Vec<Option<Vec<u8>>>>> {
         let client = self.client.clone();
         let repo_path = self.repo_path.clone();
         async move {
@@ -717,8 +736,8 @@ impl GitRepository for RemoteGitRepository {
                     .map(|file| {
                         Ok(CommitFile {
                             path: RepoPath::new(file.path.as_str())?,
-                            old_text: file.old_text,
-                            new_text: file.new_text,
+                            old_content: file.old_content,
+                            new_content: file.new_content,
                             is_binary: file.is_binary,
                         })
                     })
@@ -749,19 +768,31 @@ impl GitRepository for RemoteGitRepository {
                     }),
                 )
                 .await?;
-            Ok(git::blame::Blame {
-                entries: response.entries,
-                messages: response
-                    .messages
-                    .into_iter()
-                    .map(|(sha, message)| Ok((sha.parse::<Oid>()?, message)))
-                    .collect::<Result<HashMap<_, _>>>()?,
-                tag_names: response
-                    .tag_names
-                    .into_iter()
-                    .map(|(sha, names)| Ok((sha.parse::<Oid>()?, names)))
-                    .collect::<Result<HashMap<_, _>>>()?,
-            })
+            blame_from_response(response)
+        }
+        .boxed()
+    }
+
+    fn blame_at_revision(
+        &self,
+        path: RepoPath,
+        revision: Oid,
+    ) -> BoxFuture<'_, Result<git::blame::Blame>> {
+        let client = self.client.clone();
+        let repo_path = self.repo_path.clone();
+        let path = repo_path_arg(&path);
+        async move {
+            let response: BlameResponse = client
+                .call(
+                    "GitRepository::blame_at_revision",
+                    &json!({
+                        "repo_path": repo_path.to_string_lossy(),
+                        "path": path,
+                        "revision": revision.to_string(),
+                    }),
+                )
+                .await?;
+            blame_from_response(response)
         }
         .boxed()
     }
@@ -877,6 +908,7 @@ impl GitRepository for RemoteGitRepository {
     fn stash_paths(
         &self,
         paths: Vec<RepoPath>,
+        message: Option<String>,
         env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {
         let client = self.client.clone();
@@ -889,6 +921,29 @@ impl GitRepository for RemoteGitRepository {
                     &json!({
                         "repo_path": repo_path.to_string_lossy(),
                         "paths": paths,
+                        "message": message,
+                        "env": env_to_map(&env),
+                    }),
+                )
+                .await
+        }
+        .boxed()
+    }
+
+    fn stash_staged(
+        &self,
+        message: Option<String>,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let client = self.client.clone();
+        let repo_path = self.repo_path.clone();
+        async move {
+            client
+                .call_void(
+                    "GitRepository::stash_staged",
+                    &json!({
+                        "repo_path": repo_path.to_string_lossy(),
+                        "message": message,
                         "env": env_to_map(&env),
                     }),
                 )

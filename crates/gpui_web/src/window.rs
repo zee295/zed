@@ -8,11 +8,11 @@ use std::sync::Arc;
 use std::{cell::Cell, cell::RefCell, rc::Rc};
 
 use gpui::{
-    AnyWindowHandle, Bounds, Capslock, ClipboardItem, Decorations, DevicePixels,
-    DispatchEventResult, GpuSpecs, Modifiers, MouseButton, Pixels, PlatformAtlas, PlatformDisplay,
-    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
-    RequestFrameOptions, ResizeEdge, Scene, Size, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControlArea, WindowControls, WindowDecorations, WindowParams, px,
+    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, DispatchEventResult, GpuSpecs,
+    Modifiers, MouseButton, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
+    ResizeEdge, Scene, Size, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea, WindowControls, WindowDecorations, WindowParams, px,
 };
 use gpui_wgpu::{WgpuContext, WgpuRenderer, WgpuSurfaceConfig, wgpu};
 use wasm_bindgen::prelude::*;
@@ -64,7 +64,6 @@ pub(crate) struct WebWindowInner {
     pub(crate) is_composing: Cell<bool>,
     pub(crate) native_text_input: RefCell<NativeTextInputState>,
     pub(crate) uses_native_text_input: bool,
-    pub(crate) pending_clipboard: Rc<RefCell<Option<ClipboardItem>>>,
     pub(crate) last_cursor_css: Rc<Cell<&'static str>>,
     keyboard_accessory: Option<KeyboardAccessory>,
     keyboard_accessory_expanded: Cell<bool>,
@@ -72,6 +71,7 @@ pub(crate) struct WebWindowInner {
     mql_handle: RefCell<Option<MqlHandle>>,
     pending_physical_size: Cell<Option<(u32, u32)>>,
     raf_id: Cell<Option<i32>>,
+    raf_function: RefCell<Option<js_sys::Function>>,
 }
 
 #[derive(Default)]
@@ -157,7 +157,6 @@ impl WebWindow {
         browser_window: web_sys::Window,
         lifecycle: Rc<Cell<WebWindowLifecycle>>,
         active_window: Rc<RefCell<Option<AnyWindowHandle>>>,
-        pending_clipboard: Rc<RefCell<Option<ClipboardItem>>>,
         last_cursor_css: Rc<Cell<&'static str>>,
     ) -> anyhow::Result<Self> {
         let document = browser_window
@@ -247,7 +246,6 @@ impl WebWindow {
             is_composing: Cell::new(false),
             native_text_input: RefCell::new(NativeTextInputState::default()),
             uses_native_text_input,
-            pending_clipboard,
             last_cursor_css,
             keyboard_accessory,
             keyboard_accessory_expanded: Cell::new(false),
@@ -255,10 +253,11 @@ impl WebWindow {
             mql_handle: RefCell::new(None),
             pending_physical_size: Cell::new(None),
             raf_id: Cell::new(None),
+            raf_function: RefCell::new(None),
         });
 
         let raf_closure = inner.create_raf_closure();
-        inner.schedule_raf(&raf_closure);
+        inner.wake_frame_loop();
 
         let resize_observer_closure = Self::create_resize_observer_closure(Rc::clone(&inner));
         let resize_observer =
@@ -406,11 +405,11 @@ impl WebWindowInner {
     }
 
     fn create_raf_closure(self: &Rc<Self>) -> Closure<dyn FnMut(f64)> {
-        let raf_handle: Rc<RefCell<Option<js_sys::Function>>> = Rc::new(RefCell::new(None));
-        let raf_handle_inner = Rc::clone(&raf_handle);
-
         let this = Rc::clone(self);
         let closure = Closure::new(move |timestamp| {
+            // Clear the fired request before running callbacks so invalidation
+            // during this frame can schedule the next one.
+            this.raf_id.set(None);
             // Momentum shares the platform's frame callback so input cannot
             // re-enter GPUI through an independent animation-frame callback.
             this.tick_touch_momentum(timestamp);
@@ -418,32 +417,32 @@ impl WebWindowInner {
                 |callbacks| &mut callbacks.request_frame,
                 |callback| {
                     callback(RequestFrameOptions {
-                        require_presentation: true,
+                        require_presentation: false,
                         force_render: false,
                     })
                 },
             );
-
-            // Re-schedule for the next frame
-            if let Some(ref func) = *raf_handle_inner.borrow() {
-                this.raf_id
-                    .set(this.browser_window.request_animation_frame(func).ok());
+            if this.touch_momentum.get().is_some() {
+                this.wake_frame_loop();
             }
         });
 
         let js_func: js_sys::Function =
             closure.as_ref().unchecked_ref::<js_sys::Function>().clone();
-        *raf_handle.borrow_mut() = Some(js_func);
+        *self.raf_function.borrow_mut() = Some(js_func);
 
         closure
     }
 
-    fn schedule_raf(&self, closure: &Closure<dyn FnMut(f64)>) {
-        self.raf_id.set(
-            self.browser_window
-                .request_animation_frame(closure.as_ref().unchecked_ref())
-                .ok(),
-        );
+    pub(crate) fn wake_frame_loop(&self) {
+        if self.raf_id.get().is_some() {
+            return;
+        }
+        let raf_function = self.raf_function.borrow();
+        if let Some(func) = raf_function.as_ref() {
+            self.raf_id
+                .set(self.browser_window.request_animation_frame(func).ok());
+        }
     }
 
     fn observe_canvas(&self, observer: &web_sys::ResizeObserver) {
@@ -816,6 +815,9 @@ impl Drop for WebWindow {
                 .cancel_animation_frame(raf_id)
                 .ok();
         }
+        // A frame waker that outlives this window must not re-schedule the
+        // freed closure; without a stored function, `wake_frame_loop` no-ops.
+        self.inner.raf_function.borrow_mut().take();
         if let Some(ref observer) = self._resize_observer {
             observer.disconnect();
         }
@@ -1291,6 +1293,19 @@ impl PlatformWindow for WebWindow {
 
     fn is_fullscreen(&self) -> bool {
         self.inner.state.borrow().is_fullscreen
+    }
+
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        // Hold the inner window weakly: the waker is stored in the window's
+        // invalidator, and `callbacks.request_frame` captures a clone of that
+        // invalidator, so a strong reference here would form a cycle and leak
+        // the window on close.
+        let inner = Rc::downgrade(&self.inner);
+        Some(Rc::new(move || {
+            if let Some(inner) = inner.upgrade() {
+                inner.wake_frame_loop();
+            }
+        }))
     }
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {

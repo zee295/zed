@@ -22,11 +22,9 @@ pub fn dispatch(fs: &FsRpc, method: &str, params: &Value) -> Result<Value> {
         "GitRepository::revparse_batch" => revparse_batch(fs, params),
         "GitRepository::load_revisions" => load_revisions(fs, params),
         "GitRepository::load_commit_template" => load_commit_template(fs, params),
-        "GitRepository::load_blob_content" => Ok(Value::String(git_text(
-            fs,
-            params,
-            &["cat-file", "-p", string(params, "oid")],
-        )?)),
+        "GitRepository::load_blob_content" => Ok(json!(
+            git(fs, params, &["cat-file", "-p", string(params, "oid")])?.stdout
+        )),
         "GitRepository::status" => status(fs, params),
         "GitRepository::diff_tree" => diff_tree(fs, params),
         "GitRepository::diff_stat" => diff_stat(fs, params),
@@ -49,6 +47,7 @@ pub fn dispatch(fs: &FsRpc, method: &str, params: &Value) -> Result<Value> {
         "GitRepository::commit_data" => commit_data(fs, params),
         "GitRepository::load_commit" => load_commit(fs, params),
         "GitRepository::blame" => blame(fs, params),
+        "GitRepository::blame_at_revision" => blame_at_revision(fs, params),
         "GitRepository::remote_urls" => remote_urls(fs, params),
         "GitRepository::merge_message" => merge_message(fs, params),
         "GitRepository::show" => show(fs, params),
@@ -65,9 +64,8 @@ pub fn dispatch(fs: &FsRpc, method: &str, params: &Value) -> Result<Value> {
         "GitRepository::checkout_files" => checkout_files(fs, params),
         "GitRepository::stage_paths" => paths_command(fs, params, &["add", "--all", "--"]),
         "GitRepository::unstage_paths" => paths_command(fs, params, &["reset", "--"]),
-        "GitRepository::stash_paths" => {
-            paths_command(fs, params, &["stash", "push", "--keep-index", "--"])
-        }
+        "GitRepository::stash_paths" => stash_paths(fs, params),
+        "GitRepository::stash_staged" => stash_staged(fs, params),
         "GitRepository::stash_pop" => stash(fs, params, "pop"),
         "GitRepository::stash_apply" => stash(fs, params, "apply"),
         "GitRepository::stash_drop" => stash(fs, params, "drop"),
@@ -212,8 +210,7 @@ fn load_revisions(fs: &FsRpc, params: &Value) -> Result<Value> {
             }
             git(fs, params, &["cat-file", "-p", &revision])
                 .ok()
-                .and_then(|output| String::from_utf8(output.stdout).ok())
-                .map(Value::String)
+                .map(|output| json!(output.stdout))
                 .unwrap_or(Value::Null)
         })
         .collect();
@@ -759,8 +756,8 @@ fn load_commit(fs: &FsRpc, params: &Value) -> Result<Value> {
         let is_binary = old_binary || new_binary;
         files.push(json!({
             "path": path,
-            "old_text": if is_binary && old_text.is_some() { Some(String::new()) } else { old_text },
-            "new_text": if is_binary && new_text.is_some() { Some(String::new()) } else { new_text },
+            "old_content": old_text,
+            "new_content": new_text,
             "is_binary": is_binary,
         }));
     }
@@ -772,23 +769,19 @@ fn load_object(
     params: &Value,
     mode: &str,
     oid: &str,
-) -> Result<(Option<String>, bool)> {
+) -> Result<(Option<Vec<u8>>, bool)> {
     if oid.bytes().all(|byte| byte == b'0') {
         return Ok((None, false));
     }
     if mode == "160000" {
-        return Ok((Some(format!("Subproject commit {oid}\n")), false));
+        return Ok((
+            Some(format!("Subproject commit {oid}\n").into_bytes()),
+            false,
+        ));
     }
     let data = git(fs, params, &["cat-file", "-p", oid])?.stdout;
     let binary = data.iter().take(8000).any(|byte| *byte == 0);
-    Ok((
-        Some(if binary {
-            String::new()
-        } else {
-            String::from_utf8_lossy(&data).into_owned()
-        }),
-        binary,
-    ))
+    Ok((Some(data), binary))
 }
 
 fn blame(fs: &FsRpc, params: &Value) -> Result<Value> {
@@ -806,6 +799,10 @@ fn blame(fs: &FsRpc, params: &Value) -> Result<Value> {
         Some(string(params, "content").as_bytes()),
         false,
     )?;
+    parse_blame(fs, params, output)
+}
+
+fn parse_blame(fs: &FsRpc, params: &Value, output: Output) -> Result<Value> {
     if !output.status.success() {
         let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if error == "fatal: no such ref: HEAD" || error.contains("fatal: no such path") {
@@ -940,6 +937,23 @@ fn blame(fs: &FsRpc, params: &Value) -> Result<Value> {
     Ok(json!({"entries": entries, "messages": messages, "tag_names": tags}))
 }
 
+fn blame_at_revision(fs: &FsRpc, params: &Value) -> Result<Value> {
+    let output = git_command(
+        fs,
+        params,
+        &[
+            "blame",
+            "--incremental",
+            string(params, "revision"),
+            "--",
+            string(params, "path"),
+        ],
+        None,
+        false,
+    )?;
+    parse_blame(fs, params, output)
+}
+
 fn remote_urls(fs: &FsRpc, params: &Value) -> Result<Value> {
     let output = git_text(fs, params, &["remote", "-v"])?;
     let mut remotes = serde_json::Map::new();
@@ -996,14 +1010,16 @@ fn show(fs: &FsRpc, params: &Value) -> Result<Value> {
 
 fn set_index_text(fs: &FsRpc, params: &Value) -> Result<Value> {
     let path = string(params, "path");
-    let Some(content) = params.get("content").and_then(Value::as_str) else {
+    let Some(content) = params.get("content").filter(|content| !content.is_null()) else {
         return null_command(fs, params, &["update-index", "--force-remove", "--", path]);
     };
+    let content: Vec<u8> = serde_json::from_value(content.clone())
+        .context("git index content must be an array of bytes")?;
     let output = git_command(
         fs,
         params,
         &["hash-object", "-w", "--stdin"],
-        Some(content.as_bytes()),
+        Some(&content),
         true,
     )?;
     let blob = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -1173,6 +1189,34 @@ fn paths_command(fs: &FsRpc, params: &Value, prefix: &[&str]) -> Result<Value> {
         .map(|value| value.to_string())
         .collect::<Vec<_>>();
     args.extend(string_array(params, "paths"));
+    null_owned_command(fs, params, args)
+}
+
+fn stash_paths(fs: &FsRpc, params: &Value) -> Result<Value> {
+    let mut args = vec![
+        "stash".to_string(),
+        "push".to_string(),
+        "--quiet".to_string(),
+        "--include-untracked".to_string(),
+    ];
+    if let Some(message) = params.get("message").and_then(Value::as_str) {
+        args.extend(["--message".to_string(), message.to_string()]);
+    }
+    args.push("--".to_string());
+    args.extend(string_array(params, "paths"));
+    null_owned_command(fs, params, args)
+}
+
+fn stash_staged(fs: &FsRpc, params: &Value) -> Result<Value> {
+    let mut args = vec![
+        "stash".to_string(),
+        "push".to_string(),
+        "--quiet".to_string(),
+        "--staged".to_string(),
+    ];
+    if let Some(message) = params.get("message").and_then(Value::as_str) {
+        args.extend(["--message".to_string(), message.to_string()]);
+    }
     null_owned_command(fs, params, args)
 }
 

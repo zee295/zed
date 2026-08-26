@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
-ARG RUST_VERSION=1.95.0
+ARG RUST_VERSION=1.97.1
+ARG WASM_BINDGEN_VERSION=0.2.127
 ARG NODE_VERSION=22.23.1
 ARG NPM_VERSION=12.0.1
 ARG NPM_TAR_VERSION=7.5.22
@@ -9,6 +10,7 @@ ARG DEBIAN_RUNTIME_SUITE=trixie
 FROM rust:${RUST_VERSION}-bookworm AS builder
 
 ARG RUST_VERSION
+ARG WASM_BINDGEN_VERSION
 ARG TARGETARCH
 ARG WEB_REVISION=unknown
 ARG UPSTREAM_REVISION=unknown
@@ -24,7 +26,7 @@ RUN /tmp/install-zed-linux \
 RUN rustup toolchain install "${RUST_VERSION}" \
     && rustup toolchain install nightly --component rust-src \
     && rustup target add wasm32-unknown-unknown --toolchain nightly \
-    && cargo install wasm-bindgen-cli --version 0.2.120 --locked
+    && cargo install wasm-bindgen-cli --version "${WASM_BINDGEN_VERSION}" --locked
 
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
