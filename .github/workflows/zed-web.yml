@@ -86,7 +86,18 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Resolve upstream revision
         id: revisions
-        run: echo "upstream=$(git merge-base HEAD origin/main 2>/dev/null || git rev-parse HEAD^)" >> "$GITHUB_OUTPUT"
+        run: |
+          upstream_tag="$(
+            git tag --merged HEAD --list 'v[0-9]*' --sort=-version:refname |
+              grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
+              head -n 1
+          )"
+          if [[ -z "${upstream_tag}" ]]; then
+            echo "no upstream release tag is reachable from HEAD" >&2
+            exit 2
+          fi
+          upstream_revision="$(git rev-list -n 1 "${upstream_tag}")"
+          echo "upstream=${upstream_revision}" >> "$GITHUB_OUTPUT"
       - uses: docker/build-push-action@v6
         with:
           context: .
