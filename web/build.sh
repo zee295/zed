@@ -42,7 +42,7 @@ install -m 0755 \
     "${dist_dir}/bin/zed-extension-runtime"
 
 export CARGO_TARGET_DIR="${wasm_target}"
-export RUSTFLAGS='--cfg getrandom_backend="wasm_js" -C target-feature=+atomics,+bulk-memory,+mutable-globals -C link-arg=--shared-memory -C link-arg=--import-memory -C link-arg=--max-memory=4294967296 -C link-arg=--export=__heap_base -C link-arg=--export=__stack_pointer -C link-arg=--export=__tls_size -C link-arg=--export=__tls_align -C link-arg=--export=__tls_base -C link-arg=--export=__wasm_init_tls -C link-arg=--export=__wasm_call_ctors'
+export RUSTFLAGS='--cfg getrandom_backend="wasm_js" -C target-feature=+atomics,+bulk-memory,+mutable-globals -C link-arg=--shared-memory -C link-arg=--import-memory -C link-arg=--initial-memory=134217728 -C link-arg=--max-memory=4294967296 -C link-arg=--export=__heap_base -C link-arg=--export=__stack_pointer -C link-arg=--export=__tls_size -C link-arg=--export=__tls_align -C link-arg=--export=__tls_base -C link-arg=--export=__wasm_init_tls -C link-arg=--export=__wasm_call_ctors'
 
 if [[ ! -x "${wasi_sdk}/bin/clang" ]]; then
     "${repo_dir}/script/download-wasi-sdk"

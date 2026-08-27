@@ -196,7 +196,7 @@ Host prerequisites:
 - Rust `1.97.1`
 - Rust nightly with `rust-src`
 - `wasm32-unknown-unknown`
-- `wasm-bindgen-cli 0.2.120`
+- `wasm-bindgen-cli 0.2.127`
 - Brotli, gzip, Perl, Clang, CMake, and Zed's Linux build dependencies
 
 ```sh
@@ -221,6 +221,7 @@ substantial CPU, memory, and build time.
 
 ```sh
 cargo test -p zed_web_server --bin zed-web-server
+./web/scripts/test-patch-wasm-bindgen-memory.sh
 ./web/check-wasm-time.sh
 cargo +nightly check -p zed_web_workspace \
   --target wasm32-unknown-unknown \
@@ -264,6 +265,13 @@ pushing `zed-web`.
 `zed_web_workspace`. `web/check-wasm-time.sh` records the remaining native-only
 and test-only uses and fails when an upstream update introduces another one.
 Review every allowlist change rather than accepting it mechanically.
+
+The threaded WASM build reserves a 128 MB initial shared heap and runs
+`web/scripts/patch-wasm-bindgen-memory.sh` after wasm-bindgen. This prevents
+normal startup from repeatedly growing shared memory and retries generated
+`DataView` operations only when a valid address was caught behind a newly
+grown buffer. Preserve both linker and postprocessor changes during upstream
+updates, then run `test-patch-wasm-bindgen-memory.sh` before the browser suite.
 
 Release images are tagged with both the web branch revision and the upstream
 base revision through `build-info.json`.

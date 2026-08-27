@@ -46,6 +46,8 @@ jobs:
         run: ./script/download-wasi-sdk
       - name: Test Rust backend
         run: rustup run 1.97.1 cargo test -p zed_web_server --bin zed-web-server
+      - name: Test wasm-bindgen memory patch
+        run: ./web/scripts/test-patch-wasm-bindgen-memory.sh
       - name: Audit WASM clock usage
         run: ./web/check-wasm-time.sh
       - name: Check WASM frontend
