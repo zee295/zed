@@ -101,6 +101,8 @@ struct ProcessIdentity {
 
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct OrphanedProcessReap {
+    pub acp_agents: usize,
+    pub acp_waiting_for_prompt: bool,
     pub language_servers: usize,
     pub mcp_servers: usize,
     pub mcp_waiting_for_agent: bool,
@@ -336,9 +338,11 @@ impl ProcessManager {
                         identity,
                         owner_generation,
                         supports_compressed_output,
+                        true,
                     ) {
                         return Ok(json!({"proc_id": proc_id}));
                     }
+                    self.replace_disconnected_idle_acp_agent(identity);
                 }
                 ProcessKind::McpServer => {
                     if let Some(proc_id) = self.reattach_disconnected_process(
@@ -346,6 +350,7 @@ impl ProcessManager {
                         identity,
                         owner_generation,
                         supports_compressed_output,
+                        false,
                     ) {
                         return Ok(json!({"proc_id": proc_id}));
                     }
@@ -485,6 +490,30 @@ impl ProcessManager {
     }
 
     pub fn reap_orphaned_processes(&mut self, generation: u64) -> OrphanedProcessReap {
+        let idle_acp_agent_ids = self
+            .processes
+            .iter()
+            .filter_map(|(proc_id, entry)| {
+                (entry.owner_generation == generation
+                    && entry.disconnected
+                    && entry.kind == ProcessKind::AcpAgent
+                    && !has_active_acp_prompt(entry))
+                .then_some(*proc_id)
+            })
+            .collect::<Vec<_>>();
+        let acp_agents = idle_acp_agent_ids.len();
+        for proc_id in idle_acp_agent_ids {
+            if let Some(entry) = self.processes.remove(&proc_id) {
+                terminate_process(entry);
+            }
+        }
+        let acp_waiting_for_prompt = self.processes.values().any(|entry| {
+            entry.owner_generation == generation
+                && entry.disconnected
+                && entry.kind == ProcessKind::AcpAgent
+                && has_active_acp_prompt(entry)
+        });
+
         let language_server_ids = self
             .processes
             .iter()
@@ -530,6 +559,8 @@ impl ProcessManager {
         };
 
         OrphanedProcessReap {
+            acp_agents,
+            acp_waiting_for_prompt,
             language_servers,
             mcp_servers,
             mcp_waiting_for_agent,
@@ -559,19 +590,46 @@ impl ProcessManager {
         }
     }
 
+    fn replace_disconnected_idle_acp_agent(&mut self, identity: &ProcessIdentity) {
+        let proc_ids = self
+            .processes
+            .iter()
+            .filter_map(|(proc_id, entry)| {
+                (entry.disconnected
+                    && entry.kind == ProcessKind::AcpAgent
+                    && entry.identity.as_ref() == Some(identity)
+                    && !has_active_acp_prompt(entry))
+                .then_some(*proc_id)
+            })
+            .collect::<Vec<_>>();
+        for proc_id in proc_ids {
+            if let Some(entry) = self.processes.remove(&proc_id) {
+                tracing::info!(
+                    proc_id,
+                    cwd = %identity.cwd.display(),
+                    "replacing idle disconnected ACP agent"
+                );
+                terminate_process(entry);
+            }
+        }
+    }
+
     fn reattach_disconnected_process(
         &mut self,
         kind: ProcessKind,
         identity: &ProcessIdentity,
         owner_generation: u64,
         supports_compressed_output: bool,
+        require_active_acp_prompt: bool,
     ) -> Option<u64> {
         let proc_id = self.processes.iter().find_map(|(proc_id, entry)| {
             (entry.disconnected
                 && !entry.task.is_finished()
                 && entry.kind == kind
                 && entry.identity.as_ref() == Some(identity))
-            .then_some(*proc_id)
+            .then_some(entry)
+            .filter(|entry| !require_active_acp_prompt || has_active_acp_prompt(entry))
+            .map(|_| *proc_id)
         })?;
         let entry = self.processes.get_mut(&proc_id)?;
         entry.owner_generation = owner_generation;
@@ -699,6 +757,13 @@ impl ProcessManager {
         }
         Ok(Value::Null)
     }
+}
+
+fn has_active_acp_prompt(entry: &ProcessEntry) -> bool {
+    entry
+        .acp_activity
+        .lock()
+        .is_ok_and(|activity| !activity.prompts.is_empty())
 }
 
 fn terminate_process(entry: ProcessEntry) {
@@ -1492,7 +1557,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn reload_reattaches_disconnected_agent() -> anyhow::Result<()> {
+    async fn reload_replaces_disconnected_idle_agent() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let fs = Arc::new(FsRpc::new(root.path().to_path_buf(), false)?);
         let (outgoing, _notifications) = mpsc::unbounded_channel::<Message>();
@@ -1513,14 +1578,14 @@ mod tests {
         processes.detach_generation(1);
         let response = processes.dispatch("Process::spawn", &spawn(54), 2).await?;
 
-        assert_eq!(response["proc_id"], 53);
-        assert!(processes.processes.contains_key(&53));
-        assert!(!processes.processes.contains_key(&54));
-        let reattached = processes.processes.get(&53).unwrap();
-        assert_eq!(reattached.owner_generation, 2);
-        assert!(!reattached.disconnected);
+        assert_eq!(response["proc_id"], 54);
+        assert!(!processes.processes.contains_key(&53));
+        assert!(processes.processes.contains_key(&54));
+        let replacement = processes.processes.get(&54).unwrap();
+        assert_eq!(replacement.owner_generation, 2);
+        assert!(!replacement.disconnected);
         processes
-            .dispatch("Process::kill", &json!({"proc_id": 53}), 2)
+            .dispatch("Process::kill", &json!({"proc_id": 54}), 2)
             .await?;
         Ok(())
     }
@@ -1599,10 +1664,21 @@ mod tests {
                 .await?;
         }
         processes.detach_generation(1);
+        processes
+            .processes
+            .get(&61)
+            .unwrap()
+            .acp_activity
+            .lock()
+            .unwrap()
+            .prompts
+            .insert("request-1".into(), "session-1".into());
 
         assert_eq!(
             processes.reap_orphaned_processes(1),
             OrphanedProcessReap {
+                acp_agents: 0,
+                acp_waiting_for_prompt: true,
                 language_servers: 0,
                 mcp_servers: 0,
                 mcp_waiting_for_agent: true,
@@ -1611,16 +1687,25 @@ mod tests {
         assert!(processes.processes.contains_key(&60));
 
         processes
-            .dispatch("Process::kill", &json!({"proc_id": 61}), 1)
-            .await?;
+            .processes
+            .get(&61)
+            .unwrap()
+            .acp_activity
+            .lock()
+            .unwrap()
+            .prompts
+            .clear();
         assert_eq!(
             processes.reap_orphaned_processes(1),
             OrphanedProcessReap {
+                acp_agents: 1,
+                acp_waiting_for_prompt: false,
                 language_servers: 0,
                 mcp_servers: 1,
                 mcp_waiting_for_agent: false,
             }
         );
+        assert!(!processes.processes.contains_key(&61));
         assert!(!processes.processes.contains_key(&60));
         Ok(())
     }
@@ -1701,8 +1786,8 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn orphan_reaper_preserves_agents_and_reconnected_language_servers() -> anyhow::Result<()>
-    {
+    async fn orphan_reaper_removes_idle_agents_and_preserves_reconnected_language_servers()
+    -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let fs = Arc::new(FsRpc::new(root.path().to_path_buf(), false)?);
         let (outgoing, _notifications) = mpsc::unbounded_channel::<Message>();
@@ -1732,28 +1817,28 @@ mod tests {
         assert_eq!(
             processes.reap_orphaned_processes(1),
             OrphanedProcessReap {
+                acp_agents: 1,
+                acp_waiting_for_prompt: false,
                 language_servers: 0,
                 mcp_servers: 0,
                 mcp_waiting_for_agent: false,
             }
         );
         assert!(processes.processes.contains_key(&61));
-        assert!(processes.processes.contains_key(&62));
+        assert!(!processes.processes.contains_key(&62));
 
         processes.detach_generation(2);
         assert_eq!(
             processes.reap_orphaned_processes(2),
             OrphanedProcessReap {
+                acp_agents: 0,
+                acp_waiting_for_prompt: false,
                 language_servers: 1,
                 mcp_servers: 0,
                 mcp_waiting_for_agent: false,
             }
         );
         assert!(!processes.processes.contains_key(&61));
-        assert!(processes.processes.contains_key(&62));
-        processes
-            .dispatch("Process::kill", &json!({"proc_id": 62}), 1)
-            .await?;
         Ok(())
     }
 

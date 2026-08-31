@@ -666,15 +666,16 @@ pub async fn serve(socket: WebSocket, state: AppState) {
                     .lock()
                     .await
                     .reap_orphaned_processes(generation);
-                if reaped.language_servers > 0 || reaped.mcp_servers > 0 {
+                if reaped.acp_agents > 0 || reaped.language_servers > 0 || reaped.mcp_servers > 0 {
                     tracing::info!(
                         generation,
+                        acp_agents = reaped.acp_agents,
                         language_servers = reaped.language_servers,
                         mcp_servers = reaped.mcp_servers,
                         "reaped orphaned processes"
                     );
                 }
-                if !reaped.mcp_waiting_for_agent {
+                if !reaped.acp_waiting_for_prompt && !reaped.mcp_waiting_for_agent {
                     break;
                 }
                 tokio::time::sleep(Duration::from_secs(30)).await;
