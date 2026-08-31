@@ -13,7 +13,7 @@ use std::io;
 use std::io::Read as _;
 use std::pin::Pin;
 use std::process::{ExitStatus, Output};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::task::{Context, Poll, Waker};
 
 pub use std::process::Stdio;
@@ -30,6 +30,16 @@ use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use serde::{Deserialize, Serialize};
 #[cfg(target_family = "wasm")]
 use wasm_rpc::RpcClient;
+
+fn lock_shared<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return guard,
+            Err(TryLockError::Poisoned(error)) => return error.into_inner(),
+            Err(TryLockError::WouldBlock) => std::hint::spin_loop(),
+        }
+    }
+}
 
 #[cfg(target_family = "wasm")]
 thread_local! {
@@ -110,8 +120,8 @@ pub fn set_remote_client(client: RpcClient) {
         let Ok(payload) = serde_json::from_value::<StdoutNotification>(params) else {
             return;
         };
-        if let Some(io) = router_stdout.lock().unwrap().by_id.get(&payload.proc_id) {
-            let mut io = io.lock().unwrap();
+        if let Some(io) = lock_shared(&router_stdout).by_id.get(&payload.proc_id) {
+            let mut io = lock_shared(io);
             if let Some(bytes) = decode_process_output(&payload.data, payload.encoding.as_deref()) {
                 io.stdout_buf.extend(bytes);
                 if let Some(waker) = io.stdout_waker.take() {
@@ -126,8 +136,8 @@ pub fn set_remote_client(client: RpcClient) {
         let Ok(payload) = serde_json::from_value::<StderrNotification>(params) else {
             return;
         };
-        if let Some(io) = router_stderr.lock().unwrap().by_id.get(&payload.proc_id) {
-            let mut io = io.lock().unwrap();
+        if let Some(io) = lock_shared(&router_stderr).by_id.get(&payload.proc_id) {
+            let mut io = lock_shared(io);
             if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&payload.data) {
                 io.stderr_buf.extend(bytes);
                 if let Some(waker) = io.stderr_waker.take() {
@@ -142,8 +152,8 @@ pub fn set_remote_client(client: RpcClient) {
         let Ok(payload) = serde_json::from_value::<ExitNotification>(params) else {
             return;
         };
-        if let Some(io) = router_exit.lock().unwrap().by_id.get(&payload.proc_id) {
-            let mut io = io.lock().unwrap();
+        if let Some(io) = lock_shared(&router_exit).by_id.get(&payload.proc_id) {
+            let mut io = lock_shared(io);
             let status = ExitStatus::default();
             io.exit_status = Some(status);
             if let Some(tx) = io.exit_tx.take() {
@@ -166,9 +176,7 @@ pub fn set_remote_client(client: RpcClient) {
     let reconnect_router = router.clone();
     wasm_bindgen_futures::spawn_local(async move {
         while reconnects.next().await.is_some() {
-            let proc_ids = reconnect_router
-                .lock()
-                .unwrap()
+            let proc_ids = lock_shared(&reconnect_router)
                 .by_id
                 .keys()
                 .copied()
@@ -189,8 +197,8 @@ pub fn set_remote_client(client: RpcClient) {
                 continue;
             };
             for proc_id in response.missing {
-                if let Some(io) = reconnect_router.lock().unwrap().by_id.get(&proc_id) {
-                    mark_process_exited(&mut io.lock().unwrap());
+                if let Some(io) = lock_shared(&reconnect_router).by_id.get(&proc_id) {
+                    mark_process_exited(&mut lock_shared(io));
                 }
             }
         }
@@ -423,7 +431,7 @@ impl Command {
             };
 
             let io = Arc::new(Mutex::new(ProcessIo::new()));
-            router.lock().unwrap().by_id.insert(proc_id, io.clone());
+            lock_shared(&router).by_id.insert(proc_id, io.clone());
             let actual_proc_id = Arc::new(std::sync::atomic::AtomicU64::new(proc_id));
 
             let (spawn_ready_tx, spawn_ready_rx) = oneshot::channel();
@@ -440,7 +448,7 @@ impl Command {
                 match result {
                     Ok(response) => {
                         if response.proc_id != proc_id {
-                            let mut router = router_for_spawn.lock().unwrap();
+                            let mut router = lock_shared(&router_for_spawn);
                             router.by_id.remove(&proc_id);
                             router.by_id.insert(response.proc_id, io_for_spawn.clone());
                         }
@@ -450,8 +458,8 @@ impl Command {
                     }
                     Err(_) => {
                         let _ = spawn_ready_tx.send(None);
-                        if let Some(io) = router_for_spawn.lock().unwrap().by_id.get(&proc_id) {
-                            let mut guard = io.lock().unwrap();
+                        if let Some(io) = lock_shared(&router_for_spawn).by_id.get(&proc_id) {
+                            let mut guard = lock_shared(io);
                             guard.exit_status = Some(ExitStatus::default());
                             if let Some(tx) = guard.exit_tx.take() {
                                 tx.send(ExitStatus::default()).ok();
@@ -472,7 +480,7 @@ impl Command {
 
             let stdin = if self.stdin_cfg.is_some() {
                 let (tx, mut rx) = mpsc::unbounded::<Vec<u8>>();
-                io.lock().unwrap().stdin_tx = Some(tx.clone());
+                lock_shared(&io).stdin_tx = Some(tx.clone());
                 let client_for_stdin = client.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     let Some(proc_id_for_stdin) = spawn_ready_rx.await.unwrap_or(None) else {
@@ -641,14 +649,14 @@ impl Child {
         let io = self.io.clone();
         async move {
             {
-                let guard = io.lock().unwrap();
+                let guard = lock_shared(&io);
                 if guard.exit_status.is_some() {
                     return Ok(ExitStatus::default());
                 }
             }
             let (tx, rx) = oneshot::channel();
             {
-                let mut guard = io.lock().unwrap();
+                let mut guard = lock_shared(&io);
                 guard.exit_tx = Some(tx);
             }
             rx.await.ok();
@@ -676,7 +684,7 @@ impl Child {
     }
 
     pub fn try_status(&mut self) -> io::Result<Option<ExitStatus>> {
-        let guard = self.io.lock().unwrap();
+        let guard = lock_shared(&self.io);
         Ok(guard.exit_status)
     }
 
@@ -769,7 +777,7 @@ impl AsyncRead for ChildStdout {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        let mut io = self.io.lock().unwrap();
+        let mut io = lock_shared(&self.io);
         if io.stdout_buf.is_empty() {
             if io.exit_status.is_some() {
                 return Poll::Ready(Ok(0));
@@ -790,7 +798,7 @@ impl AsyncRead for ChildStderr {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        let mut io = self.io.lock().unwrap();
+        let mut io = lock_shared(&self.io);
         if io.stderr_buf.is_empty() {
             if io.exit_status.is_some() {
                 return Poll::Ready(Ok(0));
