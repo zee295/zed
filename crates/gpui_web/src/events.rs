@@ -246,6 +246,31 @@ impl WebWindowInner {
         self.pending_clipboard.take();
     }
 
+    fn clipboard_item_for_text(&self, text: String) -> ClipboardItem {
+        let mut owned_clipboard = self.owned_clipboard.borrow_mut();
+        if owned_clipboard
+            .as_ref()
+            .is_some_and(|item| item.text().as_deref() == Some(text.as_str()))
+        {
+            return owned_clipboard
+                .as_ref()
+                .expect("matching owned clipboard disappeared")
+                .clone();
+        }
+        owned_clipboard.take();
+        ClipboardItem::new_string(text)
+    }
+
+    fn clipboard_string_for_text(&self, text: String) -> ClipboardString {
+        let item = self.clipboard_item_for_text(text.clone());
+        item.into_entries()
+            .find_map(|entry| match entry {
+                ClipboardEntry::String(string) if string.text() == &text => Some(string),
+                _ => None,
+            })
+            .unwrap_or_else(|| ClipboardString::new(text))
+    }
+
     pub(crate) fn cancel_active_touch(&self, pointer_id: Option<i32>) {
         let Some(touch) = self.active_touch.take() else {
             return;
@@ -1197,7 +1222,7 @@ impl WebWindowInner {
 
             if image_files.is_empty() {
                 if let Some(text) = text {
-                    this.dispatch_paste(ClipboardItem::new_string(text));
+                    this.dispatch_paste(this.clipboard_item_for_text(text));
                     this.sync_native_text_input_context();
                 }
                 return;
@@ -1220,7 +1245,7 @@ impl WebWindowInner {
                     }
                 }
                 if let Some(text) = text {
-                    entries.push(ClipboardEntry::String(ClipboardString::new(text)));
+                    entries.push(ClipboardEntry::String(this.clipboard_string_for_text(text)));
                 }
                 if entries.is_empty() {
                     return;

@@ -50,6 +50,7 @@ pub struct WebPlatform {
     cursor_visible: Rc<Cell<bool>>,
     last_cursor_css: Rc<Cell<&'static str>>,
     pending_clipboard: Rc<RefCell<Option<ClipboardItem>>>,
+    owned_clipboard: Rc<RefCell<Option<ClipboardItem>>>,
     /// In-window application menus (no OS menu bar on the web).
     menus: RefCell<Vec<OwnedMenu>>,
     _cursor_restore_listeners: Vec<EventListenerHandle>,
@@ -153,6 +154,7 @@ impl WebPlatform {
         let cursor_visible = Rc::new(Cell::new(true));
         let last_cursor_css = Rc::new(Cell::new("default"));
         let pending_clipboard = Rc::new(RefCell::new(None));
+        let owned_clipboard = Rc::new(RefCell::new(None));
         let cursor_restore_listeners = cursor_restore_listeners(
             &browser_window,
             cursor_visible.clone(),
@@ -175,6 +177,7 @@ impl WebPlatform {
             cursor_visible,
             last_cursor_css,
             pending_clipboard,
+            owned_clipboard,
             menus: RefCell::new(Vec::new()),
             _cursor_restore_listeners: cursor_restore_listeners,
         }
@@ -389,6 +392,7 @@ impl Platform for WebPlatform {
             self.active_window.clone(),
             self.last_cursor_css.clone(),
             self.pending_clipboard.clone(),
+            self.owned_clipboard.clone(),
         );
         match window {
             Ok(window) => {
@@ -664,6 +668,15 @@ impl Platform for WebPlatform {
         if let Some(text) = item.text()
             && let Some(window) = web_sys::window()
         {
+            if item
+                .entries()
+                .iter()
+                .all(|entry| matches!(entry, ClipboardEntry::String(_)))
+            {
+                self.owned_clipboard.replace(Some(item));
+            } else {
+                self.owned_clipboard.take();
+            }
             // Fire-and-forget; called synchronously inside the user's input
             // event, which satisfies the browser's user-activation requirement.
             drop(window.navigator().clipboard().write_text(&text));

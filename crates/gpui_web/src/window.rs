@@ -66,6 +66,7 @@ pub(crate) struct WebWindowInner {
     pub(crate) uses_native_text_input: bool,
     pub(crate) last_cursor_css: Rc<Cell<&'static str>>,
     pub(crate) pending_clipboard: Rc<RefCell<Option<ClipboardItem>>>,
+    pub(crate) owned_clipboard: Rc<RefCell<Option<ClipboardItem>>>,
     keyboard_accessory: Option<KeyboardAccessory>,
     keyboard_accessory_expanded: Cell<bool>,
     keyboard_accessory_modifiers: Cell<Modifiers>,
@@ -160,6 +161,7 @@ impl WebWindow {
         active_window: Rc<RefCell<Option<AnyWindowHandle>>>,
         last_cursor_css: Rc<Cell<&'static str>>,
         pending_clipboard: Rc<RefCell<Option<ClipboardItem>>>,
+        owned_clipboard: Rc<RefCell<Option<ClipboardItem>>>,
     ) -> anyhow::Result<Self> {
         let document = browser_window
             .document()
@@ -250,6 +252,7 @@ impl WebWindow {
             uses_native_text_input,
             last_cursor_css,
             pending_clipboard,
+            owned_clipboard,
             keyboard_accessory,
             keyboard_accessory_expanded: Cell::new(false),
             keyboard_accessory_modifiers: Cell::new(Modifiers::default()),
