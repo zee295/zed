@@ -331,6 +331,31 @@ pub async fn execute_async(sql: &str, params: &[SqlParam]) -> Result<SqlQueryRes
     Ok(result)
 }
 
+/// Start a write that the browser may finish while the page is unloading.
+///
+/// This is intentionally fire-and-forget. It is reserved for small, standalone
+/// persistence writes that must not block the WASM UI thread and should survive
+/// an immediate reload.
+#[cfg(target_family = "wasm")]
+pub fn execute_keepalive(sql: &str, params: &[SqlParam]) -> Result<()> {
+    let params_json: Vec<Value> = params.iter().map(SqlParam::to_json).collect();
+    let body = request_with_client_id(&json!({
+        "method": "Sql::query",
+        "params": {
+            "sql": sql,
+            "params": params_json,
+        }
+    }));
+    let payload = serde_json::to_string(&body).context("serialize keepalive SQL request")?;
+    start_sql_keepalive(endpoint(), &payload)
+        .map_err(|error| anyhow!("start keepalive SQL request: {error:?}"))?;
+    read_cache_clear();
+    if touches_common_store(sql) {
+        read_cache::apply_common_write(sql, &params_json);
+    }
+    Ok(())
+}
+
 /// Execute dependent statements as one atomic server-side transaction.
 ///
 /// A parameter can refer to the row ID inserted by an earlier query in the
@@ -672,6 +697,26 @@ fn parse_query_result(value: Value) -> Result<SqlQueryResult> {
         last_rowid,
         changes,
     })
+}
+
+#[cfg(target_family = "wasm")]
+#[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
+export function zedSqlKeepalive(endpoint, payload) {
+    fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: payload,
+        credentials: "same-origin",
+        keepalive: true,
+    }).catch(error => console.error("keepalive SQL request failed", error));
+}
+"#)]
+extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(catch, js_name = zedSqlKeepalive)]
+    fn start_sql_keepalive(
+        endpoint: &str,
+        payload: &str,
+    ) -> std::result::Result<(), wasm_bindgen::JsValue>;
 }
 
 #[cfg(target_family = "wasm")]

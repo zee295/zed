@@ -1355,10 +1355,10 @@ impl ThreadMetadataStore {
         #[cfg(target_family = "wasm")]
         if was_draft && !is_draft {
             // A page reload or WASM panic can stop the asynchronous metadata
-            // queue before its first upsert reaches the server. Persist the
-            // draft promotion before returning so the new session remains in
-            // the project's recent-thread list after a reload.
-            self.db.save_immediately(&metadata).log_err();
+            // queue before its first upsert reaches the server. Start a small
+            // keepalive request so the promotion survives an immediate reload
+            // without blocking the browser's UI thread.
+            self.db.save_keepalive(&metadata).log_err();
         }
         self.save(metadata, cx);
     }
@@ -1579,7 +1579,7 @@ impl ThreadMetadataDb {
     }
 
     #[cfg(target_family = "wasm")]
-    fn save_immediately(&self, row: &ThreadMetadata) -> anyhow::Result<()> {
+    fn save_keepalive(&self, row: &ThreadMetadata) -> anyhow::Result<()> {
         use db::sqlez::remote_sql::{self, SqlParam};
 
         let session_id = row
@@ -1609,7 +1609,7 @@ impl ThreadMetadataDb {
             .transpose()
             .context("serialize thread metadata remote connection")?;
 
-        remote_sql::query(
+        remote_sql::execute_keepalive(
             Self::UPSERT_QUERY,
             &[
                 SqlParam::blob(row.thread_id.0.as_bytes()),
@@ -1631,8 +1631,7 @@ impl ThreadMetadataDb {
                 optional_text(remote_connection),
                 optional_text(row.title_override.as_ref().map(ToString::to_string)),
             ],
-        )?;
-        Ok(())
+        )
     }
 
     /// Delete metadata for a single thread.
