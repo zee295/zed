@@ -8,11 +8,11 @@ use std::sync::Arc;
 use std::{cell::Cell, cell::RefCell, rc::Rc};
 
 use gpui::{
-    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, DispatchEventResult, GpuSpecs,
-    Modifiers, MouseButton, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
-    ResizeEdge, Scene, Size, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowControls, WindowDecorations, WindowParams, px,
+    AnyWindowHandle, Bounds, Capslock, ClipboardItem, Decorations, DevicePixels,
+    DispatchEventResult, GpuSpecs, Modifiers, MouseButton, Pixels, PlatformAtlas, PlatformDisplay,
+    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
+    RequestFrameOptions, ResizeEdge, Scene, Size, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControlArea, WindowControls, WindowDecorations, WindowParams, px,
 };
 use gpui_wgpu::{WgpuContext, WgpuRenderer, WgpuSurfaceConfig, wgpu};
 use wasm_bindgen::prelude::*;
@@ -65,6 +65,7 @@ pub(crate) struct WebWindowInner {
     pub(crate) native_text_input: RefCell<NativeTextInputState>,
     pub(crate) uses_native_text_input: bool,
     pub(crate) last_cursor_css: Rc<Cell<&'static str>>,
+    pub(crate) pending_clipboard: Rc<RefCell<Option<ClipboardItem>>>,
     keyboard_accessory: Option<KeyboardAccessory>,
     keyboard_accessory_expanded: Cell<bool>,
     keyboard_accessory_modifiers: Cell<Modifiers>,
@@ -158,6 +159,7 @@ impl WebWindow {
         lifecycle: Rc<Cell<WebWindowLifecycle>>,
         active_window: Rc<RefCell<Option<AnyWindowHandle>>>,
         last_cursor_css: Rc<Cell<&'static str>>,
+        pending_clipboard: Rc<RefCell<Option<ClipboardItem>>>,
     ) -> anyhow::Result<Self> {
         let document = browser_window
             .document()
@@ -247,6 +249,7 @@ impl WebWindow {
             native_text_input: RefCell::new(NativeTextInputState::default()),
             uses_native_text_input,
             last_cursor_css,
+            pending_clipboard,
             keyboard_accessory,
             keyboard_accessory_expanded: Cell::new(false),
             keyboard_accessory_modifiers: Cell::new(Modifiers::default()),

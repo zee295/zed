@@ -210,6 +210,42 @@ impl WebWindowInner {
         self.with_callback(|callbacks| &mut callbacks.input, |callback| callback(input))
     }
 
+    fn dispatch_paste(&self, item: ClipboardItem) {
+        self.pending_clipboard.replace(Some(item));
+        let terminal_input = self
+            .with_input_handler(|handler| {
+                let Some(selection) = handler.selected_text_range(true) else {
+                    return false;
+                };
+                let mut adjusted_range = None;
+                handler
+                    .text_for_range(selection.range, &mut adjusted_range)
+                    .is_none()
+            })
+            .unwrap_or(false);
+        let modifiers = match (gpui::operating_system(), terminal_input) {
+            (gpui::OperatingSystem::Mac, _) => Modifiers::command(),
+            (gpui::OperatingSystem::Linux, true) => Modifiers {
+                control: true,
+                shift: true,
+                ..Default::default()
+            },
+            _ => Modifiers::control(),
+        };
+        let keystroke = Keystroke {
+            modifiers,
+            key: "v".into(),
+            key_char: None,
+        };
+        self.dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
+            keystroke: keystroke.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        }));
+        self.dispatch_input(PlatformInput::KeyUp(KeyUpEvent { keystroke }));
+        self.pending_clipboard.take();
+    }
+
     pub(crate) fn cancel_active_touch(&self, pointer_id: Option<i32>) {
         let Some(touch) = self.active_touch.take() else {
             return;
@@ -1161,9 +1197,7 @@ impl WebWindowInner {
 
             if image_files.is_empty() {
                 if let Some(text) = text {
-                    this.with_input_handler(|handler| {
-                        handler.paste(ClipboardItem::new_string(text));
-                    });
+                    this.dispatch_paste(ClipboardItem::new_string(text));
                     this.sync_native_text_input_context();
                 }
                 return;
@@ -1172,9 +1206,6 @@ impl WebWindowInner {
             let this = Rc::clone(&this);
             wasm_bindgen_futures::spawn_local(async move {
                 let mut entries = Vec::new();
-                if let Some(text) = text {
-                    entries.push(ClipboardEntry::String(ClipboardString::new(text)));
-                }
                 for (file, format) in image_files {
                     match crate::platform::read_blob_bytes(&file).await {
                         Ok(bytes) => {
@@ -1188,12 +1219,13 @@ impl WebWindowInner {
                         }
                     }
                 }
+                if let Some(text) = text {
+                    entries.push(ClipboardEntry::String(ClipboardString::new(text)));
+                }
                 if entries.is_empty() {
                     return;
                 }
-                this.with_input_handler(|handler| {
-                    handler.paste(ClipboardItem { entries });
-                });
+                this.dispatch_paste(ClipboardItem { entries });
                 this.sync_native_text_input_context();
             });
         })
