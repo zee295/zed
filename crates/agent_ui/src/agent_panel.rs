@@ -72,11 +72,14 @@ use extension_host::ExtensionStore;
 use feature_flags::{CreateThreadToolFeatureFlag, FeatureFlagAppExt as _};
 
 use fs::Fs;
-use futures::FutureExt as _;
+use futures::{
+    FutureExt as _,
+    future::{Shared, WeakShared},
+};
 use gpui::{
     Action, Anchor, Animation, AnimationExt, AnyElement, App, AsyncWindowContext, ClipboardItem,
-    Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, KeyContext, Pixels,
-    PlatformDisplay, Subscription, Task, TaskExt, WeakEntity, WindowHandle, prelude::*,
+    Entity, EntityId, EventEmitter, ExternalPaths, FocusHandle, Focusable, Global, KeyContext,
+    Pixels, PlatformDisplay, Subscription, Task, TaskExt, WeakEntity, WindowHandle, prelude::*,
     pulsating_between,
 };
 use language::LanguageRegistry;
@@ -108,6 +111,15 @@ const MIN_PANEL_WIDTH: Pixels = px(300.);
 const LAST_USED_AGENT_KEY: &str = "agent_panel__last_used_external_agent";
 const LAST_CREATED_ENTRY_KIND_KEY: &str = "agent_panel__last_created_entry_kind";
 const TERMINAL_AGENT_TELEMETRY_ID: &str = "terminal";
+
+type SharedAgentPanelLoad = Shared<Task<Result<Entity<AgentPanel>, Arc<anyhow::Error>>>>;
+
+#[derive(Default)]
+struct AgentPanelLoadPool {
+    pending: HashMap<EntityId, WeakShared<Task<Result<Entity<AgentPanel>, Arc<anyhow::Error>>>>>,
+}
+
+impl Global for AgentPanelLoadPool {}
 const TERMINAL_INIT_COMMAND_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const KNOWN_TERMINAL_AGENT_COMMANDS: &[&str] = &[
     "agent", // Unfortunately, both Cursor cli + grok
@@ -1279,8 +1291,25 @@ impl AgentPanel {
         workspace: WeakEntity<Workspace>,
         mut cx: AsyncWindowContext,
     ) -> Task<Result<Entity<Self>>> {
+        let workspace_entity_id = workspace.entity_id();
+        let pending_load = cx
+            .update(|_window, cx| {
+                cx.default_global::<AgentPanelLoadPool>()
+                    .pending
+                    .get(&workspace_entity_id)
+                    .and_then(WeakShared::upgrade)
+            })
+            .ok()
+            .flatten();
+        if let Some(pending_load) = pending_load {
+            return cx
+                .spawn(async move |_cx| pending_load.await.map_err(|error| anyhow!("{error:#}")));
+        }
+
         let kvp = cx.update(|_window, cx| KeyValueStore::global(cx)).ok();
-        cx.spawn(async move |cx| {
+        let load_task: SharedAgentPanelLoad = cx
+            .spawn(async move |cx| {
+                let result: Result<Entity<Self>> = async {
             let workspace_id = workspace
                 .read_with(cx, |workspace, _| workspace.database_id())
                 .ok()
@@ -1485,8 +1514,29 @@ impl AgentPanel {
                 panel
             })?;
 
-            Ok(panel)
+                    Ok(panel)
+                }
+                .await;
+                cx.update(|_window, cx| {
+                    cx.default_global::<AgentPanelLoadPool>()
+                        .pending
+                        .remove(&workspace_entity_id);
+                })
+                .ok();
+                result.map_err(Arc::new)
+            })
+            .shared();
+
+        cx.update(|_window, cx| {
+            if let Some(load_task) = load_task.downgrade() {
+                cx.default_global::<AgentPanelLoadPool>()
+                    .pending
+                    .insert(workspace_entity_id, load_task);
+            }
         })
+        .ok();
+
+        cx.spawn(async move |_cx| load_task.await.map_err(|error| anyhow!("{error:#}")))
     }
 
     pub(crate) fn new(workspace: &Workspace, _window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -7387,6 +7437,45 @@ mod tests {
                 "workspace B should have no active thread when it had no prior conversation"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_concurrent_panel_loads_share_one_panel(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            ThreadMetadataStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        workspace.update(cx, |workspace, _cx| {
+            workspace.set_random_database_id();
+        });
+
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        let async_cx = cx.update(|window, cx| window.to_async(cx));
+        let first_load = AgentPanel::load(workspace.downgrade(), async_cx.clone());
+        let second_load = AgentPanel::load(workspace.downgrade(), async_cx);
+        let (first_panel, second_panel) = futures::join!(first_load, second_load);
+
+        assert_eq!(
+            first_panel.expect("first panel load should succeed"),
+            second_panel.expect("second panel load should succeed"),
+            "concurrent loads for one workspace must reuse the same panel"
+        );
+        assert!(
+            cx.update(|_window, cx| cx.global::<AgentPanelLoadPool>().pending.is_empty()),
+            "the completed load should be removed from the single-flight pool"
+        );
     }
 
     #[gpui::test]
