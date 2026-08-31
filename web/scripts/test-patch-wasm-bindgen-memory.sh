@@ -6,17 +6,11 @@ fixture="$(mktemp)"
 trap 'rm -f "${fixture}"' EXIT
 
 cat > "${fixture}" <<'EOF'
-const oldBuffer = new ArrayBuffer(8);
-const newBuffer = new ArrayBuffer(16);
-let returnOldBuffer = true;
+const buffer = new SharedArrayBuffer(8, { maxByteLength: 16 });
 const wasm = {
     memory: {
         get buffer() {
-            if (returnOldBuffer) {
-                returnOldBuffer = false;
-                return oldBuffer;
-            }
-            return newBuffer;
+            return buffer;
         },
     },
 };
@@ -24,16 +18,17 @@ function memoryAccessor() {
     const ret = wasm.memory;
     return ret;
 }
-let cachedDataViewMemory0 = new DataView(oldBuffer);
+let cachedDataViewMemory0 = new DataView(buffer, 0, 8);
 function getDataViewMemory0() {
     if (cachedDataViewMemory0 === null || cachedDataViewMemory0.buffer !== wasm.memory.buffer) {
         cachedDataViewMemory0 = new DataView(wasm.memory.buffer);
     }
     return cachedDataViewMemory0;
 }
+buffer.grow(16);
 getDataViewMemory0().setInt32(8, 42, true);
-if (new DataView(newBuffer).getInt32(8, true) !== 42) {
-    throw new Error("DataView write was not retried after memory growth");
+if (new DataView(buffer).getInt32(8, true) !== 42) {
+    throw new Error("DataView write was not retried after in-place memory growth");
 }
 EOF
 
@@ -43,3 +38,4 @@ node "${fixture}"
 
 grep -Fq 'function accessDataViewMemory0(method, byteOffset, byteWidth, ...args) {' "${fixture}"
 [[ "$(grep -Fc 'function accessDataViewMemory0(method, byteOffset, byteWidth, ...args) {' "${fixture}")" == "1" ]]
+grep -Fq 'cachedDataViewMemory0.byteLength !== currentBuffer.byteLength' "${fixture}"

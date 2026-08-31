@@ -1352,6 +1352,14 @@ impl ThreadMetadataStore {
             archived,
         };
 
+        #[cfg(target_family = "wasm")]
+        if was_draft && !is_draft {
+            // A page reload or WASM panic can stop the asynchronous metadata
+            // queue before its first upsert reaches the server. Persist the
+            // draft promotion before returning so the new session remains in
+            // the project's recent-thread list after a reload.
+            self.db.save_immediately(&metadata).log_err();
+        }
         self.save(metadata, cx);
     }
 }
@@ -1468,6 +1476,23 @@ impl Domain for ThreadMetadataDb {
 db::static_connection!(ThreadMetadataDb, []);
 
 impl ThreadMetadataDb {
+    const UPSERT_QUERY: &str = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override) \
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+        ON CONFLICT(thread_id) DO UPDATE SET \
+            session_id = excluded.session_id, \
+            agent_id = excluded.agent_id, \
+            title = excluded.title, \
+            updated_at = excluded.updated_at, \
+            created_at = excluded.created_at, \
+            interacted_at = excluded.interacted_at, \
+            folder_paths = excluded.folder_paths, \
+            folder_paths_order = excluded.folder_paths_order, \
+            archived = excluded.archived, \
+            main_worktree_paths = excluded.main_worktree_paths, \
+            main_worktree_paths_order = excluded.main_worktree_paths_order, \
+            remote_connection = excluded.remote_connection, \
+            title_override = excluded.title_override";
+
     #[allow(dead_code)]
     pub fn list_ids(&self) -> anyhow::Result<Vec<ThreadId>> {
         self.select::<ThreadId>(
@@ -1533,23 +1558,7 @@ impl ThreadMetadataDb {
         let archived = row.archived;
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
-                       ON CONFLICT(thread_id) DO UPDATE SET \
-                           session_id = excluded.session_id, \
-                           agent_id = excluded.agent_id, \
-                           title = excluded.title, \
-                           updated_at = excluded.updated_at, \
-                           created_at = excluded.created_at, \
-                           interacted_at = excluded.interacted_at, \
-                           folder_paths = excluded.folder_paths, \
-                           folder_paths_order = excluded.folder_paths_order, \
-                           archived = excluded.archived, \
-                           main_worktree_paths = excluded.main_worktree_paths, \
-                           main_worktree_paths_order = excluded.main_worktree_paths_order, \
-                           remote_connection = excluded.remote_connection, \
-                           title_override = excluded.title_override";
-            let mut stmt = Statement::prepare(conn, sql)?;
+            let mut stmt = Statement::prepare(conn, Self::UPSERT_QUERY)?;
             let mut i = stmt.bind(&thread_id, 1)?;
             i = stmt.bind(&session_id, i)?;
             i = stmt.bind(&agent_id, i)?;
@@ -1567,6 +1576,63 @@ impl ThreadMetadataDb {
             stmt.exec()
         })
         .await
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn save_immediately(&self, row: &ThreadMetadata) -> anyhow::Result<()> {
+        use db::sqlez::remote_sql::{self, SqlParam};
+
+        let session_id = row
+            .session_id
+            .as_ref()
+            .map(|session_id| SqlParam::text(session_id.0.to_string()))
+            .unwrap_or(SqlParam::Null);
+        let agent_id = if row.agent_id.as_ref() == ZED_AGENT_ID.as_ref() {
+            SqlParam::Null
+        } else {
+            SqlParam::text(row.agent_id.to_string())
+        };
+        let title = SqlParam::text(
+            row.title
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+        );
+        let optional_text =
+            |value: Option<String>| value.map(SqlParam::text).unwrap_or(SqlParam::Null);
+        let serialized = row.folder_paths().serialize();
+        let main_serialized = row.main_worktree_paths().serialize();
+        let remote_connection = row
+            .remote_connection
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .context("serialize thread metadata remote connection")?;
+
+        remote_sql::query(
+            Self::UPSERT_QUERY,
+            &[
+                SqlParam::blob(row.thread_id.0.as_bytes()),
+                session_id,
+                agent_id,
+                title,
+                SqlParam::text(row.updated_at.to_rfc3339()),
+                optional_text(row.created_at.map(|date| date.to_rfc3339())),
+                optional_text(row.interacted_at.map(|date| date.to_rfc3339())),
+                optional_text((!row.folder_paths().is_empty()).then_some(serialized.paths)),
+                optional_text((!row.folder_paths().is_empty()).then_some(serialized.order)),
+                SqlParam::int(i64::from(row.archived)),
+                optional_text(
+                    (!row.main_worktree_paths().is_empty()).then_some(main_serialized.paths),
+                ),
+                optional_text(
+                    (!row.main_worktree_paths().is_empty()).then_some(main_serialized.order),
+                ),
+                optional_text(remote_connection),
+                optional_text(row.title_override.as_ref().map(ToString::to_string)),
+            ],
+        )?;
+        Ok(())
     }
 
     /// Delete metadata for a single thread.
