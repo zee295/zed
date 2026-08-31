@@ -5,11 +5,10 @@ use agent_settings::AgentProfileId;
 use anyhow::{Context as _, Result};
 use chrono::{DateTime, Utc};
 use collections::{HashMap, IndexMap};
-use futures::{FutureExt, future::Shared};
+use futures::{FutureExt, future::Shared, lock::Mutex};
 use gpui::{BackgroundExecutor, Global, Task};
 use indoc::indoc;
 use language_model::Speed;
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sqlez::{
     bindable::{Bind, Column},
@@ -511,7 +510,7 @@ impl ThreadsDatabase {
     }
 
     fn save_thread_sync(
-        connection: &Arc<Mutex<Connection>>,
+        connection: &Connection,
         id: acp::SessionId,
         thread: DbThread,
         folder_paths: &PathList,
@@ -545,8 +544,6 @@ impl ThreadsDatabase {
             thread,
             version: DbThread::VERSION,
         })?;
-
-        let connection = connection.lock();
 
         #[cfg(not(target_family = "wasm"))]
         let (data_type, data) = {
@@ -593,7 +590,7 @@ impl ThreadsDatabase {
         let connection = self.connection.clone();
 
         self.executor.spawn(async move {
-            let connection = connection.lock();
+            let connection = connection.lock().await;
 
             let mut select = connection
                 .select_bound::<(), (Arc<str>, Option<Arc<str>>, Option<String>, Option<String>, String, String, Option<String>)>(indoc! {"
@@ -636,7 +633,7 @@ impl ThreadsDatabase {
         let connection = self.connection.clone();
 
         self.executor.spawn(async move {
-            let connection = connection.lock();
+            let connection = connection.lock().await;
             let mut select = connection.select_bound::<Arc<str>, (DataType, Vec<u8>)>(indoc! {"
                 SELECT data_type, data FROM threads WHERE id = ? LIMIT 1
             "})?;
@@ -659,7 +656,10 @@ impl ThreadsDatabase {
         let connection = self.connection.clone();
 
         self.executor
-            .spawn(async move { Self::save_thread_sync(&connection, id, thread, &folder_paths) })
+            .spawn(async move {
+                let connection = connection.lock().await;
+                Self::save_thread_sync(&connection, id, thread, &folder_paths)
+            })
     }
 
     fn deserialize_thread(data_type: DataType, data: Vec<u8>) -> Result<DbThread> {
@@ -709,7 +709,7 @@ impl ThreadsDatabase {
 
         self.executor.spawn(async move {
             let sandboxed_terminal_temp_dirs = {
-                let connection = connection.lock();
+                let connection = connection.lock().await;
 
                 let mut select_children =
                     connection.select_bound::<Arc<str>, Arc<str>>(indoc! {"
@@ -762,7 +762,7 @@ impl ThreadsDatabase {
 
         self.executor.spawn(async move {
             let sandboxed_terminal_temp_dirs = {
-                let connection = connection.lock();
+                let connection = connection.lock().await;
 
                 let mut select = connection.select_bound::<(), (DataType, Vec<u8>)>(indoc! {"
                     SELECT data_type, data FROM threads
