@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use gpui::{App, AppContext as _, Context, Entity, Task};
@@ -109,7 +110,7 @@ impl Project {
                         settings.alternate_scroll,
                         settings.max_scroll_history_lines,
                         settings.path_hyperlink_regexes.clone(),
-                        settings.path_hyperlink_timeout_ms,
+                        Duration::from_millis(settings.path_hyperlink_timeout_ms),
                         true,
                         window_id,
                         Some(completion_tx),
@@ -200,7 +201,7 @@ impl Project {
                         settings.alternate_scroll,
                         settings.max_scroll_history_lines,
                         settings.path_hyperlink_regexes.clone(),
-                        settings.path_hyperlink_timeout_ms,
+                        Duration::from_millis(settings.path_hyperlink_timeout_ms),
                         true,
                         window_id,
                         None,

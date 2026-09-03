@@ -3,6 +3,7 @@ use crate::events::{
     ClickState, EventListenerHandle, TouchMomentumState, TouchPointerState, WebEventListeners,
     is_mac_platform,
 };
+use crate::ime_mirror::ImeMirror;
 use crate::platform::WebWindowLifecycle;
 use std::sync::Arc;
 use std::{cell::Cell, cell::RefCell, rc::Rc};
@@ -49,7 +50,7 @@ pub(crate) struct WebWindowMutableState {
 pub(crate) struct WebWindowInner {
     pub(crate) browser_window: web_sys::Window,
     pub(crate) canvas: web_sys::HtmlCanvasElement,
-    pub(crate) input_element: web_sys::HtmlTextAreaElement,
+    pub(crate) ime_mirror: ImeMirror,
     pub(crate) has_device_pixel_support: bool,
     pub(crate) is_mac: bool,
     pub(crate) state: RefCell<WebWindowMutableState>,
@@ -62,33 +63,22 @@ pub(crate) struct WebWindowInner {
     pub(crate) last_physical_size: Cell<(u32, u32)>,
     pub(crate) notify_scale: Cell<bool>,
     pub(crate) is_composing: Cell<bool>,
-    pub(crate) native_text_input: RefCell<NativeTextInputState>,
-    pub(crate) uses_native_text_input: bool,
     pub(crate) last_cursor_css: Rc<Cell<&'static str>>,
     pub(crate) pending_clipboard: Rc<RefCell<Option<ClipboardItem>>>,
     pub(crate) owned_clipboard: Rc<RefCell<Option<ClipboardItem>>>,
     keyboard_accessory: Option<KeyboardAccessory>,
     keyboard_accessory_expanded: Cell<bool>,
     keyboard_accessory_modifiers: Cell<Modifiers>,
+    /// Set while `sync_virtual_keyboard` blur/focus-cycles the hidden input.
+    /// The cycle is a keyboard-visibility hint, not a real activity change;
+    /// letting the focus/blur listeners report it would re-enter GPUI
+    /// synchronously from inside an input dispatch, and a `RefCell`
+    /// double-borrow panic on wasm never unwinds, wedging the app.
+    pub(crate) suppress_focus_status_events: Cell<bool>,
     mql_handle: RefCell<Option<MqlHandle>>,
     pending_physical_size: Cell<Option<(u32, u32)>>,
     raf_id: Cell<Option<i32>>,
     raf_function: RefCell<Option<js_sys::Function>>,
-}
-
-#[derive(Default)]
-pub(crate) struct NativeTextInputState {
-    pub(crate) value: String,
-    pub(crate) document_start_utf16: Option<usize>,
-    pub(crate) mode: NativeTextInputMode,
-}
-
-#[derive(Clone, Copy, Default, Eq, PartialEq)]
-pub(crate) enum NativeTextInputMode {
-    #[default]
-    Inactive,
-    Document,
-    Terminal,
 }
 
 struct KeyboardAccessory {
@@ -182,30 +172,7 @@ impl WebWindow {
         };
         let renderer = WgpuRenderer::new_from_surface(context, surface, renderer_config)?;
 
-        let input_element: web_sys::HtmlTextAreaElement = document
-            .create_element("textarea")
-            .map_err(|e| anyhow::anyhow!("Failed to create textarea element: {e:?}"))?
-            .dyn_into()
-            .map_err(|e| anyhow::anyhow!("Created element is not a textarea: {e:?}"))?;
-        let input_style = input_element.style();
-        input_style.set_property("position", "fixed").ok();
-        input_style.set_property("top", "0").ok();
-        input_style.set_property("left", "0").ok();
-        input_style.set_property("width", "1px").ok();
-        input_style.set_property("height", "1px").ok();
-        input_style.set_property("opacity", "0").ok();
-        input_style.set_property("font-size", "16px").ok();
-        input_style.set_property("resize", "none").ok();
-        input_element.set_wrap("off");
-        body.append_child(&input_element)
-            .map_err(|e| anyhow::anyhow!("Failed to append input to body: {e:?}"))?;
-        input_element.focus().ok();
-
-        let uses_native_text_input = browser_window
-            .match_media("(any-pointer: coarse)")
-            .ok()
-            .flatten()
-            .is_some_and(|query| query.matches());
+        let ime_mirror = ImeMirror::new(&document, &body)?;
         let keyboard_accessory =
             create_mobile_keyboard_accessory(&document, &browser_window, &body)?;
         let display: Rc<dyn PlatformDisplay> = Rc::new(WebDisplay::new(browser_window.clone()));
@@ -235,7 +202,7 @@ impl WebWindow {
         let inner = Rc::new(WebWindowInner {
             browser_window,
             canvas,
-            input_element,
+            ime_mirror,
             has_device_pixel_support,
             is_mac,
             state: RefCell::new(mutable_state),
@@ -248,14 +215,13 @@ impl WebWindow {
             last_physical_size: Cell::new((0, 0)),
             notify_scale: Cell::new(false),
             is_composing: Cell::new(false),
-            native_text_input: RefCell::new(NativeTextInputState::default()),
-            uses_native_text_input,
             last_cursor_css,
             pending_clipboard,
             owned_clipboard,
             keyboard_accessory,
             keyboard_accessory_expanded: Cell::new(false),
             keyboard_accessory_modifiers: Cell::new(Modifiers::default()),
+            suppress_focus_status_events: Cell::new(false),
             mql_handle: RefCell::new(None),
             pending_physical_size: Cell::new(None),
             raf_id: Cell::new(None),
@@ -556,130 +522,6 @@ impl WebWindowInner {
         Some(result)
     }
 
-    pub(crate) fn reset_native_text_input(&self) {
-        if !self.uses_native_text_input {
-            return;
-        }
-
-        self.input_element.set_value("");
-        self.input_element.set_selection_range(0, 0).ok();
-        *self.native_text_input.borrow_mut() = NativeTextInputState::default();
-    }
-
-    fn configure_native_text_input(&self, mode: NativeTextInputMode) {
-        let terminal = mode == NativeTextInputMode::Terminal;
-        for (attribute, value) in [
-            ("autocomplete", "off"),
-            ("autocapitalize", "none"),
-            ("autocorrect", "off"),
-            ("spellcheck", "false"),
-        ] {
-            if terminal {
-                self.input_element.set_attribute(attribute, value).ok();
-            } else {
-                self.input_element.remove_attribute(attribute).ok();
-            }
-        }
-    }
-
-    pub(crate) fn sync_native_text_input_context(&self) {
-        const CONTEXT_UTF16: usize = 1024;
-
-        if !self.uses_native_text_input || self.is_composing.get() {
-            return;
-        }
-
-        enum InputContext {
-            Document {
-                value: String,
-                document_start_utf16: usize,
-                selection_start: usize,
-                selection_end: usize,
-                reversed: bool,
-            },
-            Terminal,
-        }
-
-        let context = self
-            .with_input_handler(|handler| {
-                let selection = handler.selected_text_range(true)?;
-                let proposed_range = selection.range.start.saturating_sub(CONTEXT_UTF16)
-                    ..selection.range.end.saturating_add(CONTEXT_UTF16);
-                let mut adjusted_range = None;
-                let Some(value) =
-                    handler.text_for_range(proposed_range.clone(), &mut adjusted_range)
-                else {
-                    return Some(InputContext::Terminal);
-                };
-                let document_range = adjusted_range.unwrap_or(proposed_range);
-                if selection.range.start < document_range.start
-                    || selection.range.end > document_range.end
-                {
-                    return None;
-                }
-
-                Some(InputContext::Document {
-                    value,
-                    document_start_utf16: document_range.start,
-                    selection_start: selection.range.start - document_range.start,
-                    selection_end: selection.range.end - document_range.start,
-                    reversed: selection.reversed,
-                })
-            })
-            .flatten();
-
-        let Some(context) = context else {
-            self.configure_native_text_input(NativeTextInputMode::Inactive);
-            return self.reset_native_text_input();
-        };
-
-        if matches!(context, InputContext::Terminal) {
-            self.configure_native_text_input(NativeTextInputMode::Terminal);
-            self.input_element.set_value("");
-            self.input_element.set_selection_range(0, 0).ok();
-            *self.native_text_input.borrow_mut() = NativeTextInputState {
-                value: String::new(),
-                document_start_utf16: None,
-                mode: NativeTextInputMode::Terminal,
-            };
-            return;
-        }
-
-        let InputContext::Document {
-            value,
-            document_start_utf16,
-            selection_start,
-            selection_end,
-            reversed,
-        } = context
-        else {
-            unreachable!()
-        };
-
-        let (Ok(selection_start), Ok(selection_end)) =
-            (u32::try_from(selection_start), u32::try_from(selection_end))
-        else {
-            self.configure_native_text_input(NativeTextInputMode::Inactive);
-            self.reset_native_text_input();
-            return;
-        };
-
-        self.configure_native_text_input(NativeTextInputMode::Document);
-        self.input_element.set_value(&value);
-        self.input_element
-            .set_selection_range_with_direction(
-                selection_start,
-                selection_end,
-                if reversed { "backward" } else { "forward" },
-            )
-            .ok();
-        *self.native_text_input.borrow_mut() = NativeTextInputState {
-            value,
-            document_start_utf16: Some(document_start_utf16),
-            mode: NativeTextInputMode::Document,
-        };
-    }
-
     pub(crate) fn keyboard_accessory_root(&self) -> Option<web_sys::HtmlElement> {
         self.keyboard_accessory
             .as_ref()
@@ -755,7 +597,7 @@ impl WebWindowInner {
         modifiers
     }
 
-    pub(crate) fn update_touch_input_focus(&self, position: Point<Pixels>) {
+    pub(crate) fn update_touch_input_focus(self: &Rc<Self>, position: Point<Pixels>) {
         // A tap can synchronously move GPUI focus. Draw the invalidated frame now so
         // the platform input handler below represents the control that was tapped.
         self.with_callback(
@@ -771,22 +613,15 @@ impl WebWindowInner {
         let accepts_touch_input = self.soft_keyboard_requested.replace(false)
             || self
                 .with_input_handler(|handler| {
-                    handler
-                        .element_bounds()
-                        .is_some_and(|bounds| bounds.contains(&position))
+                    handler.query_accepts_text_input()
+                        && handler
+                            .element_bounds()
+                            .is_some_and(|bounds| bounds.contains(&position))
                 })
                 .unwrap_or(false);
 
-        if accepts_touch_input {
-            self.sync_native_text_input_context();
-            self.input_element.focus().ok();
-            self.show_keyboard_accessory();
-        } else {
-            self.reset_native_text_input();
-            self.input_element.blur().ok();
-            self.hide_keyboard_accessory();
-            self.update_active_status(true);
-        }
+        self.sync_virtual_keyboard(accepts_touch_input);
+        ImeMirror::schedule_sync(self);
     }
 
     pub(crate) fn register_appearance_change(self: &Rc<Self>) -> Option<EventListenerHandle> {
@@ -835,12 +670,11 @@ impl Drop for WebWindow {
 
         let canvas: &web_sys::Element = self.inner.canvas.as_ref();
         canvas.remove();
-        let input_element: &web_sys::Element = self.inner.input_element.as_ref();
-        input_element.remove();
         if let Some(accessory) = &self.inner.keyboard_accessory {
             let root: &web_sys::Element = accessory.root.as_ref();
             root.remove();
         }
+        self.inner.ime_mirror.remove();
         self.active_window.borrow_mut().take();
         self.lifecycle.set(WebWindowLifecycle::Closed);
     }
@@ -1229,14 +1063,12 @@ impl PlatformWindow for WebWindow {
 
     fn show_soft_keyboard(&self) {
         self.inner.soft_keyboard_requested.set(true);
-        self.inner.sync_native_text_input_context();
-        self.inner.input_element.focus().ok();
-        self.inner.show_keyboard_accessory();
+        self.inner.sync_virtual_keyboard(true);
+        ImeMirror::schedule_sync(&self.inner);
     }
 
     fn hide_soft_keyboard(&self) {
-        self.inner.input_element.blur().ok();
-        self.inner.hide_keyboard_accessory();
+        self.inner.sync_virtual_keyboard(false);
     }
 
     fn prompt(
@@ -1370,10 +1202,6 @@ impl PlatformWindow for WebWindow {
         }
 
         self.inner.state.borrow_mut().renderer.draw(scene);
-    }
-
-    fn completed_frame(&self) {
-        // On web, presentation happens automatically via wgpu surface present
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

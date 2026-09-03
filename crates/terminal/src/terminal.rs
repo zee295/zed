@@ -1034,7 +1034,7 @@ impl TerminalBuilder {
                 alternate_scroll,
                 max_scroll_history_lines,
                 path_hyperlink_regexes: Vec::default(),
-                path_hyperlink_timeout_ms: 0,
+                path_hyperlink_timeout: Duration::ZERO,
                 window_id,
             },
             child_exited: None,
@@ -1070,7 +1070,7 @@ impl TerminalBuilder {
         alternate_scroll: AlternateScroll,
         max_scroll_history_lines: Option<usize>,
         path_hyperlink_regexes: Vec<String>,
-        path_hyperlink_timeout_ms: u64,
+        path_hyperlink_timeout: Duration,
         is_remote_terminal: bool,
         window_id: u64,
         completion_tx: Option<Sender<Option<ExitStatus>>>,
@@ -1295,7 +1295,7 @@ impl TerminalBuilder {
                 selection_phase: SelectionPhase::Ended,
                 hyperlink_regex_searches: RegexSearches::new(
                     &path_hyperlink_regexes,
-                    path_hyperlink_timeout_ms,
+                    path_hyperlink_timeout,
                 ),
                 vi_mode_enabled: false,
                 is_remote_terminal,
@@ -1312,7 +1312,7 @@ impl TerminalBuilder {
                     alternate_scroll,
                     max_scroll_history_lines,
                     path_hyperlink_regexes,
-                    path_hyperlink_timeout_ms,
+                    path_hyperlink_timeout,
                     window_id,
                 },
                 child_exited: None,
@@ -1385,7 +1385,7 @@ impl TerminalBuilder {
         alternate_scroll: AlternateScroll,
         max_scroll_history_lines: Option<usize>,
         path_hyperlink_regexes: Vec<String>,
-        path_hyperlink_timeout_ms: u64,
+        path_hyperlink_timeout: Duration,
         _is_remote_terminal: bool,
         window_id: u64,
         completion_tx: Option<Sender<Option<ExitStatus>>>,
@@ -1459,7 +1459,7 @@ impl TerminalBuilder {
                 selection_phase: SelectionPhase::Ended,
                 hyperlink_regex_searches: RegexSearches::new(
                     &path_hyperlink_regexes,
-                    path_hyperlink_timeout_ms,
+                    path_hyperlink_timeout,
                 ),
                 vi_mode_enabled: false,
                 is_remote_terminal: true,
@@ -1474,7 +1474,7 @@ impl TerminalBuilder {
                     alternate_scroll,
                     max_scroll_history_lines,
                     path_hyperlink_regexes,
-                    path_hyperlink_timeout_ms,
+                    path_hyperlink_timeout,
                     window_id,
                 },
                 child_exited: None,
@@ -1671,7 +1671,7 @@ struct CopyTemplate {
     alternate_scroll: AlternateScroll,
     max_scroll_history_lines: Option<usize>,
     path_hyperlink_regexes: Vec<String>,
-    path_hyperlink_timeout_ms: u64,
+    path_hyperlink_timeout: Duration,
     window_id: u64,
 }
 
@@ -1709,7 +1709,7 @@ impl TaskStatus {
 }
 
 const FIND_HYPERLINK_THROTTLE_PX: Pixels = px(5.0);
-const FIND_HYPERLINK_THROTTLE_MS: Duration = Duration::from_millis(100);
+const FIND_HYPERLINK_THROTTLE: Duration = Duration::from_millis(100);
 
 /// Minimum pointer movement before a left click begins a selection. This keeps
 /// a click that jitters by a pixel or two (such as the window-focusing click)
@@ -2636,7 +2636,7 @@ impl Terminal {
                     + (position.y - last_pos.y).abs())
                     > FIND_HYPERLINK_THROTTLE_PX;
                 let time_elapsed =
-                    now.duration_since(self.last_mouse_move_time) > FIND_HYPERLINK_THROTTLE_MS;
+                    now.duration_since(self.last_mouse_move_time) > FIND_HYPERLINK_THROTTLE;
                 distance_moved || time_elapsed
             });
 
@@ -3254,7 +3254,7 @@ impl Terminal {
             self.template.alternate_scroll,
             self.template.max_scroll_history_lines,
             self.template.path_hyperlink_regexes.clone(),
-            self.template.path_hyperlink_timeout_ms,
+            self.template.path_hyperlink_timeout,
             self.is_remote_terminal,
             self.template.window_id,
             None,
@@ -3804,7 +3804,7 @@ mod tests {
                     AlternateScroll::On,
                     None,
                     vec![],
-                    0,
+                    Duration::ZERO,
                     false,
                     0,
                     Some(completion_tx),
@@ -3855,7 +3855,7 @@ mod tests {
                     AlternateScroll::On,
                     None,
                     vec![],
-                    0,
+                    Duration::ZERO,
                     false,
                     0,
                     Some(completion_tx),
@@ -4248,7 +4248,7 @@ mod tests {
                     AlternateScroll::On,
                     None,
                     vec![],
-                    0,
+                    Duration::ZERO,
                     false,
                     0,
                     Some(completion_tx),
@@ -4316,7 +4316,7 @@ mod tests {
                     AlternateScroll::On,
                     None,
                     vec![],
-                    0,
+                    Duration::ZERO,
                     false,
                     0,
                     None,
@@ -4382,7 +4382,7 @@ mod tests {
                     AlternateScroll::On,
                     None,
                     Vec::new(),
-                    0,
+                    Duration::ZERO,
                     false,
                     0,
                     Some(completion_tx),

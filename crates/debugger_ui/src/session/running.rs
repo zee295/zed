@@ -1752,6 +1752,16 @@ impl RunningState {
             .update(cx, |list, cx| list.schedule_refresh(true, window, cx));
     }
 
+    pub fn continue_program(&mut self, cx: &mut Context<Self>) {
+        let Some(thread_id) = self.thread_id else {
+            return;
+        };
+
+        self.session().update(cx, |state, cx| {
+            state.continue_program(thread_id, cx);
+        });
+    }
+
     pub fn continue_thread(&mut self, cx: &mut Context<Self>) {
         let Some(thread_id) = self.thread_id else {
             return;

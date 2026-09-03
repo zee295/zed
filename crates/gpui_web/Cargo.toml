@@ -56,9 +56,9 @@ web-sys = { version = "0.3", features = [
     "HtmlCanvasElement",
     "HtmlElement",
     "HtmlTextAreaElement",
-    "InputEvent",
     "IdleDeadline",
     "IdleRequestOptions",
+    "InputEvent",
     "KeyboardEvent",
     "Location",
     "MediaQueryList",
@@ -87,4 +87,6 @@ web-sys = { version = "0.3", features = [
     "WheelEvent",
     "Window",
 ] }
-unicode-segmentation.workspace = true
+
+[package.metadata.cargo-shear]
+ignored = ["scheduler"]

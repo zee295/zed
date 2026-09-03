@@ -35,7 +35,7 @@ mod remote {
     use language::{
         CodeLabel, DynLspInstaller, HighlightId, Language, LanguageConfig, LanguageName,
         LanguageQueries, LanguageRegistry, LanguageServerBinaryLocations, LoadedLanguage,
-        LspAdapter, LspAdapterDelegate, QUERY_FILENAME_PREFIXES, Toolchain,
+        LspAdapter, LspAdapterDelegate, QueryFile, QueryFileContents, Toolchain,
     };
     use language_model::LanguageModelRegistry;
     use lsp::{
@@ -232,19 +232,12 @@ mod remote {
     }
 
     fn language_queries_from_response(query_files: &HashMap<String, String>) -> LanguageQueries {
-        let mut queries = LanguageQueries::default();
-        for (file_name, content) in query_files {
-            for (prefix, accessor) in QUERY_FILENAME_PREFIXES {
-                if file_name.starts_with(prefix) && file_name.ends_with(".scm") {
-                    match accessor(&mut queries) {
-                        Some(existing) => existing.to_mut().push_str(content),
-                        slot @ None => *slot = Some(Cow::Owned(content.clone())),
-                    }
-                    break;
-                }
-            }
-        }
-        queries
+        LanguageQueries::from_files(query_files.iter().filter_map(|(file_name, content)| {
+            file_name
+                .parse::<QueryFile>()
+                .ok()
+                .map(|query_file| QueryFileContents::new(query_file, Cow::Owned(content.clone())))
+        }))
     }
 
     #[derive(Deserialize)]
@@ -1343,13 +1336,19 @@ mod remote {
                         hidden,
                         None,
                         Arc::new(move || {
-                            Ok(LoadedLanguage {
-                                config: loaded_config.clone(),
-                                queries: language_queries_from_response(&query_files),
-                                context_provider: context_provider.clone(),
-                                toolchain_provider: None,
-                                manifest_name: None,
-                            })
+                            let loaded_config = loaded_config.clone();
+                            let queries = language_queries_from_response(&query_files);
+                            let context_provider = context_provider.clone();
+                            async move {
+                                Ok(LoadedLanguage {
+                                    config: loaded_config,
+                                    queries,
+                                    context_provider,
+                                    toolchain_provider: None,
+                                    manifest_name: None,
+                                })
+                            }
+                            .boxed()
                         }),
                     );
                     language_names.push(name);

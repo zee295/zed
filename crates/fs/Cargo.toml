@@ -37,7 +37,6 @@ serde_json.workspace = true
 slotmap.workspace = true
 telemetry.workspace = true
 text.workspace = true
-time.workspace = true
 util.workspace = true
 path.workspace = true
 git.workspace = true
@@ -61,11 +60,11 @@ windows.workspace = true
 dunce.workspace = true
 async-std.workspace = true
 
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
-ashpd.workspace = true
-
 [target.'cfg(target_os = "macos")'.dependencies]
 unicode-normalization = "0.1"
+
+[package.metadata.cargo-shear]
+ignored = ["async-std"]
 
 [dev-dependencies]
 fs = { workspace = true, features = ["test-support"] }

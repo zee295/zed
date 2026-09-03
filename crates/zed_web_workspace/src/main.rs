@@ -416,12 +416,15 @@ fn register_plain_languages(languages: &language::LanguageRegistry, node_runtime
             false,
             None,
             Arc::new(move || {
-                Ok(LoadedLanguage {
-                    config: config.clone(),
-                    queries: Default::default(),
-                    context_provider: None,
-                    toolchain_provider: None,
-                    manifest_name: None,
+                let config = config.clone();
+                Box::pin(async move {
+                    Ok(LoadedLanguage {
+                        config,
+                        queries: Default::default(),
+                        context_provider: None,
+                        toolchain_provider: None,
+                        manifest_name: None,
+                    })
                 })
             }),
         );
@@ -967,8 +970,8 @@ fn install_menus(cx: &mut App) {
                 MenuItem::action("Go to Line/Column…", ToggleGoToLine),
                 MenuItem::separator(),
                 MenuItem::action("Go to Definition", GoToDefinition::default()),
-                MenuItem::action("Go to Declaration", GoToDeclaration),
-                MenuItem::action("Go to Type Definition", GoToTypeDefinition),
+                MenuItem::action("Go to Declaration", GoToDeclaration::default()),
+                MenuItem::action("Go to Type Definition", GoToTypeDefinition::default()),
                 MenuItem::action("Find All References", FindAllReferences::default()),
                 MenuItem::separator(),
                 MenuItem::action("Next Problem", GoToDiagnostic::default()),

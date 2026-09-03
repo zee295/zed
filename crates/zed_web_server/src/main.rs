@@ -491,6 +491,11 @@ async fn proxy_http(
     let upstream = match request.body(body).send().await {
         Ok(response) => response,
         Err(error) => {
+            if let Some(response) = empty_local_model_discovery_response(&provider, &rest, &method)
+            {
+                tracing::debug!(?error, %provider, "local model provider is unavailable");
+                return security_headers(response);
+            }
             tracing::error!(?error, %provider, "proxy request failed");
             return (StatusCode::BAD_GATEWAY, error.to_string()).into_response();
         }
@@ -528,6 +533,26 @@ async fn proxy_http(
         HeaderValue::from_static("*"),
     );
     security_headers(response)
+}
+
+fn empty_local_model_discovery_response(
+    provider: &str,
+    rest: &str,
+    method: &axum::http::Method,
+) -> Option<Response> {
+    if method != axum::http::Method::GET {
+        return None;
+    }
+
+    let payload = match (provider, rest.trim_start_matches('/')) {
+        ("ollama", "api/tags") => serde_json::json!({ "models": [] }),
+        ("llama-cpp", "v1/models") | ("lm-studio", "api/v0/models") => {
+            serde_json::json!({ "data": [] })
+        }
+        ("llama-cpp", "props") => serde_json::json!({}),
+        _ => return None,
+    };
+    Some(axum::Json(payload).into_response())
 }
 
 fn proxy_upstream(variable: &str, default: &str) -> String {
@@ -802,6 +827,39 @@ mod tests {
         assert!(should_skip_proxy_request_header("cookie", false));
         assert!(!should_skip_proxy_request_header("x-api-key", true));
         assert!(should_skip_proxy_request_header("x-api-key", false));
+    }
+
+    #[test]
+    fn treats_unavailable_local_model_discovery_as_an_empty_list() {
+        for (provider, path) in [
+            ("ollama", "/api/tags"),
+            ("llama-cpp", "/v1/models"),
+            ("llama-cpp", "/props"),
+            ("lm-studio", "/api/v0/models"),
+        ] {
+            let response =
+                empty_local_model_discovery_response(provider, path, &axum::http::Method::GET)
+                    .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "application/json"
+            );
+        }
+
+        assert!(
+            empty_local_model_discovery_response("ollama", "/api/chat", &axum::http::Method::GET,)
+                .is_none()
+        );
+        assert!(
+            empty_local_model_discovery_response("ollama", "/api/tags", &axum::http::Method::POST,)
+                .is_none()
+        );
     }
 
     #[test]

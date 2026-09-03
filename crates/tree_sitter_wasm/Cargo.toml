@@ -94,7 +94,7 @@ version = "0.1.9"
 version = "0.1"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-wasmtime-c-api = { package = "wasmtime-c-api-impl", version = "36.0.9", default-features = false, features = ["cranelift", "gc-drc"] }
+wasmtime-c-api = { package = "wasmtime-c-api-impl", version = "48.0.0", default-features = false, features = ["cranelift", "gc", "gc-null"] }
 
 [build-dependencies]
 cc = "1.2"
