@@ -242,11 +242,23 @@ impl std::ops::Deref for GlobalKeyValueStore {
 
 static GLOBAL_KEY_VALUE_STORE: std::sync::LazyLock<GlobalKeyValueStore> =
     std::sync::LazyLock::new(|| {
-        let db_dir = crate::database_dir();
-        GlobalKeyValueStore(gpui::block_on(crate::open_db::<GlobalKeyValueStore>(
-            db_dir,
-            crate::GlobalDbScope,
-        )))
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let db_dir = crate::database_dir();
+            GlobalKeyValueStore(gpui::block_on(crate::open_db::<GlobalKeyValueStore>(
+                db_dir,
+                crate::GlobalDbScope,
+            )))
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            GlobalKeyValueStore(
+                futures::FutureExt::now_or_never(crate::open_in_memory_db::<GlobalKeyValueStore>(
+                    "zed-web-global-kvp",
+                ))
+                .expect("in-memory global KVP should initialize synchronously on wasm"),
+            )
+        }
     });
 
 impl GlobalKeyValueStore {

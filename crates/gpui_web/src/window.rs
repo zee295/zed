@@ -1,6 +1,6 @@
 use crate::display::WebDisplay;
 use crate::events::{
-    ClickState, EventListenerHandle, TouchMomentumState, TouchPointerState, WebEventListeners,
+    ClickState, EventListenerHandle, TouchIds, TouchPointerState, WebEventListeners,
     is_mac_platform,
 };
 use crate::ime_mirror::ImeMirror;
@@ -12,8 +12,9 @@ use gpui::{
     AnyWindowHandle, Bounds, Capslock, ClipboardItem, Decorations, DevicePixels,
     DispatchEventResult, GpuSpecs, Modifiers, MouseButton, Pixels, PlatformAtlas, PlatformDisplay,
     PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
-    RequestFrameOptions, ResizeEdge, Scene, Size, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControlArea, WindowControls, WindowDecorations, WindowParams, px,
+    RequestFrameOptions, ResizeEdge, Scene, Size, TextInputConfiguration, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
+    WindowParams, px,
 };
 use gpui_wgpu::{WgpuContext, WgpuRenderer, WgpuSurfaceConfig, wgpu};
 use wasm_bindgen::prelude::*;
@@ -56,9 +57,9 @@ pub(crate) struct WebWindowInner {
     pub(crate) state: RefCell<WebWindowMutableState>,
     pub(crate) callbacks: RefCell<WebWindowCallbacks>,
     pub(crate) click_state: RefCell<ClickState>,
+    pub(crate) touch_ids: RefCell<TouchIds>,
     pub(crate) pressed_button: Cell<Option<MouseButton>>,
     pub(crate) active_touch: RefCell<Option<TouchPointerState>>,
-    pub(crate) touch_momentum: Cell<Option<TouchMomentumState>>,
     pub(crate) soft_keyboard_requested: Cell<bool>,
     pub(crate) last_physical_size: Cell<(u32, u32)>,
     pub(crate) notify_scale: Cell<bool>,
@@ -75,6 +76,22 @@ pub(crate) struct WebWindowInner {
     /// synchronously from inside an input dispatch, and a `RefCell`
     /// double-borrow panic on wasm never unwinds, wedging the app.
     pub(crate) suppress_focus_status_events: Cell<bool>,
+    /// The visual viewport's width and greatest height seen at that width,
+    /// in layout pixels. The keyboard-visibility probe compares the current
+    /// height against this maximum; the width detects rotation, which must
+    /// restart the calibration.
+    pub(crate) visual_viewport_probe: Cell<(f64, f64)>,
+    /// The visual viewport height when the current pointer gesture began.
+    /// A mid-gesture change means the software keyboard opened or closed and
+    /// reflowed the layout, so the release position no longer refers to what
+    /// the user aimed at.
+    pub(crate) gesture_start_visual_viewport_height: Cell<f64>,
+    /// A touch that may still resolve into a tap: its pointer id and starting
+    /// position, cleared once it travels beyond touch slop. Virtual keyboard
+    /// and IME focus may only change when a touch release completes a tap;
+    /// pans must leave them untouched, or scrolling over editable content
+    /// flickers the keyboard and drags the caret around.
+    pub(crate) touch_tap_candidate: Cell<Option<(i32, Point<Pixels>)>>,
     mql_handle: RefCell<Option<MqlHandle>>,
     pending_physical_size: Cell<Option<(u32, u32)>>,
     raf_id: Cell<Option<i32>>,
@@ -94,7 +111,7 @@ pub struct WebWindow {
     display: Rc<dyn PlatformDisplay>,
     lifecycle: Rc<Cell<WebWindowLifecycle>>,
     active_window: Rc<RefCell<Option<AnyWindowHandle>>>,
-    _raf_closure: Closure<dyn FnMut(f64)>,
+    _raf_closure: Closure<dyn FnMut()>,
     _resize_observer: Option<web_sys::ResizeObserver>,
     _resize_observer_closure: Closure<dyn FnMut(js_sys::Array)>,
     _event_listeners: WebEventListeners,
@@ -208,9 +225,9 @@ impl WebWindow {
             state: RefCell::new(mutable_state),
             callbacks: RefCell::new(WebWindowCallbacks::default()),
             click_state: RefCell::new(ClickState::default()),
+            touch_ids: RefCell::new(TouchIds::default()),
             pressed_button: Cell::new(None),
             active_touch: RefCell::new(None),
-            touch_momentum: Cell::new(None),
             soft_keyboard_requested: Cell::new(false),
             last_physical_size: Cell::new((0, 0)),
             notify_scale: Cell::new(false),
@@ -222,6 +239,9 @@ impl WebWindow {
             keyboard_accessory_expanded: Cell::new(false),
             keyboard_accessory_modifiers: Cell::new(Modifiers::default()),
             suppress_focus_status_events: Cell::new(false),
+            visual_viewport_probe: Cell::new((0.0, 0.0)),
+            gesture_start_visual_viewport_height: Cell::new(0.0),
+            touch_tap_candidate: Cell::new(None),
             mql_handle: RefCell::new(None),
             pending_physical_size: Cell::new(None),
             raf_id: Cell::new(None),
@@ -353,6 +373,20 @@ impl WebWindow {
                 |callbacks| &mut callbacks.resize,
                 |callback| callback(new_size, dpr_f32),
             );
+
+            // ResizeObserver runs after layout but before the browser paints.
+            // Render synchronously here so the newly resized CSS canvas is
+            // never presented with its previous backing image stretched into
+            // the new viewport dimensions.
+            inner.with_callback(
+                |callbacks| &mut callbacks.request_frame,
+                |callback| {
+                    callback(RequestFrameOptions {
+                        require_presentation: true,
+                        force_render: true,
+                    })
+                },
+            );
         })
     }
 }
@@ -376,15 +410,12 @@ impl WebWindowInner {
         Some(result)
     }
 
-    fn create_raf_closure(self: &Rc<Self>) -> Closure<dyn FnMut(f64)> {
+    fn create_raf_closure(self: &Rc<Self>) -> Closure<dyn FnMut()> {
         let this = Rc::clone(self);
-        let closure = Closure::new(move |timestamp| {
+        let closure = Closure::new(move || {
             // Clear the fired request before running callbacks so invalidation
             // during this frame can schedule the next one.
             this.raf_id.set(None);
-            // Momentum shares the platform's frame callback so input cannot
-            // re-enter GPUI through an independent animation-frame callback.
-            this.tick_touch_momentum(timestamp);
             this.with_callback(
                 |callbacks| &mut callbacks.request_frame,
                 |callback| {
@@ -394,9 +425,6 @@ impl WebWindowInner {
                     })
                 },
             );
-            if this.touch_momentum.get().is_some() {
-                this.wake_frame_loop();
-            }
         });
 
         let js_func: js_sys::Function =
@@ -477,7 +505,7 @@ impl WebWindowInner {
 
                 if !is_visible {
                     this.cancel_active_touch(None);
-                    this.cancel_touch_momentum();
+                    this.cancel_active_touches();
                 }
 
                 {
@@ -595,33 +623,6 @@ impl WebWindowInner {
             update_keyboard_modifier_button(&accessory.alt, false);
         }
         modifiers
-    }
-
-    pub(crate) fn update_touch_input_focus(self: &Rc<Self>, position: Point<Pixels>) {
-        // A tap can synchronously move GPUI focus. Draw the invalidated frame now so
-        // the platform input handler below represents the control that was tapped.
-        self.with_callback(
-            |callbacks| &mut callbacks.request_frame,
-            |callback| {
-                callback(RequestFrameOptions {
-                    require_presentation: false,
-                    force_render: false,
-                })
-            },
-        );
-
-        let accepts_touch_input = self.soft_keyboard_requested.replace(false)
-            || self
-                .with_input_handler(|handler| {
-                    handler.query_accepts_text_input()
-                        && handler
-                            .element_bounds()
-                            .is_some_and(|bounds| bounds.contains(&position))
-                })
-                .unwrap_or(false);
-
-        self.sync_virtual_keyboard(accepts_touch_input);
-        ImeMirror::schedule_sync(self);
     }
 
     pub(crate) fn register_appearance_change(self: &Rc<Self>) -> Option<EventListenerHandle> {
@@ -1069,6 +1070,10 @@ impl PlatformWindow for WebWindow {
 
     fn hide_soft_keyboard(&self) {
         self.inner.sync_virtual_keyboard(false);
+    }
+
+    fn set_text_input_configuration(&mut self, configuration: TextInputConfiguration) {
+        self.inner.ime_mirror.apply_configuration(&configuration);
     }
 
     fn prompt(

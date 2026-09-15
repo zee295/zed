@@ -139,6 +139,12 @@ struct CommitFileResponse {
 }
 
 #[derive(Deserialize)]
+struct LoadCommitResponse {
+    files: Vec<CommitFileResponse>,
+    is_shallow_boundary: bool,
+}
+
+#[derive(Deserialize)]
 struct BlameResponse {
     entries: Vec<BlameEntry>,
     messages: HashMap<String, String>,
@@ -717,21 +723,28 @@ impl GitRepository for RemoteGitRepository {
         .boxed()
     }
 
-    fn load_commit(&self, commit: String, _cx: AsyncApp) -> BoxFuture<'_, Result<CommitDiff>> {
+    fn load_commit(
+        &self,
+        commit: String,
+        ignore_shallow_boundary: bool,
+        _cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<CommitDiff>> {
         let client = self.client.clone();
         let repo_path = self.repo_path.clone();
         async move {
-            let files: Vec<CommitFileResponse> = client
+            let response: LoadCommitResponse = client
                 .call(
                     "GitRepository::load_commit",
                     &json!({
                         "repo_path": repo_path.to_string_lossy(),
                         "commit": commit,
+                        "ignore_shallow_boundary": ignore_shallow_boundary,
                     }),
                 )
                 .await?;
             Ok(CommitDiff {
-                files: files
+                files: response
+                    .files
                     .into_iter()
                     .map(|file| {
                         Ok(CommitFile {
@@ -742,6 +755,7 @@ impl GitRepository for RemoteGitRepository {
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
+                is_shallow_boundary: response.is_shallow_boundary,
             })
         }
         .boxed()

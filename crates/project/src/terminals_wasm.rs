@@ -92,18 +92,13 @@ impl Project {
         let window_id = cx.entity_id().as_u64();
 
         cx.spawn(async move |project, cx| {
-            let (completion_tx, completion_rx) = async_channel::bounded(1);
-            let task_state = Some(terminal::TaskState {
-                spawned_task: spawn_task.clone(),
-                status: terminal::TaskStatus::Running,
-                completion_rx,
-            });
+            let mode = terminal::TerminalMode::task(spawn_task);
 
             let builder = cx
                 .update(|cx| {
                     TerminalBuilder::new(
                         cwd,
-                        task_state,
+                        mode,
                         shell,
                         env,
                         settings.cursor_shape,
@@ -113,7 +108,6 @@ impl Project {
                         Duration::from_millis(settings.path_hyperlink_timeout_ms),
                         true,
                         window_id,
-                        Some(completion_tx),
                         cx,
                         Vec::new(),
                         path_style,
@@ -194,7 +188,7 @@ impl Project {
                 .update(|cx| {
                     TerminalBuilder::new(
                         cwd,
-                        None,
+                        terminal::TerminalMode::interactive(),
                         shell,
                         env,
                         settings.cursor_shape,
@@ -204,7 +198,6 @@ impl Project {
                         Duration::from_millis(settings.path_hyperlink_timeout_ms),
                         true,
                         window_id,
-                        None,
                         cx,
                         Vec::new(),
                         path_style,

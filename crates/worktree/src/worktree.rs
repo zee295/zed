@@ -5904,32 +5904,38 @@ impl BackgroundScanner {
         }
         drop(ignore_queue_tx);
 
+        let process_queue = || async {
+            loop {
+                select_biased! {
+                    // Process any path refresh requests before moving on to process
+                    // the queue of ignore statuses.
+                    request = self.next_scan_request().fuse() => {
+                        let Ok(request) = request else { break };
+                        if !self.process_scan_request(request, true).await {
+                            return;
+                        }
+                    }
+
+                    // Recursively process directories whose ignores have changed.
+                    job = ignore_queue_rx.recv().fuse() => {
+                        let Ok(job) = job else { break };
+                        self.update_ignore_status(job, &prev_snapshot).await;
+                    }
+                }
+            }
+        };
+
+        #[cfg(not(target_family = "wasm"))]
         self.executor
             .scoped(|scope| {
                 for _ in 0..self.executor.num_cpus() {
-                    scope.spawn(async {
-                        loop {
-                            select_biased! {
-                                // Process any path refresh requests before moving on to process
-                                // the queue of ignore statuses.
-                                request = self.next_scan_request().fuse() => {
-                                    let Ok(request) = request else { break };
-                                    if !self.process_scan_request(request, true).await {
-                                        return;
-                                    }
-                                }
-
-                                // Recursively process directories whose ignores have changed.
-                                job = ignore_queue_rx.recv().fuse() => {
-                                    let Ok(job) = job else { break };
-                                    self.update_ignore_status(job, &prev_snapshot).await;
-                                }
-                            }
-                        }
-                    });
+                    scope.spawn(process_queue());
                 }
             })
             .await;
+
+        #[cfg(target_family = "wasm")]
+        process_queue().await;
     }
 
     async fn ignores_needing_update(&self) -> Vec<Arc<Path>> {

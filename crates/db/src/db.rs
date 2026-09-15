@@ -62,7 +62,14 @@ impl AppDatabase {
     /// migrations in dependency order.
     pub fn new() -> Self {
         let db_dir = database_dir();
+        #[cfg(not(target_family = "wasm"))]
         let connection = gpui::block_on(open_db::<AppMigrator>(db_dir, *RELEASE_CHANNEL));
+        #[cfg(target_family = "wasm")]
+        let connection = {
+            let _ = db_dir;
+            futures::FutureExt::now_or_never(open_in_memory_db::<AppMigrator>("zed-web-global"))
+                .expect("in-memory AppDatabase should complete synchronously on wasm")
+        };
         Self(connection)
     }
 

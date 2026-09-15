@@ -20,7 +20,7 @@ test-support = ["collections/test-support", "gpui/test-support", "proto/test-sup
 [dependencies]
 web-time.workspace = true
 anyhow.workspace = true
-tungstenite = "0.27"
+tungstenite = "0.28"
 base64.workspace = true
 collections.workspace = true
 futures.workspace = true

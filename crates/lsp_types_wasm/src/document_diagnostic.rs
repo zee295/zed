@@ -23,6 +23,12 @@ pub struct DiagnosticClientCapabilities {
     /// Whether the clients supports related documents for document diagnostic pulls.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub related_document_support: Option<bool>,
+
+    /// Whether the client supports `MarkupContent` in diagnostic messages.
+    ///
+    /// @since 3.18.0
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub markup_message_support: Option<bool>,
 }
 
 /// Diagnostic options.

@@ -722,6 +722,17 @@ fn commit_data(fs: &FsRpc, params: &Value) -> Result<Value> {
 }
 
 fn load_commit(fs: &FsRpc, params: &Value) -> Result<Value> {
+    let ignore_shallow_boundary = params
+        .get("ignore_shallow_boundary")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !ignore_shallow_boundary && is_shallow_boundary_commit(fs, params)? {
+        return Ok(json!({
+            "files": [],
+            "is_shallow_boundary": true,
+        }));
+    }
+
     let output = git(
         fs,
         params,
@@ -761,7 +772,30 @@ fn load_commit(fs: &FsRpc, params: &Value) -> Result<Value> {
             "is_binary": is_binary,
         }));
     }
-    Ok(Value::Array(files))
+    Ok(json!({
+        "files": files,
+        "is_shallow_boundary": false,
+    }))
+}
+
+fn is_shallow_boundary_commit(fs: &FsRpc, params: &Value) -> Result<bool> {
+    let shallow_path = git_text(fs, params, &["rev-parse", "--git-path", "shallow"])?;
+    let shallow_path = PathBuf::from(shallow_path.trim());
+    let shallow_path = if shallow_path.is_absolute() {
+        shallow_path
+    } else {
+        work_directory(fs, params)?.join(shallow_path)
+    };
+    let shallow_contents = match fs::read_to_string(shallow_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("reading shallow file"),
+    };
+    let commit = format!("{}^{{commit}}", string(params, "commit"));
+    let oid = git_text(fs, params, &["rev-parse", "--verify", &commit])?;
+    Ok(shallow_contents
+        .lines()
+        .any(|line| line.trim() == oid.trim()))
 }
 
 fn load_object(

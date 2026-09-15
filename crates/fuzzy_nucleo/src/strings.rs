@@ -127,6 +127,7 @@ where
     let config = nucleo::Config::DEFAULT;
     let mut matchers = matcher::get_matchers(num_cpus, config);
 
+    #[cfg(not(target_family = "wasm"))]
     executor
         .scoped(|scope| {
             for (segment_idx, (results, matcher)) in segment_results
@@ -153,6 +154,26 @@ where
             }
         })
         .await;
+
+    #[cfg(target_family = "wasm")]
+    for (segment_idx, (results, matcher)) in segment_results
+        .iter_mut()
+        .zip(matchers.iter_mut())
+        .enumerate()
+    {
+        let segment_start = segment_idx * base_size + segment_idx.min(remainder);
+        let segment_end = (segment_idx + 1) * base_size + (segment_idx + 1).min(remainder);
+
+        match_string_helper(
+            &candidates[segment_start..segment_end],
+            &query,
+            matcher,
+            length_penalty,
+            results,
+            cancel_flag,
+        )
+        .ok();
+    }
 
     matcher::return_matchers(matchers);
 

@@ -1370,7 +1370,7 @@ fn init_app_state(
         app_state.fs.clone(),
         prompt_builder,
         app_state.languages.clone(),
-        false, // is_new_install
+        true,  // Web defaults already use the agentic layout; skip the desktop layout backfill.
         false, // is_eval
         cx,
     );

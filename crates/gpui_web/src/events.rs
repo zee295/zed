@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::{collections::HashMap, rc::Rc};
 
 use gpui::{
     Capslock, ClipboardEntry, ClipboardItem, ClipboardString, DispatchEventResult, GestureTuning,
@@ -93,31 +93,36 @@ pub(crate) struct ClickState {
 
 pub(crate) struct TouchPointerState {
     pointer_id: i32,
-    start_position: Point<Pixels>,
     last_position: Point<Pixels>,
-    last_move_time: f64,
-    // CSS pixels per millisecond, smoothed across recent pointer moves.
-    velocity_x: f32,
-    velocity_y: f32,
-    scrolling: bool,
-    resizing: bool,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct TouchMomentumState {
-    position: Point<Pixels>,
-    modifiers: Modifiers,
-    velocity_x: f32,
-    velocity_y: f32,
-    last_timestamp: Option<f64>,
+#[derive(Default)]
+pub(crate) struct TouchIds {
+    next: u64,
+    active: HashMap<i32, TouchId>,
 }
 
-const TOUCH_SCROLL_THRESHOLD: f32 = 6.0;
-const TOUCH_VELOCITY_SMOOTHING: f32 = 0.35;
-const TOUCH_MOMENTUM_MAX_SPEED: f32 = 4.0;
-const TOUCH_MOMENTUM_MAX_FRAME_MS: f32 = 32.0;
-const TOUCH_MOMENTUM_MAX_GAP_MS: f64 = 100.0;
-const TOUCH_MOMENTUM_RELEASE_AGE_MS: f64 = 80.0;
+impl TouchIds {
+    fn start(&mut self, pointer_id: i32) -> Option<TouchId> {
+        let next = self.next.checked_add(1)?;
+        let touch_id = TouchId(self.next);
+        self.next = next;
+        self.active.insert(pointer_id, touch_id);
+        Some(touch_id)
+    }
+
+    fn active(&self, pointer_id: i32) -> Option<TouchId> {
+        self.active.get(&pointer_id).copied()
+    }
+
+    fn end(&mut self, pointer_id: i32) -> Option<TouchId> {
+        self.active.remove(&pointer_id)
+    }
+
+    fn drain(&mut self) -> Vec<TouchId> {
+        self.active.drain().map(|(_, touch_id)| touch_id).collect()
+    }
+}
 
 impl Default for ClickState {
     fn default() -> Self {
@@ -176,6 +181,7 @@ impl WebWindowInner {
             self.register_pointer_enter(),
         ];
         handles.extend(self.register_keyboard_accessory());
+        handles.extend(self.register_selection_change());
         handles.extend(self.register_visibility_change());
         handles.extend(self.register_appearance_change());
         handles.extend(self.register_fullscreen_change());
@@ -283,128 +289,29 @@ impl WebWindowInner {
 
         self.canvas.release_pointer_capture(touch.pointer_id).ok();
         let modifiers = self.state.borrow().modifiers;
-        if touch.resizing {
-            self.pressed_button.set(None);
-            self.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
-                button: MouseButton::Left,
-                position: touch.last_position,
-                modifiers,
-                click_count: self.click_state.borrow().current_count,
-            }));
-        } else if touch.scrolling {
-            self.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
-                position: touch.last_position,
-                delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
-                modifiers,
-                touch_phase: TouchPhase::Cancelled,
-            }));
-        }
-        self.dispatch_input(PlatformInput::Touch(TouchEvent {
-            id: TouchId(touch.pointer_id as u64),
-            phase: TouchPhase::Cancelled,
+        self.pressed_button.set(None);
+        self.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
+            button: MouseButton::Left,
             position: touch.last_position,
-            force: None,
+            modifiers,
+            click_count: self.click_state.borrow().current_count,
         }));
         self.update_hover_status(false);
     }
 
-    fn finish_touch_momentum(&self, phase: TouchPhase) {
-        let Some(momentum) = self.touch_momentum.take() else {
-            return;
-        };
-
-        self.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
-            position: momentum.position,
-            delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
-            modifiers: momentum.modifiers,
-            touch_phase: phase,
-        }));
-    }
-
-    pub(crate) fn cancel_touch_momentum(&self) {
-        self.finish_touch_momentum(TouchPhase::Cancelled);
-    }
-
-    fn start_touch_momentum(
-        &self,
-        position: Point<Pixels>,
-        modifiers: Modifiers,
-        velocity_x: f32,
-        velocity_y: f32,
-        release_age_ms: f64,
-    ) {
-        let tuning = GestureTuning::default();
-        let min_velocity = tuning.min_fling_velocity / 1000.0;
-        let (velocity_x, velocity_y) =
-            clamp_touch_velocity(velocity_x, velocity_y, TOUCH_MOMENTUM_MAX_SPEED);
-        let speed = velocity_x.hypot(velocity_y);
-        if !release_age_ms.is_finite()
-            || !velocity_x.is_finite()
-            || !velocity_y.is_finite()
-            || !(0.0..=TOUCH_MOMENTUM_RELEASE_AGE_MS).contains(&release_age_ms)
-            || speed < min_velocity
-        {
-            self.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+    pub(crate) fn cancel_active_touches(&self) {
+        let touch_ids = self.touch_ids.borrow_mut().drain();
+        self.touch_tap_candidate.set(None);
+        let position = self.state.borrow().mouse_position;
+        for touch_id in touch_ids {
+            self.dispatch_input(PlatformInput::Touch(TouchEvent {
+                id: touch_id,
+                phase: TouchPhase::Cancelled,
                 position,
-                delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
-                modifiers,
-                touch_phase: TouchPhase::Ended,
+                predicted_position: None,
+                force: None,
             }));
-            return;
         }
-
-        self.touch_momentum.set(Some(TouchMomentumState {
-            position,
-            modifiers,
-            velocity_x,
-            velocity_y,
-            last_timestamp: None,
-        }));
-        self.wake_frame_loop();
-    }
-
-    pub(crate) fn tick_touch_momentum(&self, timestamp: f64) {
-        let Some(mut momentum) = self.touch_momentum.get() else {
-            return;
-        };
-        let elapsed_ms = momentum
-            .last_timestamp
-            .map(|last_timestamp| timestamp - last_timestamp)
-            .unwrap_or(1000.0 / 60.0);
-        if !elapsed_ms.is_finite() || elapsed_ms > TOUCH_MOMENTUM_MAX_GAP_MS {
-            self.finish_touch_momentum(TouchPhase::Ended);
-            return;
-        }
-        if elapsed_ms <= 0.0 {
-            return;
-        }
-
-        let frame_ms = (elapsed_ms as f32).min(TOUCH_MOMENTUM_MAX_FRAME_MS);
-        let tuning = GestureTuning::default();
-        let decay = tuning.momentum_decay_per_ms.powf(frame_ms);
-        momentum.velocity_x *= decay;
-        momentum.velocity_y *= decay;
-
-        let min_velocity = tuning.min_fling_velocity / 1000.0;
-        if !momentum.velocity_x.is_finite()
-            || !momentum.velocity_y.is_finite()
-            || momentum.velocity_x.hypot(momentum.velocity_y) < min_velocity
-        {
-            self.finish_touch_momentum(TouchPhase::Ended);
-            return;
-        }
-
-        momentum.last_timestamp = Some(timestamp);
-        self.touch_momentum.set(Some(momentum));
-        self.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
-            position: momentum.position,
-            delta: ScrollDelta::Pixels(point(
-                px(momentum.velocity_x * frame_ms),
-                px(momentum.velocity_y * frame_ms),
-            )),
-            modifiers: momentum.modifiers,
-            touch_phase: TouchPhase::Moved,
-        }));
     }
 
     fn dispatch_accessory_key(&self, key: &str, modifiers: Modifiers) {
@@ -516,70 +423,81 @@ impl WebWindowInner {
 
             let pointer_type = event.pointer_type();
             let position = pointer_position_in_element(&event);
-            if pointer_type != "touch" || this.pointer_targets_text_input(position) {
-                if pointer_type == "touch" {
-                    this.ime_mirror.set_read_only(false);
-                }
-                this.ime_mirror.focus();
-            }
+            this.gesture_start_visual_viewport_height
+                .set(this.visual_viewport_height());
 
-            let button = dom_mouse_button_to_gpui(event.button());
-            let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
+            // Capture the pointer so drags that leave the canvas keep
+            // delivering pointermove/pointerup here; otherwise a release
+            // outside the canvas is never seen and `pressed_button` stays
+            // stuck. The capture is released implicitly on pointerup.
+            this.canvas.set_pointer_capture(event.pointer_id()).ok();
 
             if pointer_type == "touch" {
                 this.cancel_active_touch(None);
-                this.cancel_touch_momentum();
-                // Capture only after stale touch state is cleared: pointer ids
-                // may be reused after a missed release.
-                this.canvas.set_pointer_capture(event.pointer_id()).ok();
                 this.update_active_status(true);
                 this.soft_keyboard_requested.set(false);
+                let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
                 {
                     let mut current_state = this.state.borrow_mut();
                     current_state.mouse_position = position;
                     current_state.modifiers = modifiers;
                 }
                 this.update_hover_status(true);
+
+                let Some(touch_id) = this.touch_ids.borrow_mut().start(event.pointer_id()) else {
+                    log::error!("exhausted touch identifiers");
+                    return;
+                };
                 this.dispatch_input(PlatformInput::Touch(TouchEvent {
-                    id: TouchId(event.pointer_id() as u64),
+                    id: touch_id,
                     phase: TouchPhase::Started,
                     position,
+                    predicted_position: None,
                     force: None,
                 }));
 
-                let resizing = css_cursor_is_resize(this.last_cursor_css.get());
-                if resizing {
-                    let button = MouseButton::Left;
-                    this.pressed_button.set(Some(button));
+                // GPUI refreshes the hit test and cursor during Touch::Started.
+                // Convert a touch on a resize separator into a mouse drag; all
+                // other touches stay on the portable gesture recognizer.
+                if css_cursor_is_resize(this.last_cursor_css.get()) {
+                    this.touch_ids.borrow_mut().end(event.pointer_id());
+                    this.dispatch_input(PlatformInput::Touch(TouchEvent {
+                        id: touch_id,
+                        phase: TouchPhase::Cancelled,
+                        position,
+                        predicted_position: None,
+                        force: None,
+                    }));
+                    this.pressed_button.set(Some(MouseButton::Left));
                     let click_count = this
                         .click_state
                         .borrow_mut()
                         .register_click(position, js_sys::Date::now());
                     this.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
-                        button,
+                        button: MouseButton::Left,
                         position,
                         modifiers,
                         click_count,
                         first_mouse: false,
                     }));
+                    this.active_touch.replace(Some(TouchPointerState {
+                        pointer_id: event.pointer_id(),
+                        last_position: position,
+                    }));
+                } else if this.touch_tap_candidate.get().is_none() {
+                    this.touch_tap_candidate
+                        .set(Some((event.pointer_id(), position)));
                 }
-                this.active_touch.replace(Some(TouchPointerState {
-                    pointer_id: event.pointer_id(),
-                    start_position: position,
-                    last_position: position,
-                    last_move_time: event.time_stamp(),
-                    velocity_x: 0.0,
-                    velocity_y: 0.0,
-                    scrolling: false,
-                    resizing,
-                }));
+                // Keyboard and IME focus intentionally do not change here:
+                // whether this touch is a tap or a pan is only known at
+                // release, and only a tap may affect them (see
+                // `touch_tap_candidate`). The release handler still runs
+                // within a user gesture, as keyboard summoning requires.
                 return;
             }
 
-            // Capture the pointer so drags that leave the canvas keep
-            // delivering pointermove/pointerup here.
-            this.canvas.set_pointer_capture(event.pointer_id()).ok();
-            this.ime_mirror.focus();
+            let button = dom_mouse_button_to_gpui(event.button());
+            let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
             let time = js_sys::Date::now();
 
             this.pressed_button.set(Some(button));
@@ -598,6 +516,8 @@ impl WebWindowInner {
                 click_count,
                 first_mouse: false,
             }));
+
+            this.ime_mirror.focus();
         })
     }
 
@@ -611,80 +531,93 @@ impl WebWindowInner {
         .unwrap_or(false)
     }
 
+    fn focused_input_accepts_text(&self) -> bool {
+        self.with_input_handler(|handler| handler.query_accepts_text_input())
+            .unwrap_or(false)
+    }
+
     fn register_pointer_up(self: &Rc<Self>) -> EventListenerHandle {
         let this = Rc::clone(self);
         self.listen("pointerup", move |event: JsValue| {
             let event: web_sys::PointerEvent = event.unchecked_into();
             event.prevent_default();
 
-            let button = dom_mouse_button_to_gpui(event.button());
             let position = pointer_position_in_element(&event);
-            let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
 
             if event.pointer_type() == "touch" {
-                let Some(touch) = this.active_touch.take() else {
+                if let Some(mut touch) = this.active_touch.take() {
+                    if touch.pointer_id == event.pointer_id() {
+                        touch.last_position = position;
+                        this.canvas.release_pointer_capture(event.pointer_id()).ok();
+                        let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
+                        {
+                            let mut current_state = this.state.borrow_mut();
+                            current_state.mouse_position = position;
+                            current_state.modifiers = modifiers;
+                        }
+                        this.pressed_button.set(None);
+                        this.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
+                            button: MouseButton::Left,
+                            position,
+                            modifiers,
+                            click_count: this.click_state.borrow().current_count,
+                        }));
+                        this.update_hover_status(false);
+                        return;
+                    }
+                    this.active_touch.replace(Some(touch));
+                }
+
+                let Some(touch_id) = this.touch_ids.borrow_mut().end(event.pointer_id()) else {
                     return;
                 };
-                if touch.pointer_id != event.pointer_id() {
-                    this.active_touch.replace(Some(touch));
-                    return;
-                }
-                this.canvas.release_pointer_capture(event.pointer_id()).ok();
-
-                {
-                    let mut current_state = this.state.borrow_mut();
-                    current_state.mouse_position = position;
-                    current_state.modifiers = modifiers;
-                }
-
-                if touch.resizing {
-                    this.pressed_button.set(None);
-                    this.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
-                        button: MouseButton::Left,
-                        position,
-                        modifiers,
-                        click_count: this.click_state.borrow().current_count,
-                    }));
-                } else if touch.scrolling {
-                    this.start_touch_momentum(
-                        position,
-                        modifiers,
-                        touch.velocity_x,
-                        touch.velocity_y,
-                        event.time_stamp() - touch.last_move_time,
-                    );
-                } else {
-                    // Delay the synthetic click until pointerup so a drag can
-                    // become a scroll gesture without first selecting text.
-                    let button = MouseButton::Left;
-                    let click_count = this
-                        .click_state
-                        .borrow_mut()
-                        .register_click(position, js_sys::Date::now());
-                    this.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
-                        button,
-                        position,
-                        modifiers,
-                        click_count,
-                        first_mouse: false,
-                    }));
-                    this.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
-                        button,
-                        position,
-                        modifiers,
-                        click_count,
-                    }));
-                    this.update_touch_input_focus(position);
-                }
-                this.dispatch_input(PlatformInput::Touch(TouchEvent {
-                    id: TouchId(event.pointer_id() as u64),
+                this.state.borrow_mut().mouse_position = position;
+                let completes_tap = match this.touch_tap_candidate.get() {
+                    Some((pointer_id, _)) if pointer_id == event.pointer_id() => {
+                        this.touch_tap_candidate.set(None);
+                        true
+                    }
+                    _ => false,
+                };
+                let focused_input_accepted_text_before_tap = this.focused_input_accepts_text();
+                // A recognized tap is dispatched synchronously inside this
+                // call, so the text-input check below sees the state the tap
+                // produced.
+                let dispatch_result = this.dispatch_input(PlatformInput::Touch(TouchEvent {
+                    id: touch_id,
                     phase: TouchPhase::Ended,
                     position,
+                    predicted_position: None,
                     force: None,
                 }));
-                this.update_hover_status(false);
+
+                // A keyboard opening or closing mid-gesture reflows the
+                // layout, so the release position no longer refers to the
+                // content the user aimed at (a tap that summoned the keyboard
+                // often ends up below the shrunken layout, which would
+                // immediately dismiss it again). Skip the sync then, and for
+                // anything that wasn't a tap: pans and flings must not move
+                // keyboard or IME focus at all.
+                let viewport_stable = this.gesture_start_visual_viewport_height.get()
+                    == this.visual_viewport_height();
+                if completes_tap && viewport_stable {
+                    let preserve_focused_input = should_preserve_focused_input(
+                        focused_input_accepted_text_before_tap,
+                        this.focused_input_accepts_text(),
+                        dispatch_result,
+                    );
+                    if !preserve_focused_input {
+                        let editable = this.soft_keyboard_requested.replace(false)
+                            || this.pointer_targets_text_input(position);
+                        this.sync_virtual_keyboard(editable);
+                    }
+                }
+                this.schedule_ime_mirror_sync();
                 return;
             }
+
+            let button = dom_mouse_button_to_gpui(event.button());
+            let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
 
             this.pressed_button.set(None);
             let click_count = this.click_state.borrow().current_count;
@@ -702,18 +635,85 @@ impl WebWindowInner {
                 click_count,
             }));
 
-            if event.pointer_type() == "touch" {
-                this.sync_virtual_keyboard(this.pointer_targets_text_input(position));
-            }
             this.schedule_ime_mirror_sync();
         })
     }
 
+    /// The visual viewport's current height in layout pixels, or zero when
+    /// the API is unavailable.
+    fn visual_viewport_height(&self) -> f64 {
+        self.browser_window
+            .visual_viewport()
+            .map_or(0.0, |viewport| viewport.height() * viewport.scale())
+    }
+
+    /// Whether the software keyboard is likely hidden — a heuristic, since
+    /// no cross-browser keyboard-visibility signal exists. It infers from
+    /// the visual viewport: a shown keyboard shrinks its height well below
+    /// the greatest height seen at the current width (the width only changes
+    /// on rotation, which restarts the calibration). `window.innerHeight`
+    /// can't serve as the reference because Android shrinks it along with
+    /// the keyboard. Unknown states err toward "visible" so ordinary
+    /// editable taps don't gratuitously restart the IME session.
+    ///
+    /// Restricted to coarse-pointer environments: elsewhere (desktop
+    /// browsers, including touchscreen laptops) viewport height tracks
+    /// user window resizes rather than a software keyboard, so the
+    /// calibration would misfire. Split-screen resizes on mobile can still
+    /// fool it; tracking `visualViewport` resize events around focus
+    /// transitions would be sturdier.
+    fn keyboard_likely_dismissed(&self) -> bool {
+        let coarse_pointer = self
+            .browser_window
+            .match_media("(pointer: coarse)")
+            .ok()
+            .flatten()
+            .is_some_and(|media_query_list| media_query_list.matches());
+        if !coarse_pointer {
+            return false;
+        }
+        let Some(viewport) = self.browser_window.visual_viewport() else {
+            return false;
+        };
+        let width = viewport.width() * viewport.scale();
+        let height = viewport.height() * viewport.scale();
+        let (probe_width, probe_height) = self.visual_viewport_probe.get();
+        let max_height = if width == probe_width {
+            probe_height.max(height)
+        } else {
+            height
+        };
+        self.visual_viewport_probe.set((width, max_height));
+        height >= max_height * 0.85
+    }
+
+    /// The browser or OS took over the pointer (native scrolling, a system
+    /// gesture, the pointer being removed): no pointerup will follow, so the
+    /// gesture must unwind rather than complete.
     fn register_pointer_cancel(self: &Rc<Self>) -> EventListenerHandle {
         let this = Rc::clone(self);
         self.listen("pointercancel", move |event: JsValue| {
             let event: web_sys::PointerEvent = event.unchecked_into();
             this.cancel_active_touch(Some(event.pointer_id()));
+            if event.pointer_type() == "touch" {
+                let Some(touch_id) = this.touch_ids.borrow_mut().end(event.pointer_id()) else {
+                    return;
+                };
+                if let Some((pointer_id, _)) = this.touch_tap_candidate.get()
+                    && pointer_id == event.pointer_id()
+                {
+                    this.touch_tap_candidate.set(None);
+                }
+                this.dispatch_input(PlatformInput::Touch(TouchEvent {
+                    id: touch_id,
+                    phase: TouchPhase::Cancelled,
+                    position: pointer_position_in_element(&event),
+                    predicted_position: None,
+                    force: None,
+                }));
+            } else {
+                this.pressed_button.set(None);
+            }
         })
     }
 
@@ -756,12 +756,24 @@ impl WebWindowInner {
     pub(crate) fn sync_virtual_keyboard(self: &Rc<Self>, editable: bool) {
         let was_editable = !self.ime_mirror.read_only();
         self.ime_mirror.set_read_only(!editable);
-        // Cycle only on an actual editability transition. Cycling on every
-        // tap would restart the IME connection right as the keyboard reads
-        // the tapped caret's context, racing its word segmentation.
-        if editable != was_editable {
+        // Trigger a focus event only when the keyboard actually needs
+        // summoning. Cycling focus on every tap would restart the IME
+        // connection right as the keyboard reads the tapped caret's context,
+        // racing its word segmentation. But `focus()` on an already-focused
+        // element is a no-op, so a dismissed keyboard would otherwise never
+        // return for taps that stay within editable content: detect that
+        // through the visual viewport and force a fresh focus event.
+        let editable_needs_focus_event = editable
+            && (!was_editable || !self.ime_mirror.is_focused() || self.keyboard_likely_dismissed());
+        if editable_needs_focus_event || (!editable && was_editable) {
             self.suppress_focus_status_events.set(true);
             if editable {
+                // A same-task blur/focus cycle may be coalesced by iOS, but
+                // this branch only runs when the keyboard is already gone,
+                // so a coalesced cycle loses nothing.
+                if self.ime_mirror.is_focused() {
+                    self.ime_mirror.blur();
+                }
                 self.ime_mirror.focus();
             } else {
                 self.ime_mirror.blur();
@@ -819,94 +831,58 @@ impl WebWindowInner {
             event.prevent_default();
 
             let position = pointer_position_in_element(&event);
-            let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
 
             if event.pointer_type() == "touch" {
-                let mut active_touch = this.active_touch.borrow_mut();
-                let Some(touch) = active_touch.as_mut() else {
-                    return;
-                };
-                if touch.pointer_id != event.pointer_id() {
-                    return;
-                }
-
-                if touch.resizing {
-                    touch.last_position = position;
-                    drop(active_touch);
-                    {
-                        let mut current_state = this.state.borrow_mut();
-                        current_state.mouse_position = position;
-                        current_state.modifiers = modifiers;
-                    }
-                    this.dispatch_input(PlatformInput::MouseMove(MouseMoveEvent {
-                        position,
-                        pressed_button: Some(MouseButton::Left),
-                        modifiers,
-                    }));
-                    return;
-                }
-
-                let total_x = f32::from(position.x - touch.start_position.x);
-                let total_y = f32::from(position.y - touch.start_position.y);
-                let distance = total_x.hypot(total_y);
-                if !touch.scrolling && distance < TOUCH_SCROLL_THRESHOLD {
-                    touch.last_position = position;
-                    touch.last_move_time = event.time_stamp();
-                    touch.velocity_x = 0.0;
-                    touch.velocity_y = 0.0;
-                    return;
-                }
-
-                let was_scrolling = touch.scrolling;
-                let touch_phase = if was_scrolling {
-                    TouchPhase::Moved
-                } else {
-                    touch.scrolling = true;
-                    TouchPhase::Started
-                };
-                let delta = point(
-                    position.x - touch.last_position.x,
-                    position.y - touch.last_position.y,
-                );
-                let elapsed_ms = event.time_stamp() - touch.last_move_time;
-                if elapsed_ms > 0.0 && elapsed_ms <= TOUCH_MOMENTUM_MAX_GAP_MS {
-                    let instantaneous_x = f32::from(delta.x) / elapsed_ms as f32;
-                    let instantaneous_y = f32::from(delta.y) / elapsed_ms as f32;
-                    if was_scrolling {
-                        touch.velocity_x = touch.velocity_x * (1.0 - TOUCH_VELOCITY_SMOOTHING)
-                            + instantaneous_x * TOUCH_VELOCITY_SMOOTHING;
-                        touch.velocity_y = touch.velocity_y * (1.0 - TOUCH_VELOCITY_SMOOTHING)
-                            + instantaneous_y * TOUCH_VELOCITY_SMOOTHING;
-                    } else {
-                        touch.velocity_x = instantaneous_x;
-                        touch.velocity_y = instantaneous_y;
-                    }
-                    (touch.velocity_x, touch.velocity_y) = clamp_touch_velocity(
-                        touch.velocity_x,
-                        touch.velocity_y,
-                        TOUCH_MOMENTUM_MAX_SPEED,
-                    );
-                } else {
-                    touch.velocity_x = 0.0;
-                    touch.velocity_y = 0.0;
-                }
-                touch.last_position = position;
-                touch.last_move_time = event.time_stamp();
-                drop(active_touch);
-
                 {
-                    let mut current_state = this.state.borrow_mut();
-                    current_state.mouse_position = position;
-                    current_state.modifiers = modifiers;
+                    let mut active_touch = this.active_touch.borrow_mut();
+                    if let Some(touch) = active_touch.as_mut()
+                        && touch.pointer_id == event.pointer_id()
+                    {
+                        touch.last_position = position;
+                        drop(active_touch);
+                        let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
+                        {
+                            let mut current_state = this.state.borrow_mut();
+                            current_state.mouse_position = position;
+                            current_state.modifiers = modifiers;
+                        }
+                        this.dispatch_input(PlatformInput::MouseMove(MouseMoveEvent {
+                            position,
+                            pressed_button: Some(MouseButton::Left),
+                            modifiers,
+                        }));
+                        return;
+                    }
                 }
-                this.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+
+                let Some(touch_id) = this.touch_ids.borrow().active(event.pointer_id()) else {
+                    return;
+                };
+                this.state.borrow_mut().mouse_position = position;
+                // Mirror the slop rule of gpui's tap recognizer: once the
+                // touch travels beyond it, its release must not affect the
+                // keyboard. Only gpui knows what the gesture truly resolved
+                // to; this platform-side shadow exists because the keyboard
+                // decision must be made synchronously inside the browser's
+                // pointerup handler.
+                if let Some((pointer_id, start_position)) = this.touch_tap_candidate.get()
+                    && pointer_id == event.pointer_id()
+                    && (position - start_position).magnitude()
+                        > f64::from(GestureTuning::default().touch_slop)
+                {
+                    this.touch_tap_candidate.set(None);
+                }
+                this.dispatch_input(PlatformInput::Touch(TouchEvent {
+                    id: touch_id,
+                    phase: TouchPhase::Moved,
                     position,
-                    delta: ScrollDelta::Pixels(delta),
-                    modifiers,
-                    touch_phase,
+                    predicted_position: predicted_pointer_position(&event, position),
+                    force: None,
                 }));
                 return;
             }
+
+            let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
 
             let current_pressed = this.pressed_button.get();
 
@@ -1232,6 +1208,83 @@ impl WebWindowInner {
         })
     }
 
+    /// Imports IME-driven selection moves on the mirror element into the app.
+    ///
+    /// Some IME gestures preview their effect by moving the field's
+    /// selection before committing an edit — Android's slide-on-backspace
+    /// grows a selection over the text it will delete. A native field
+    /// renders that selection itself; this import gives the app the same
+    /// chance. Like edit imports, the move is expressed relative to the
+    /// element's stored selection and applied to the app selection queried
+    /// in the same synchronous callback, never through document coordinates,
+    /// which go stale in a collaborative document.
+    ///
+    /// Self-inflicted events are filtered by state, not by suppression
+    /// flags: `selectionchange` dispatches asynchronously, after the sync or
+    /// import that caused it has already adopted the element's selection, so
+    /// a stored-state match means there is nothing to import.
+    ///
+    /// Registered on the document: Chrome dispatches text-control selection
+    /// changes there, not on the element.
+    fn register_selection_change(self: &Rc<Self>) -> Option<EventListenerHandle> {
+        let document = self.browser_window.document()?;
+        let this = Rc::clone(self);
+        Some(EventListenerHandle::add(
+            document.as_ref(),
+            "selectionchange",
+            move |_event: JsValue| {
+                if this.is_composing.get() || !this.ime_mirror.is_focused() {
+                    return;
+                }
+                // An in-flight edit owns the selection; its import adopts it.
+                if this.ime_mirror.value() != this.ime_mirror.stored_text() {
+                    return;
+                }
+                let Some(element_start) = this.ime_mirror.selection_start() else {
+                    return;
+                };
+                let element_end = this
+                    .ime_mirror
+                    .element_selection_end()
+                    .unwrap_or(element_start);
+                let (stored_start, stored_end) = this.ime_mirror.stored_selection();
+                if (element_start, element_end) == (stored_start, stored_end) {
+                    return;
+                }
+                let applied = this.with_input_handler(|handler| {
+                    let Some(selection) = handler.selected_text_range(false) else {
+                        return false;
+                    };
+                    // The app range corresponding to the stored element
+                    // selection is exactly `selection`; a single consistent
+                    // alignment between the two maps the moved endpoints.
+                    // Disagreeing alignments mean the app selection changed
+                    // underneath and the pending resync owns the element.
+                    let alignment = selection.range.start.checked_sub(stored_start as usize);
+                    if alignment.is_none()
+                        || alignment != selection.range.end.checked_sub(stored_end as usize)
+                    {
+                        return false;
+                    }
+                    let alignment = alignment.unwrap();
+                    handler.set_selected_text_range(
+                        alignment + element_start as usize..alignment + element_end as usize,
+                    );
+                    true
+                });
+                if applied == Some(true) {
+                    this.ime_mirror.adopt_element_state();
+                } else {
+                    // No import is coming for this move; without a forced
+                    // sync the mirror would keep deferring to it and show
+                    // the IME a selection the app never adopted.
+                    this.ime_mirror.reject_selection_import();
+                    this.schedule_ime_mirror_sync();
+                }
+            },
+        ))
+    }
+
     /// Software keyboards (IMEs) express editing through `beforeinput`
     /// rather than key events: Android IMEs emit only a placeholder key
     /// event (`key: "Unidentified"`, `keyCode` 229). This handler only
@@ -1270,7 +1323,7 @@ impl WebWindowInner {
             }
 
             let selection_start = this.ime_mirror.selection_start();
-            let selection_end = this.ime_mirror.selection_end();
+            let selection_end = this.ime_mirror.element_selection_end();
             let text_length = this.ime_mirror.value().encode_utf16().count() as u32;
             let boundary_edit = match input_type.as_str() {
                 "deleteContentBackward" | "deleteWordBackward"
@@ -1464,7 +1517,7 @@ impl WebWindowInner {
             "blur",
             move |_event: JsValue| {
                 this.cancel_active_touch(None);
-                this.cancel_touch_momentum();
+                this.cancel_active_touches();
             },
         )
     }
@@ -1627,6 +1680,16 @@ fn capslock_from_keyboard_event(event: &web_sys::KeyboardEvent) -> Capslock {
     }
 }
 
+fn should_preserve_focused_input(
+    accepted_text_before_tap: bool,
+    accepts_text_after_tap: bool,
+    dispatch_result: Option<DispatchEventResult>,
+) -> bool {
+    accepted_text_before_tap
+        && accepts_text_after_tap
+        && dispatch_result.is_some_and(|result| result.default_prevented)
+}
+
 pub(crate) fn browser_operating_system(browser_window: &web_sys::Window) -> gpui::OperatingSystem {
     let navigator = browser_window.navigator();
 
@@ -1732,20 +1795,111 @@ fn pointer_position_in_element(event: &web_sys::PointerEvent) -> Point<Pixels> {
     mouse_position_in_element(mouse_event)
 }
 
-fn clamp_touch_velocity(velocity_x: f32, velocity_y: f32, max_speed: f32) -> (f32, f32) {
-    if !velocity_x.is_finite() || !velocity_y.is_finite() {
-        return (0.0, 0.0);
+/// How far ahead of the raw pointer position predictions may reach.
+///
+/// Browsers predict much further (Chrome offers samples out to 25ms), but
+/// prediction error grows with the horizon and surfaces as jitter: the
+/// emitted pan deltas gain a term proportional to lead x change in velocity,
+/// which at long leads visibly reverses direction mid-drag. Measurements
+/// show leads up to ~10ms track at or below the raw stream's frame-to-frame
+/// variation; AOSP similarly caps touch resampling extrapolation at 8ms
+/// (`RESAMPLE_MAX_PREDICTION` in `InputTransport.cpp`).
+const MAX_PREDICTION_LEAD_MS: f64 = 10.;
+
+/// The predicted pointer position closest to [`MAX_PREDICTION_LEAD_MS`]
+/// ahead of `event`, from `getPredictedEvents()`, or `None` when the browser
+/// offers no prediction (Safari lacks the method, Firefox returns an empty
+/// array). A prediction further out than the cap is linearly scaled back to
+/// it.
+///
+/// Accessed through `Reflect` because calling a missing method through the
+/// web-sys binding would throw, and predicted events' `offsetX`/`offsetY`
+/// are unreliable across browsers (their target may be detached), so the
+/// position is derived from the client-coordinate delta against the parent
+/// event, anchored to the parent's element-relative `position`.
+fn predicted_pointer_position(
+    event: &web_sys::PointerEvent,
+    position: Point<Pixels>,
+) -> Option<Point<Pixels>> {
+    let method = js_sys::Reflect::get(event, &JsValue::from_str("getPredictedEvents")).ok()?;
+    let method = method.dyn_ref::<js_sys::Function>()?;
+    let predicted_events: js_sys::Array = method.call0(event).ok()?.dyn_into().ok()?;
+    let mut best: Option<(f64, web_sys::PointerEvent)> = None;
+    for predicted in predicted_events.iter() {
+        let Ok(predicted) = predicted.dyn_into::<web_sys::PointerEvent>() else {
+            continue;
+        };
+        let lead = predicted.time_stamp() - event.time_stamp();
+        if lead <= 0. {
+            continue;
+        }
+        let distance_to_cap = (lead - MAX_PREDICTION_LEAD_MS).abs();
+        if best
+            .as_ref()
+            .is_none_or(|(best_distance, _)| distance_to_cap < *best_distance)
+        {
+            best = Some((distance_to_cap, predicted));
+        }
     }
-    let speed = velocity_x.hypot(velocity_y);
-    if speed <= max_speed {
-        (velocity_x, velocity_y)
-    } else {
-        let scale = max_speed / speed;
-        (velocity_x * scale, velocity_y * scale)
-    }
+    let (_, predicted) = best?;
+    let lead = predicted.time_stamp() - event.time_stamp();
+    let scale = (MAX_PREDICTION_LEAD_MS / lead).min(1.) as f32;
+    let event: &web_sys::MouseEvent = event.as_ref();
+    let predicted: &web_sys::MouseEvent = predicted.as_ref();
+    Some(point(
+        position.x + px((predicted.client_x() - event.client_x()) as f32 * scale),
+        position.y + px((predicted.client_y() - event.client_y()) as f32 * scale),
+    ))
 }
 
 fn mouse_position_in_element(event: &web_sys::MouseEvent) -> Point<Pixels> {
     // offset_x/offset_y give position relative to the target element's padding edge
     point(px(event.offset_x() as f32), px(event.offset_y() as f32))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_pointer_id_reuse_gets_a_new_touch_id() {
+        let mut touch_ids = TouchIds::default();
+        let first = touch_ids.start(7).expect("first touch id");
+        let concurrent = touch_ids.start(8).expect("concurrent touch id");
+
+        assert_ne!(first, concurrent);
+        assert_eq!(touch_ids.active(7), Some(first));
+        assert_eq!(touch_ids.end(7), Some(first));
+        assert_eq!(touch_ids.active(7), None);
+
+        let reused = touch_ids.start(7).expect("reused pointer touch id");
+        assert_ne!(reused, first);
+        assert_ne!(reused, concurrent);
+    }
+
+    #[test]
+    fn handled_tap_preserves_unchanged_text_input() {
+        assert!(should_preserve_focused_input(
+            true,
+            true,
+            Some(DispatchEventResult {
+                propagate: false,
+                default_prevented: true,
+            }),
+        ));
+    }
+
+    #[test]
+    fn tap_does_not_preserve_unhandled_or_unfocused_input() {
+        let result = |default_prevented| {
+            Some(DispatchEventResult {
+                propagate: false,
+                default_prevented,
+            })
+        };
+
+        assert!(!should_preserve_focused_input(true, true, result(false),));
+        assert!(!should_preserve_focused_input(false, true, result(true),));
+        assert!(!should_preserve_focused_input(true, false, result(true),));
+    }
 }

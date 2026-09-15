@@ -66,65 +66,42 @@ impl PlatformScheduler {
 }
 
 impl Scheduler for PlatformScheduler {
+    #[cfg(not(target_family = "wasm"))]
     fn block(
         &self,
         _session_id: Option<SessionId>,
         mut future: Pin<&mut dyn Future<Output = ()>>,
         timeout: Option<Duration>,
     ) -> bool {
-        #[cfg(target_family = "wasm")]
-        {
-            // Browsers cannot park the main thread. For pure-compute futures
-            // (e.g. wrap-map flushes that only `yield` occasionally) we busy-poll
-            // with a noop waker until ready. If a timeout is set and the future is
-            // still pending after a few polls, return false so callers fall back
-            // to the async spawn path (see WrapMap::flush_edits).
-            use std::task::{Context, Poll, Waker};
-            let waker = Waker::noop();
-            let mut cx = Context::from_waker(waker);
-            // Cap busy-poll iterations so we never hang the browser tab if the
-            // future is waiting on real I/O / timers.
-            let max_polls = if timeout.is_some() { 64usize } else { 10_000 };
-            for _ in 0..max_polls {
-                if let Poll::Ready(()) = future.as_mut().poll(&mut cx) {
-                    return true;
-                }
-            }
-            false
+        use waker_fn::waker_fn;
+        let deadline = timeout.map(|t| Instant::now() + t);
+        let parker = parking::Parker::new();
+        let unparker = parker.unparker();
+        let waker = waker_fn(move || {
+            unparker.unpark();
+        });
+        let mut cx = Context::from_waker(&waker);
+        if let Poll::Ready(()) = future.as_mut().poll(&mut cx) {
+            return true;
         }
-        #[cfg(not(target_family = "wasm"))]
-        {
-            use std::task::{Context, Poll};
-            use waker_fn::waker_fn;
-            let deadline = timeout.map(|t| Instant::now() + t);
-            let parker = parking::Parker::new();
-            let unparker = parker.unparker();
-            let waker = waker_fn(move || {
-                unparker.unpark();
-            });
-            let mut cx = Context::from_waker(&waker);
-            if let Poll::Ready(()) = future.as_mut().poll(&mut cx) {
-                return true;
+
+        let park_deadline = |deadline: Instant| {
+            // Timer expirations are only delivered every ~15.6 milliseconds by default on Windows.
+            // We increase the resolution during this wait so that short timeouts stay reasonably short.
+            let _timer_guard = self.dispatcher.increase_timer_resolution();
+            parker.park_deadline(deadline)
+        };
+
+        loop {
+            match deadline {
+                Some(deadline) if !park_deadline(deadline) && deadline <= Instant::now() => {
+                    return false;
+                }
+                Some(_) => (),
+                None => parker.park(),
             }
-
-            let park_deadline = |deadline: Instant| {
-                // Timer expirations are only delivered every ~15.6 milliseconds by default on Windows.
-                // We increase the resolution during this wait so that short timeouts stay reasonably short.
-                let _timer_guard = self.dispatcher.increase_timer_resolution();
-                parker.park_deadline(deadline)
-            };
-
-            loop {
-                match deadline {
-                    Some(deadline) if !park_deadline(deadline) && deadline <= Instant::now() => {
-                        return false;
-                    }
-                    Some(_) => (),
-                    None => parker.park(),
-                }
-                if let Poll::Ready(()) = future.as_mut().poll(&mut cx) {
-                    break true;
-                }
+            if let Poll::Ready(()) = future.as_mut().poll(&mut cx) {
+                break true;
             }
         }
     }
