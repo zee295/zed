@@ -1,17 +1,16 @@
 use anyhow::Result;
-#[cfg(feature = "editing")]
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::ops::Range;
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 use std::sync::LazyLock;
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 use tree_sitter::{Query, StreamingIterator as _};
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 use util::RangeExt;
 
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 pub fn update_value_in_json_text<'a>(
     text: &mut String,
     key_path: &mut Vec<&'a str>,
@@ -72,7 +71,7 @@ pub fn update_value_in_json_text<'a>(
 }
 
 /// * `replace_key` - When an exact key match according to `key_path` is found, replace the key with `replace_key` if `Some`.
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 pub fn replace_value_in_json_text<T: AsRef<str>>(
     text: &str,
     key_path: &[T],
@@ -284,7 +283,7 @@ pub fn replace_value_in_json_text<T: AsRef<str>>(
     }
 }
 
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 fn construct_json_value(
     key_path: &[impl AsRef<str>],
     new_value: Option<&serde_json::Value>,
@@ -301,12 +300,12 @@ fn construct_json_value(
     return new_value;
 }
 
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 fn parse_index_key(index_key: &str) -> Option<usize> {
     index_key.strip_prefix('#')?.parse().ok()
 }
 
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 fn handle_possible_array_value(
     key_node: &tree_sitter::Node,
     value_node: &tree_sitter::Node,
@@ -374,14 +373,14 @@ fn handle_possible_array_value(
     return Some((replace_range, replace_value));
 }
 
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 const TS_DOCUMENT_KIND: &str = "document";
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 const TS_ARRAY_KIND: &str = "array";
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 const TS_COMMENT_KIND: &str = "comment";
 
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 pub fn replace_top_level_array_value_in_json_text(
     text: &str,
     key_path: &[impl AsRef<str>],
@@ -504,7 +503,7 @@ pub fn replace_top_level_array_value_in_json_text(
     }
 }
 
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 pub fn append_top_level_array_value_in_json_text(
     text: &str,
     new_value: &Value,
@@ -629,7 +628,7 @@ pub fn append_top_level_array_value_in_json_text(
 
 /// Infers the indentation size used in JSON text by analyzing the tree structure.
 /// Returns the detected indent size, or a default of 2 if no indentation is found.
-#[cfg(feature = "editing")]
+#[cfg(all(feature = "editing", not(target_family = "wasm")))]
 pub fn infer_json_indent_size(text: &str) -> usize {
     const MAX_INDENT_SIZE: usize = 64;
 
@@ -722,7 +721,6 @@ pub fn infer_json_indent_size(text: &str) -> usize {
     if max_count == 0 { 2 } else { max_indent }
 }
 
-#[cfg(feature = "editing")]
 pub fn to_pretty_json(
     value: &impl Serialize,
     indent_size: usize,
@@ -757,60 +755,249 @@ pub fn parse_json_with_comments<T: DeserializeOwned>(content: &str) -> Result<T>
     Ok(value)
 }
 
-#[cfg(not(feature = "editing"))]
+// The browser tree-sitter bindings are stubs, so WASM settings edits use a
+// structured JSON fallback instead of initializing a native grammar.
+#[cfg(any(not(feature = "editing"), target_family = "wasm"))]
+fn fallback_parse_index_key(index_key: &str) -> Option<usize> {
+    index_key.strip_prefix('#')?.parse().ok()
+}
+
+#[cfg(any(not(feature = "editing"), target_family = "wasm"))]
+fn fallback_container_for_path(key_path: &[&str]) -> Value {
+    if key_path
+        .first()
+        .and_then(|key| fallback_parse_index_key(key))
+        .is_some()
+    {
+        Value::Array(Vec::new())
+    } else {
+        Value::Object(serde_json::Map::new())
+    }
+}
+
+#[cfg(any(not(feature = "editing"), target_family = "wasm"))]
+fn fallback_update_value_at_path(
+    value: &mut Value,
+    key_path: &[&str],
+    new_value: Option<&Value>,
+    replace_key: Option<&str>,
+) {
+    let Some((key, remaining_path)) = key_path.split_first() else {
+        *value = new_value.cloned().unwrap_or(Value::Null);
+        return;
+    };
+
+    if let Some(index) = fallback_parse_index_key(key) {
+        if !value.is_array() {
+            *value = Value::Array(Vec::new());
+        }
+        let array = value.as_array_mut().unwrap();
+
+        if remaining_path.is_empty() {
+            if let Some(new_value) = new_value {
+                while array.len() < index {
+                    array.push(Value::Null);
+                }
+                if index < array.len() {
+                    array[index] = new_value.clone();
+                } else {
+                    array.push(new_value.clone());
+                }
+            } else if index < array.len() {
+                array.remove(index);
+            }
+            return;
+        }
+
+        while array.len() <= index {
+            array.push(Value::Null);
+        }
+        if array[index].is_null() {
+            array[index] = fallback_container_for_path(remaining_path);
+        }
+        fallback_update_value_at_path(&mut array[index], remaining_path, new_value, replace_key);
+        return;
+    }
+
+    if !value.is_object() {
+        *value = Value::Object(serde_json::Map::new());
+    }
+    let object = value.as_object_mut().unwrap();
+    if remaining_path.is_empty() {
+        object.remove(*key);
+        if let Some(new_value) = new_value {
+            object.insert(replace_key.unwrap_or(key).to_string(), new_value.clone());
+        }
+        return;
+    }
+
+    let child = object
+        .entry((*key).to_string())
+        .or_insert_with(|| fallback_container_for_path(remaining_path));
+    fallback_update_value_at_path(child, remaining_path, new_value, replace_key);
+}
+
+#[cfg(any(not(feature = "editing"), target_family = "wasm"))]
+fn fallback_serialize_document(value: &Value, original_text: &str, tab_size: usize) -> String {
+    if original_text.trim().is_empty() || original_text.contains('\n') {
+        to_pretty_json(value, tab_size, 0)
+    } else {
+        value.to_string()
+    }
+}
+
+#[cfg(any(not(feature = "editing"), target_family = "wasm"))]
 pub fn replace_value_in_json_text<T: AsRef<str>>(
     text: &str,
     key_path: &[T],
-    _tab_size: usize,
+    tab_size: usize,
     new_value: Option<&Value>,
-    _replace_key: Option<&str>,
+    replace_key: Option<&str>,
 ) -> (Range<usize>, String) {
-    let new_text = new_value.map_or_else(String::new, |v| v.to_string());
-    (0..text.len(), new_text)
-}
+    if key_path.is_empty() {
+        return (
+            0..text.len(),
+            new_value.map_or_else(String::new, |value| {
+                fallback_serialize_document(value, text, tab_size)
+            }),
+        );
+    }
 
-#[cfg(not(feature = "editing"))]
-pub fn replace_top_level_array_value_in_json_text(
-    text: &str,
-    _key_path: &[impl AsRef<str>],
-    new_value: Option<&Value>,
-    _replace_key: Option<&str>,
-    _array_index: usize,
-    _tab_size: usize,
-) -> (Range<usize>, String) {
+    let key_path = key_path.iter().map(|key| key.as_ref()).collect::<Vec<_>>();
+    let mut value =
+        parse_json_with_comments(text).unwrap_or_else(|_| fallback_container_for_path(&key_path));
+    fallback_update_value_at_path(&mut value, &key_path, new_value, replace_key);
     (
         0..text.len(),
-        new_value.map_or_else(String::new, |v| v.to_string()),
+        fallback_serialize_document(&value, text, tab_size),
     )
 }
 
-#[cfg(not(feature = "editing"))]
+#[cfg(any(not(feature = "editing"), target_family = "wasm"))]
+pub fn replace_top_level_array_value_in_json_text(
+    text: &str,
+    key_path: &[impl AsRef<str>],
+    new_value: Option<&Value>,
+    replace_key: Option<&str>,
+    array_index: usize,
+    tab_size: usize,
+) -> (Range<usize>, String) {
+    let mut value = parse_json_with_comments(text).unwrap_or_else(|_| Value::Array(Vec::new()));
+    if !value.is_array() {
+        value = Value::Array(Vec::new());
+    }
+    let index_key = format!("#{array_index}");
+    let mut full_path = vec![index_key.as_str()];
+    full_path.extend(key_path.iter().map(|key| key.as_ref()));
+    fallback_update_value_at_path(&mut value, &full_path, new_value, replace_key);
+    (
+        0..text.len(),
+        fallback_serialize_document(&value, text, tab_size),
+    )
+}
+
+#[cfg(any(not(feature = "editing"), target_family = "wasm"))]
 pub fn append_top_level_array_value_in_json_text(
     text: &str,
     new_value: &Value,
-    _tab_size: usize,
+    tab_size: usize,
 ) -> (Range<usize>, String) {
-    (text.len()..text.len(), format!(",{}", new_value))
+    let mut value = parse_json_with_comments(text).unwrap_or_else(|_| Value::Array(Vec::new()));
+    if !value.is_array() {
+        value = Value::Array(Vec::new());
+    }
+    value.as_array_mut().unwrap().push(new_value.clone());
+    (
+        0..text.len(),
+        fallback_serialize_document(&value, text, tab_size),
+    )
 }
 
-#[cfg(not(feature = "editing"))]
-pub fn infer_json_indent_size(_text: &str) -> usize {
-    2
+#[cfg(any(not(feature = "editing"), target_family = "wasm"))]
+pub fn infer_json_indent_size(text: &str) -> usize {
+    text.lines()
+        .filter_map(|line| {
+            let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+            (indent > 0 && indent < 64).then_some(indent)
+        })
+        .min()
+        .unwrap_or(2)
 }
 
-#[cfg(not(feature = "editing"))]
+#[cfg(any(not(feature = "editing"), target_family = "wasm"))]
 pub fn update_value_in_json_text(
     text: &mut String,
     _key_path: &mut Vec<&str>,
-    _tab_size: usize,
+    tab_size: usize,
     _old_value: &Value,
     new_value: &Value,
     edits: &mut Vec<(Range<usize>, String)>,
 ) {
-    let new_text = new_value.to_string();
+    let new_text = fallback_serialize_document(new_value, text, tab_size);
     let range = 0..text.len();
     text.replace_range(range.clone(), &new_text);
     edits.push((range, new_text));
+}
+
+#[cfg(all(test, not(feature = "editing")))]
+mod fallback_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn updates_settings_without_tree_sitter() {
+        let mut text =
+            "{\n  // Keep parsing JSONC input.\n  \"theme\": \"One Dark\"\n}".to_string();
+        let old_value = json!({ "theme": "One Dark" });
+        let new_value = json!({
+            "theme": "One Dark",
+            "agent_servers": {
+                "claude-acp": { "type": "registry" }
+            }
+        });
+        let mut edits = Vec::new();
+        let indent_size = infer_json_indent_size(&text);
+
+        update_value_in_json_text(
+            &mut text,
+            &mut Vec::new(),
+            indent_size,
+            &old_value,
+            &new_value,
+            &mut edits,
+        );
+
+        assert_eq!(parse_json_with_comments::<Value>(&text).unwrap(), new_value);
+        assert!(text.contains("\n  \"agent_servers\""));
+        assert_eq!(edits.len(), 1);
+    }
+
+    #[test]
+    fn replaces_and_appends_array_values_without_tree_sitter() {
+        let input = "[\n  {\n    \"bindings\": {\"ctrl-a\": \"select_all\"}\n  }\n]";
+        let (range, replacement) = replace_top_level_array_value_in_json_text(
+            input,
+            &["bindings", "ctrl-a"],
+            Some(&json!("editor::SelectAll")),
+            None,
+            0,
+            2,
+        );
+        let mut updated = input.to_string();
+        updated.replace_range(range, &replacement);
+
+        let (range, replacement) =
+            append_top_level_array_value_in_json_text(&updated, &json!({ "context": "Editor" }), 2);
+        updated.replace_range(range, &replacement);
+
+        assert_eq!(
+            parse_json_with_comments::<Value>(&updated).unwrap(),
+            json!([
+                { "bindings": { "ctrl-a": "editor::SelectAll" } },
+                { "context": "Editor" }
+            ])
+        );
+    }
 }
 
 #[cfg(test)]
