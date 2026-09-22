@@ -1642,12 +1642,7 @@ fn install_workspace_chrome(cx: &mut App) {
         let git_blame_status = cx.new(|_| git_ui::GitBlameStatus::default());
         let merge_conflict_indicator =
             cx.new(|cx| git_ui::MergeConflictIndicator::new(workspace, cx));
-        let activity_indicator = activity_indicator::ActivityIndicator::new(
-            workspace,
-            workspace.project().read(cx).languages().clone(),
-            window,
-            cx,
-        );
+        let activity_indicator = activity_indicator::ActivityIndicator::new(workspace, window, cx);
         let edit_prediction_menu_handle = ui::PopoverMenuHandle::default();
         let edit_prediction_button = cx.new(|cx| {
             edit_prediction_ui::EditPredictionButton::new(

@@ -91,11 +91,6 @@ pub(crate) struct ClickState {
     current_count: usize,
 }
 
-pub(crate) struct TouchPointerState {
-    pointer_id: i32,
-    last_position: Point<Pixels>,
-}
-
 #[derive(Default)]
 pub(crate) struct TouchIds {
     next: u64,
@@ -278,27 +273,6 @@ impl WebWindowInner {
             .unwrap_or_else(|| ClipboardString::new(text))
     }
 
-    pub(crate) fn cancel_active_touch(&self, pointer_id: Option<i32>) {
-        let Some(touch) = self.active_touch.take() else {
-            return;
-        };
-        if pointer_id.is_some_and(|pointer_id| touch.pointer_id != pointer_id) {
-            self.active_touch.replace(Some(touch));
-            return;
-        }
-
-        self.canvas.release_pointer_capture(touch.pointer_id).ok();
-        let modifiers = self.state.borrow().modifiers;
-        self.pressed_button.set(None);
-        self.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
-            button: MouseButton::Left,
-            position: touch.last_position,
-            modifiers,
-            click_count: self.click_state.borrow().current_count,
-        }));
-        self.update_hover_status(false);
-    }
-
     pub(crate) fn cancel_active_touches(&self) {
         let touch_ids = self.touch_ids.borrow_mut().drain();
         self.touch_tap_candidate.set(None);
@@ -433,7 +407,6 @@ impl WebWindowInner {
             this.canvas.set_pointer_capture(event.pointer_id()).ok();
 
             if pointer_type == "touch" {
-                this.cancel_active_touch(None);
                 this.update_active_status(true);
                 this.soft_keyboard_requested.set(false);
                 let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
@@ -448,43 +421,16 @@ impl WebWindowInner {
                     log::error!("exhausted touch identifiers");
                     return;
                 };
-                this.dispatch_input(PlatformInput::Touch(TouchEvent {
+                let dispatch_result = this.dispatch_input(PlatformInput::Touch(TouchEvent {
                     id: touch_id,
                     phase: TouchPhase::Started,
                     position,
                     predicted_position: None,
                     force: None,
                 }));
-
-                // GPUI refreshes the hit test and cursor during Touch::Started.
-                // Convert a touch on a resize separator into a mouse drag; all
-                // other touches stay on the portable gesture recognizer.
-                if css_cursor_is_resize(this.last_cursor_css.get()) {
-                    this.touch_ids.borrow_mut().end(event.pointer_id());
-                    this.dispatch_input(PlatformInput::Touch(TouchEvent {
-                        id: touch_id,
-                        phase: TouchPhase::Cancelled,
-                        position,
-                        predicted_position: None,
-                        force: None,
-                    }));
-                    this.pressed_button.set(Some(MouseButton::Left));
-                    let click_count = this
-                        .click_state
-                        .borrow_mut()
-                        .register_click(position, js_sys::Date::now());
-                    this.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
-                        button: MouseButton::Left,
-                        position,
-                        modifiers,
-                        click_count,
-                        first_mouse: false,
-                    }));
-                    this.active_touch.replace(Some(TouchPointerState {
-                        pointer_id: event.pointer_id(),
-                        last_position: position,
-                    }));
-                } else if this.touch_tap_candidate.get().is_none() {
+                let touch_drag_claimed = dispatch_result
+                    .is_some_and(|dispatch_result| dispatch_result.default_prevented);
+                if !touch_drag_claimed && this.touch_tap_candidate.get().is_none() {
                     this.touch_tap_candidate
                         .set(Some((event.pointer_id(), position)));
                 }
@@ -545,29 +491,6 @@ impl WebWindowInner {
             let position = pointer_position_in_element(&event);
 
             if event.pointer_type() == "touch" {
-                if let Some(mut touch) = this.active_touch.take() {
-                    if touch.pointer_id == event.pointer_id() {
-                        touch.last_position = position;
-                        this.canvas.release_pointer_capture(event.pointer_id()).ok();
-                        let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
-                        {
-                            let mut current_state = this.state.borrow_mut();
-                            current_state.mouse_position = position;
-                            current_state.modifiers = modifiers;
-                        }
-                        this.pressed_button.set(None);
-                        this.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
-                            button: MouseButton::Left,
-                            position,
-                            modifiers,
-                            click_count: this.click_state.borrow().current_count,
-                        }));
-                        this.update_hover_status(false);
-                        return;
-                    }
-                    this.active_touch.replace(Some(touch));
-                }
-
                 let Some(touch_id) = this.touch_ids.borrow_mut().end(event.pointer_id()) else {
                     return;
                 };
@@ -694,7 +617,6 @@ impl WebWindowInner {
         let this = Rc::clone(self);
         self.listen("pointercancel", move |event: JsValue| {
             let event: web_sys::PointerEvent = event.unchecked_into();
-            this.cancel_active_touch(Some(event.pointer_id()));
             if event.pointer_type() == "touch" {
                 let Some(touch_id) = this.touch_ids.borrow_mut().end(event.pointer_id()) else {
                     return;
@@ -721,7 +643,26 @@ impl WebWindowInner {
         let this = Rc::clone(self);
         self.listen("lostpointercapture", move |event: JsValue| {
             let event: web_sys::PointerEvent = event.unchecked_into();
-            this.cancel_active_touch(Some(event.pointer_id()));
+            if event.pointer_type() != "touch" {
+                return;
+            }
+            let Some(touch_id) = this.touch_ids.borrow_mut().end(event.pointer_id()) else {
+                return;
+            };
+            if this
+                .touch_tap_candidate
+                .get()
+                .is_some_and(|(pointer_id, _)| pointer_id == event.pointer_id())
+            {
+                this.touch_tap_candidate.set(None);
+            }
+            this.dispatch_input(PlatformInput::Touch(TouchEvent {
+                id: touch_id,
+                phase: TouchPhase::Cancelled,
+                position: pointer_position_in_element(&event),
+                predicted_position: None,
+                force: None,
+            }));
         })
     }
 
@@ -833,28 +774,6 @@ impl WebWindowInner {
             let position = pointer_position_in_element(&event);
 
             if event.pointer_type() == "touch" {
-                {
-                    let mut active_touch = this.active_touch.borrow_mut();
-                    if let Some(touch) = active_touch.as_mut()
-                        && touch.pointer_id == event.pointer_id()
-                    {
-                        touch.last_position = position;
-                        drop(active_touch);
-                        let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
-                        {
-                            let mut current_state = this.state.borrow_mut();
-                            current_state.mouse_position = position;
-                            current_state.modifiers = modifiers;
-                        }
-                        this.dispatch_input(PlatformInput::MouseMove(MouseMoveEvent {
-                            position,
-                            pressed_button: Some(MouseButton::Left),
-                            modifiers,
-                        }));
-                        return;
-                    }
-                }
-
                 let Some(touch_id) = this.touch_ids.borrow().active(event.pointer_id()) else {
                     return;
                 };
@@ -1516,7 +1435,6 @@ impl WebWindowInner {
             self.browser_window.as_ref(),
             "blur",
             move |_event: JsValue| {
-                this.cancel_active_touch(None);
                 this.cancel_active_touches();
             },
         )
@@ -1543,22 +1461,6 @@ impl WebWindowInner {
             );
         }
     }
-}
-
-fn css_cursor_is_resize(cursor: &str) -> bool {
-    matches!(
-        cursor,
-        "ew-resize"
-            | "ns-resize"
-            | "col-resize"
-            | "row-resize"
-            | "w-resize"
-            | "e-resize"
-            | "n-resize"
-            | "s-resize"
-            | "nesw-resize"
-            | "nwse-resize"
-    )
 }
 
 fn clipboard_image_files(

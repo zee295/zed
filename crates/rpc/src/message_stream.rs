@@ -41,9 +41,9 @@ where
     pub async fn write(&mut self, message: Message) -> anyhow::Result<()> {
         match message {
             Message::Envelope(message) => {
-                self.encoding_buffer.reserve(message.encoded_len());
+                self.encoding_buffer.reserve(message.encoded_size());
                 message
-                    .encode(&mut self.encoding_buffer)
+                    .encode_to_buffer(&mut self.encoding_buffer)
                     .map_err(io::Error::from)?;
 
                 #[cfg(not(target_family = "wasm"))]
@@ -100,7 +100,7 @@ where
                     {
                         self.encoding_buffer.extend_from_slice(&bytes);
                     }
-                    let envelope = Envelope::decode(self.encoding_buffer.as_slice())
+                    let envelope = Envelope::decode_from_slice(self.encoding_buffer.as_slice())
                         .map_err(io::Error::from)?;
 
                     self.encoding_buffer.clear();

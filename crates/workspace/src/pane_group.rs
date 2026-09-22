@@ -1141,9 +1141,10 @@ mod element {
     use std::{cell::RefCell, iter, rc::Rc, sync::Arc};
 
     use gpui::{
-        Along, AnyElement, App, Axis, BorderStyle, Bounds, Element, GlobalElementId,
+        Along, AnyElement, App, Axis, BorderStyle, Bounds, DispatchPhase, Element, GlobalElementId,
         HitboxBehavior, IntoElement, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
-        Pixels, Point, Size, Style, WeakEntity, Window, px, relative, size,
+        Pixels, Point, Size, Style, TouchDragEvent, TouchPhase, WeakEntity, Window, px, relative,
+        size,
     };
     use gpui::{CursorStyle, Hitbox};
     use parking_lot::Mutex;
@@ -1223,7 +1224,7 @@ mod element {
 
         fn compute_resize(
             flexes: &Arc<Mutex<Vec<f32>>>,
-            e: &MouseMoveEvent,
+            position: Point<Pixels>,
             ix: usize,
             axis: Axis,
             child_start: Point<Pixels>,
@@ -1252,7 +1253,7 @@ mod element {
             // This is basically a "bucket" of pixel changes that need to be applied in response to this
             // mouse event. Probably a small, fractional number like 0.5 or 1.5 pixels
             let mut proposed_current_pixel_change =
-                (e.position - child_start).along(axis) - size(ix, flexes.as_slice());
+                (position - child_start).along(axis) - size(ix, flexes.as_slice());
 
             // This takes a pixel change, and computes the flex changes that correspond to this pixel change
             // as well as the next one, for some reason
@@ -1580,7 +1581,7 @@ mod element {
                             if phase.bubble() && *dragged_handle == Some(ix) {
                                 Self::compute_resize(
                                     &flexes,
-                                    e,
+                                    e.position,
                                     ix,
                                     axis,
                                     child_bounds.origin,
@@ -1589,6 +1590,45 @@ mod element {
                                     window,
                                     cx,
                                 )
+                            }
+                        }
+                    });
+                    window.on_mouse_event({
+                        let workspace = self.workspace.clone();
+                        let dragged_handle = layout.dragged_handle.clone();
+                        let flexes = self.flexes.clone();
+                        let handle_hitbox = handle.hitbox.clone();
+                        let child_bounds = child.bounds;
+                        let axis = self.axis;
+                        move |e: &TouchDragEvent, phase, window, cx| {
+                            if phase != DispatchPhase::Bubble {
+                                return;
+                            }
+                            let is_active = *dragged_handle.borrow() == Some(ix);
+                            match e.phase {
+                                TouchPhase::Started if handle_hitbox.is_hovered(window) => {
+                                    dragged_handle.replace(Some(ix));
+                                    window.prevent_default();
+                                    cx.stop_propagation();
+                                }
+                                TouchPhase::Moved if is_active => {
+                                    Self::compute_resize(
+                                        &flexes,
+                                        e.position,
+                                        ix,
+                                        axis,
+                                        child_bounds.origin,
+                                        bounds.size,
+                                        workspace.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                }
+                                TouchPhase::Ended | TouchPhase::Cancelled if is_active => {
+                                    dragged_handle.replace(None);
+                                    cx.stop_propagation();
+                                }
+                                _ => {}
                             }
                         }
                     });

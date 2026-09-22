@@ -547,6 +547,7 @@ pub fn init(cx: &mut App) {
             });
         });
 
+        // Subscribe to worktree additions to suggest opening the project in a dev container.
         cx.observe_new(
             |workspace: &mut Workspace,
              window: Option<&mut Window>,
@@ -554,6 +555,12 @@ pub fn init(cx: &mut App) {
                 let Some(window) = window else {
                     return;
                 };
+                // A workspace opened with `--dev-container` has its worktrees scanning
+                // before this observer runs, so their update events can't be relied on
+                // to trigger the auto-open.
+                if workspace.open_in_dev_container() {
+                    dev_container_suggest::open_dev_container_from_cli(workspace, window, cx);
+                }
                 cx.subscribe_in(
                     workspace.project(),
                     window,

@@ -14,11 +14,7 @@ use std::{
 
 use anyhow::{Context as _, Result, anyhow};
 use derive_more::{Deref, DerefMut};
-use futures::{
-    Future, FutureExt,
-    channel::oneshot,
-    future::{LocalBoxFuture, Shared},
-};
+use futures::{Future, FutureExt, channel::oneshot, future::LocalBoxFuture};
 use itertools::Itertools;
 use parking_lot::RwLock;
 use slotmap::SlotMap;
@@ -43,6 +39,7 @@ pub use visual_test_context::*;
 
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::InspectorElementRegistry;
+use crate::asset_cache::CachedLoad;
 use crate::{
     Action, ActionBuildError, ActionRegistry, Any, AnyView, AnyWindowHandle, AppContext, Arena,
     ArenaBox, Asset, AssetSource, BackgroundExecutor, Bounds, ClipboardItem, ClipboardReadError,
@@ -77,11 +74,14 @@ mod visual_test_context;
 /// [Context::on_app_quit] before fully quitting.
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(200);
 
+type DeferredAppUpdate = Box<dyn FnOnce(&mut App)>;
+
 /// Temporary(?) wrapper around [`RefCell<App>`] to help us debug any double borrows.
 /// Strongly consider removing after stabilization.
 #[doc(hidden)]
 pub struct AppCell {
     app: RefCell<App>,
+    deferred_updates: RefCell<Vec<DeferredAppUpdate>>,
 }
 
 impl AppCell {
@@ -92,7 +92,10 @@ impl AppCell {
             let thread_id = std::thread::current().id();
             eprintln!("borrowed {thread_id:?}");
         }
-        AppRef(self.app.borrow())
+        AppRef {
+            app: Some(self.app.borrow()),
+            app_cell: self,
+        }
     }
 
     #[doc(hidden)]
@@ -102,7 +105,10 @@ impl AppCell {
             let thread_id = std::thread::current().id();
             eprintln!("borrowed {thread_id:?}");
         }
-        AppRefMut(self.app.borrow_mut())
+        AppRefMut {
+            app: self.app.borrow_mut(),
+            deferred_updates: &self.deferred_updates,
+        }
     }
 
     #[doc(hidden)]
@@ -112,16 +118,50 @@ impl AppCell {
             let thread_id = std::thread::current().id();
             eprintln!("borrowed {thread_id:?}");
         }
-        Ok(AppRefMut(self.app.try_borrow_mut()?))
+        Ok(AppRefMut {
+            app: self.app.try_borrow_mut()?,
+            deferred_updates: &self.deferred_updates,
+        })
+    }
+}
+
+fn drain_deferred_updates(app: &mut App, deferred_updates: &RefCell<Vec<DeferredAppUpdate>>) {
+    loop {
+        let updates = {
+            let mut deferred_updates = deferred_updates.borrow_mut();
+            mem::take(&mut *deferred_updates)
+        };
+        if updates.is_empty() {
+            break;
+        }
+        for update in updates {
+            update(app);
+        }
     }
 }
 
 #[doc(hidden)]
-#[derive(Deref, DerefMut)]
-pub struct AppRef<'a>(Ref<'a, App>);
+pub struct AppRef<'a> {
+    app: Option<Ref<'a, App>>,
+    app_cell: &'a AppCell,
+}
+
+impl Deref for AppRef<'_> {
+    type Target = App;
+
+    fn deref(&self) -> &Self::Target {
+        self.app
+            .as_ref()
+            .expect("AppRef dereferenced after its borrow was released")
+    }
+}
 
 impl Drop for AppRef<'_> {
     fn drop(&mut self) {
+        self.app.take();
+        if let Ok(mut app) = self.app_cell.app.try_borrow_mut() {
+            drain_deferred_updates(&mut app, &self.app_cell.deferred_updates);
+        }
         if option_env!("TRACK_THREAD_BORROWS").is_some() {
             let thread_id = std::thread::current().id();
             eprintln!("dropped borrow from {thread_id:?}");
@@ -131,10 +171,16 @@ impl Drop for AppRef<'_> {
 
 #[doc(hidden)]
 #[derive(Deref, DerefMut)]
-pub struct AppRefMut<'a>(RefMut<'a, App>);
+pub struct AppRefMut<'a> {
+    #[deref]
+    #[deref_mut]
+    app: RefMut<'a, App>,
+    deferred_updates: &'a RefCell<Vec<DeferredAppUpdate>>,
+}
 
 impl Drop for AppRefMut<'_> {
     fn drop(&mut self) {
+        drain_deferred_updates(&mut self.app, self.deferred_updates);
         if option_env!("TRACK_THREAD_BORROWS").is_some() {
             let thread_id = std::thread::current().id();
             eprintln!("dropped {thread_id:?}");
@@ -873,46 +919,44 @@ impl App {
                 #[cfg(any(test, feature = "leak-detection"))]
                 _ref_counts,
             }),
+            deferred_updates: RefCell::new(Vec::new()),
         });
 
         init_app_menus(platform.as_ref(), &app.borrow());
         SystemWindowTabController::init(&mut app.borrow_mut());
 
         platform.on_keyboard_layout_change(Box::new({
-            let app = Rc::downgrade(&app);
+            let cx = app.borrow().to_async();
             move || {
-                if let Some(app) = app.upgrade() {
-                    let cx = &mut app.borrow_mut();
+                cx.update_or_defer(|cx| {
                     cx.keyboard_layout = cx.platform.keyboard_layout();
                     cx.keyboard_mapper = cx.platform.keyboard_mapper();
                     cx.keyboard_layout_observers
                         .clone()
                         .retain(&(), move |callback| (callback)(cx));
-                }
+                });
             }
         }));
 
         platform.on_thermal_state_change(Box::new({
-            let app = Rc::downgrade(&app);
+            let cx = app.borrow().to_async();
             move || {
-                if let Some(app) = app.upgrade() {
-                    let cx = &mut app.borrow_mut();
+                cx.update_or_defer(|cx| {
                     cx.thermal_state_observers
                         .clone()
                         .retain(&(), move |callback| (callback)(cx));
-                }
+                });
             }
         }));
 
         platform.on_system_wake(Box::new({
-            let app = Rc::downgrade(&app);
+            let cx = app.borrow().to_async();
             move || {
-                if let Some(app) = app.upgrade() {
-                    let cx = &mut app.borrow_mut();
+                cx.update_or_defer(|cx| {
                     cx.system_wake_observers
                         .clone()
                         .retain(&(), move |callback| (callback)(cx));
-                }
+                });
             }
         }));
 
@@ -2656,27 +2700,25 @@ impl App {
         self.loading_assets.contains_key(&asset_id)
     }
 
-    /// Asynchronously load an asset, if the asset hasn't finished loading this will return None.
+    /// Starts loading an uncached asset and returns its result once available.
     ///
-    /// Note that the multiple calls to this method will only result in one `Asset::load` call at a
-    /// time, and the results of this call will be cached
-    pub fn fetch_asset<A: Asset>(&mut self, source: &A::Source) -> (Shared<Task<A::Output>>, bool) {
+    /// Pending loads and completed results are cached until [`Self::remove_asset`].
+    /// This method does not subscribe a view to completion notifications.
+    pub fn fetch_asset<A: Asset>(&mut self, source: &A::Source) -> Option<A::Output> {
+        self.asset_entry::<A>(source).get()
+    }
+
+    pub(crate) fn asset_entry<A: Asset>(&mut self, source: &A::Source) -> &CachedLoad<A::Output> {
         let asset_id = (TypeId::of::<A>(), hash(source));
-        let mut is_first = false;
-        let task = self
-            .loading_assets
-            .remove(&asset_id)
-            .map(|boxed_task| *boxed_task.downcast::<Shared<Task<A::Output>>>().unwrap())
-            .unwrap_or_else(|| {
-                is_first = true;
-                let future = A::load(source.clone(), self);
-
-                self.background_executor().spawn(future).shared()
-            });
-
-        self.loading_assets.insert(asset_id, Box::new(task.clone()));
-
-        (task, is_first)
+        if !self.loading_assets.contains_key(&asset_id) {
+            let future = A::load(source.clone(), self);
+            let entry = CachedLoad::new(future, self);
+            self.loading_assets.insert(asset_id, Box::new(entry));
+        }
+        self.loading_assets
+            .get(&asset_id)
+            .and_then(|entry| entry.downcast_ref())
+            .expect("asset cache entries are keyed by their asset type")
     }
 
     /// Obtain a new [`FocusHandle`], which allows you to track and manipulate the keyboard focus
@@ -3135,6 +3177,30 @@ mod test {
         cx.to_async().refresh();
 
         assert_eq!(render_count.get(), render_count_before_refresh + 1);
+    }
+
+    #[test]
+    fn reentrant_app_updates_are_deferred_until_the_current_borrow_ends() {
+        let cx = TestAppContext::single();
+        let async_cx = cx.to_async();
+        let nested_cx = async_cx.clone();
+        let observed = Rc::new(RefCell::new(Vec::new()));
+
+        cx.update({
+            let observed = observed.clone();
+            move |_| {
+                async_cx.update_or_defer({
+                    let observed = observed.clone();
+                    move |_| {
+                        observed.borrow_mut().push(1);
+                        nested_cx.update_or_defer(move |_| observed.borrow_mut().push(2));
+                    }
+                });
+                assert!(observed.borrow().is_empty());
+            }
+        });
+
+        assert_eq!(*observed.borrow(), [1, 2]);
     }
 
     #[test]

@@ -1,7 +1,6 @@
 use crate::display::WebDisplay;
 use crate::events::{
-    ClickState, EventListenerHandle, TouchIds, TouchPointerState, WebEventListeners,
-    is_mac_platform,
+    ClickState, EventListenerHandle, TouchIds, WebEventListeners, is_mac_platform,
 };
 use crate::ime_mirror::ImeMirror;
 use crate::platform::WebWindowLifecycle;
@@ -12,9 +11,9 @@ use gpui::{
     AnyWindowHandle, Bounds, Capslock, ClipboardItem, Decorations, DevicePixels,
     DispatchEventResult, GpuSpecs, Modifiers, MouseButton, Pixels, PlatformAtlas, PlatformDisplay,
     PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
-    RequestFrameOptions, ResizeEdge, Scene, Size, TextInputConfiguration, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
-    WindowParams, px,
+    RequestFrameOptions, ResizeEdge, Scene, Size, TextInputConfiguration, TextInputStateChange,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls,
+    WindowDecorations, WindowParams, px,
 };
 use gpui_wgpu::{WgpuContext, WgpuRenderer, WgpuSurfaceConfig, wgpu};
 use wasm_bindgen::prelude::*;
@@ -59,12 +58,10 @@ pub(crate) struct WebWindowInner {
     pub(crate) click_state: RefCell<ClickState>,
     pub(crate) touch_ids: RefCell<TouchIds>,
     pub(crate) pressed_button: Cell<Option<MouseButton>>,
-    pub(crate) active_touch: RefCell<Option<TouchPointerState>>,
     pub(crate) soft_keyboard_requested: Cell<bool>,
     pub(crate) last_physical_size: Cell<(u32, u32)>,
     pub(crate) notify_scale: Cell<bool>,
     pub(crate) is_composing: Cell<bool>,
-    pub(crate) last_cursor_css: Rc<Cell<&'static str>>,
     pub(crate) pending_clipboard: Rc<RefCell<Option<ClipboardItem>>>,
     pub(crate) owned_clipboard: Rc<RefCell<Option<ClipboardItem>>>,
     keyboard_accessory: Option<KeyboardAccessory>,
@@ -166,7 +163,6 @@ impl WebWindow {
         browser_window: web_sys::Window,
         lifecycle: Rc<Cell<WebWindowLifecycle>>,
         active_window: Rc<RefCell<Option<AnyWindowHandle>>>,
-        last_cursor_css: Rc<Cell<&'static str>>,
         pending_clipboard: Rc<RefCell<Option<ClipboardItem>>>,
         owned_clipboard: Rc<RefCell<Option<ClipboardItem>>>,
     ) -> anyhow::Result<Self> {
@@ -227,12 +223,10 @@ impl WebWindow {
             click_state: RefCell::new(ClickState::default()),
             touch_ids: RefCell::new(TouchIds::default()),
             pressed_button: Cell::new(None),
-            active_touch: RefCell::new(None),
             soft_keyboard_requested: Cell::new(false),
             last_physical_size: Cell::new((0, 0)),
             notify_scale: Cell::new(false),
             is_composing: Cell::new(false),
-            last_cursor_css,
             pending_clipboard,
             owned_clipboard,
             keyboard_accessory,
@@ -504,7 +498,6 @@ impl WebWindowInner {
                     .unwrap_or(true);
 
                 if !is_visible {
-                    this.cancel_active_touch(None);
                     this.cancel_active_touches();
                 }
 
@@ -1074,6 +1067,14 @@ impl PlatformWindow for WebWindow {
 
     fn set_text_input_configuration(&mut self, configuration: TextInputConfiguration) {
         self.inner.ime_mirror.apply_configuration(&configuration);
+    }
+
+    fn text_input_state_changed(&self, change: TextInputStateChange) {
+        match change {
+            TextInputStateChange::FocusGained => self.inner.sync_virtual_keyboard(true),
+            TextInputStateChange::FocusLost => self.inner.sync_virtual_keyboard(false),
+            TextInputStateChange::SelectionChanged | TextInputStateChange::ContentChanged => {}
+        }
     }
 
     fn prompt(

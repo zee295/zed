@@ -10,8 +10,8 @@ use db::kvp::KeyValueStore;
 use gpui::{
     Action, Anchor, AnyView, App, Axis, Context, Entity, EntityId, EventEmitter, FocusHandle,
     Focusable, IntoElement, KeyContext, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement,
-    Render, SharedString, StyleRefinement, Styled, Subscription, WeakEntity, Window, deferred, div,
-    px,
+    Render, SharedString, StyleRefinement, Styled, Subscription, TouchDragEvent, TouchPhase,
+    WeakEntity, Window, deferred, div, px,
 };
 use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore, TerminalDockPosition};
@@ -1292,6 +1292,7 @@ impl Render for Dock {
         let dispatch_context = Self::dispatch_context();
         if let Some(entry) = self.visible_entry() {
             let position = self.position;
+            let workspace = self.workspace.clone();
             let resize_handle_size = if cfg!(target_family = "wasm")
                 && window.viewport_size().width <= MOBILE_VIEWPORT_MAX_WIDTH
             {
@@ -1305,6 +1306,25 @@ impl Render for Dock {
                     .on_drag(DraggedDock(position), |dock, _, _, cx| {
                         cx.stop_propagation();
                         cx.new(|_| dock.clone())
+                    })
+                    .on_touch_drag(move |event: &TouchDragEvent, window, cx| {
+                        match event.phase {
+                            TouchPhase::Started => window.prevent_default(),
+                            TouchPhase::Moved => {
+                                workspace
+                                    .update(cx, |workspace, cx| {
+                                        workspace.resize_dock_at(
+                                            position,
+                                            event.position,
+                                            window,
+                                            cx,
+                                        );
+                                    })
+                                    .ok();
+                            }
+                            TouchPhase::Ended | TouchPhase::Cancelled => {}
+                        }
+                        cx.stop_propagation();
                     })
                     .on_mouse_down(
                         MouseButton::Left,

@@ -247,13 +247,13 @@ async fn load_extension(request: &Request, cx: &mut gpui::AsyncApp) -> Result<Wa
         .context("invalid extension directory")?;
     let manifest = Arc::new(
         ExtensionManifest::load(
-            Arc::new(RealFs::new(None, cx.background_executor().clone())),
+            RealFs::new(None, cx.background_executor().clone()),
             &extension_dir,
         )
         .await?,
     );
     let http = Arc::new(ReqwestClient::user_agent(USER_AGENT)?);
-    let fs: Arc<dyn Fs> = Arc::new(RealFs::new(None, cx.background_executor().clone()));
+    let fs: Arc<dyn Fs> = RealFs::new(None, cx.background_executor().clone());
     let node_runtime = NodeRuntime::new(
         http.clone(),
         None,
@@ -285,6 +285,7 @@ async fn execute(extension: &WasmExtension, request: Request) -> Result<Value> {
             .worktree_env
             .unwrap_or_else(|| std::env::vars().collect()),
     });
+    let language_server_status_source = gpui::EntityId::from(worktree.id().max(1));
     let server_id = request
         .language_server_id
         .map(|name| LanguageServerName(name.into()));
@@ -297,7 +298,12 @@ async fn execute(extension: &WasmExtension, request: Request) -> Result<Value> {
                 .map(|name| LanguageName::new(&name))
                 .context("missing language_name")?;
             let command = extension
-                .language_server_command(server_id, language, worktree)
+                .language_server_command(
+                    server_id,
+                    language,
+                    worktree,
+                    language_server_status_source,
+                )
                 .await?;
             let command_path = extension.path_from_extension(&command.command);
             Ok(json!({
@@ -313,7 +319,12 @@ async fn execute(extension: &WasmExtension, request: Request) -> Result<Value> {
                 .map(|name| LanguageName::new(&name))
                 .context("missing language_name")?;
             let value = extension
-                .language_server_initialization_options(server_id, language, worktree)
+                .language_server_initialization_options(
+                    server_id,
+                    language,
+                    worktree,
+                    language_server_status_source,
+                )
                 .await?;
             Ok(json!(value))
         }
@@ -321,7 +332,11 @@ async fn execute(extension: &WasmExtension, request: Request) -> Result<Value> {
             let server_id = server_id.context("missing language_server_id")?;
             Ok(json!(
                 extension
-                    .language_server_workspace_configuration(server_id, worktree)
+                    .language_server_workspace_configuration(
+                        server_id,
+                        worktree,
+                        language_server_status_source,
+                    )
                     .await?
             ))
         }
@@ -329,7 +344,11 @@ async fn execute(extension: &WasmExtension, request: Request) -> Result<Value> {
             let server_id = server_id.context("missing language_server_id")?;
             Ok(json!(
                 extension
-                    .language_server_initialization_options_schema(server_id, worktree)
+                    .language_server_initialization_options_schema(
+                        server_id,
+                        worktree,
+                        language_server_status_source,
+                    )
                     .await?
             ))
         }
@@ -337,7 +356,11 @@ async fn execute(extension: &WasmExtension, request: Request) -> Result<Value> {
             let server_id = server_id.context("missing language_server_id")?;
             Ok(json!(
                 extension
-                    .language_server_workspace_configuration_schema(server_id, worktree)
+                    .language_server_workspace_configuration_schema(
+                        server_id,
+                        worktree,
+                        language_server_status_source,
+                    )
                     .await?
             ))
         }
@@ -350,11 +373,21 @@ async fn execute(extension: &WasmExtension, request: Request) -> Result<Value> {
                 .context("missing target_language_server_id")?;
             let value = if request.method.ends_with("initialization_options") {
                 extension
-                    .language_server_additional_initialization_options(server_id, target, worktree)
+                    .language_server_additional_initialization_options(
+                        server_id,
+                        target,
+                        worktree,
+                        language_server_status_source,
+                    )
                     .await?
             } else {
                 extension
-                    .language_server_additional_workspace_configuration(server_id, target, worktree)
+                    .language_server_additional_workspace_configuration(
+                        server_id,
+                        target,
+                        worktree,
+                        language_server_status_source,
+                    )
                     .await?
             };
             Ok(json!(value))

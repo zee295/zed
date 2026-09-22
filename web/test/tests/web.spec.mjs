@@ -96,6 +96,81 @@ test("restores panel visibility after reload", async ({ browser, baseURL }) => {
   await context.close();
 });
 
+test("resizes mobile docks without re-entering entity updates", async ({
+  browser,
+  baseURL,
+}) => {
+  const context = await browser.newContext({
+    viewport: { width: 412, height: 915 },
+    deviceScaleFactor: 2,
+    isMobile: true,
+    hasTouch: true,
+  });
+  await authenticate(context, baseURL);
+  await context.addInitScript(() => {
+    localStorage.setItem("zed-web-agent-panel-open", "true");
+    localStorage.setItem("zed-web-workspace-sidebar-open", "true");
+  });
+
+  const page = await context.newPage();
+  const failures = [];
+  page.on("console", (message) => {
+    if (
+      message.type() === "error" &&
+      /panicked|already (?:mutably )?borrowed|already being updated|DataView|RuntimeError: unreachable/.test(
+        message.text(),
+      )
+    ) {
+      failures.push(message.text());
+    }
+  });
+  page.on("pageerror", (error) => failures.push(error.message));
+
+  await page.goto(baseURL);
+  await expect(page).toHaveTitle(/Zed Remote . Workspace/, {
+    timeout: 90_000,
+  });
+  await expect
+    .poll(() => page.evaluate(() => self.__zedRpcConnectionState))
+    .toBe("open");
+  await expect(page.locator("canvas").first()).toBeVisible({ timeout: 90_000 });
+
+  const cdp = await context.newCDPSession(page);
+  for (let index = 0; index < 12; index += 1) {
+    await page.mouse.move(330, 330);
+    await page.mouse.wheel(0, 900);
+
+    const startX = [3, 10, 20, 195, 386, 401][index % 6];
+    await cdp.send("Input.dispatchTouchEvent", {
+      type: "touchStart",
+      touchPoints: [{ x: startX, y: 320, id: 1 }],
+    });
+    for (let step = 1; step <= 5; step += 1) {
+      const deltaX = index % 2 === 0 ? step * 7 : -step * 7;
+      await cdp.send("Input.dispatchTouchEvent", {
+        type: "touchMove",
+        touchPoints: [
+          {
+            x: Math.max(1, Math.min(410, startX + deltaX)),
+            y: 320 + step * 16,
+            id: 1,
+          },
+        ],
+      });
+    }
+    await cdp.send("Input.dispatchTouchEvent", {
+      type: "touchEnd",
+      touchPoints: [],
+    });
+  }
+
+  await expect
+    .poll(() => page.evaluate(() => self.__zedRpcConnectionState))
+    .toBe("open");
+  expect(failures).toEqual([]);
+  await context.close();
+});
+
 test("accepts pasted images exposed only through clipboard files", async ({
   browser,
   baseURL,

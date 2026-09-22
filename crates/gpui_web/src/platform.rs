@@ -417,7 +417,6 @@ impl Platform for WebPlatform {
             self.browser_window.clone(),
             self.window_lifecycle.clone(),
             self.active_window.clone(),
-            self.last_cursor_css.clone(),
             self.pending_clipboard.clone(),
             self.owned_clipboard.clone(),
         );

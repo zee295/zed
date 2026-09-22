@@ -615,6 +615,18 @@ impl Fs for RemoteFs {
             .collect())
     }
 
+    fn path_exists(&self, _: &std::path::Path) -> bool {
+        false
+    }
+
+    fn is_path_case_sensitive(&self, _: &std::path::Path) -> bool {
+        true
+    }
+
+    fn requires_poll_watcher(&self, _: &std::path::Path) -> bool {
+        false
+    }
+
     async fn watch(
         &self,
         path: &std::path::Path,
