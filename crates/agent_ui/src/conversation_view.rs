@@ -2956,6 +2956,11 @@ impl ConversationView {
             return;
         }
 
+        if cfg!(target_family = "wasm") {
+            window.request_attention();
+            return;
+        }
+
         let Some(root_thread) = self.root_thread_view() else {
             return;
         };

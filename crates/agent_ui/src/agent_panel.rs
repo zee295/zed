@@ -2748,6 +2748,10 @@ impl AgentPanel {
         if self.terminal_status_visible(terminal_id, window, cx) {
             return;
         }
+        if cfg!(target_family = "wasm") {
+            window.request_attention();
+            return;
+        }
         let settings = AgentSettings::get_global(cx);
         match settings.notify_when_agent_waiting {
             NotifyWhenAgentWaiting::PrimaryScreen => {
