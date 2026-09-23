@@ -44,11 +44,14 @@ install -m 0755 \
 export CARGO_TARGET_DIR="${wasm_target}"
 export RUSTFLAGS='--cfg getrandom_backend="wasm_js" -C target-feature=+atomics,+bulk-memory,+mutable-globals -C link-arg=--shared-memory -C link-arg=--import-memory -C link-arg=--initial-memory=134217728 -C link-arg=--max-memory=4294967296 -C link-arg=--export=__heap_base -C link-arg=--export=__stack_pointer -C link-arg=--export=__tls_size -C link-arg=--export=__tls_align -C link-arg=--export=__tls_base -C link-arg=--export=__wasm_init_tls -C link-arg=--export=__wasm_call_ctors'
 
-if [[ ! -x "${wasi_sdk}/bin/clang" ]]; then
-    "${repo_dir}/script/download-wasi-sdk"
+if [[ -z "${WASI_SDK_PATH:-}" ]]; then
+    (cd "${repo_dir}" && ./script/download-wasi-sdk)
+elif [[ ! -x "${wasi_sdk}/bin/clang" ]]; then
+    printf 'WASI SDK clang not found at %s\n' "${wasi_sdk}/bin/clang" >&2
+    exit 1
 fi
 export CC_wasm32_unknown_unknown="${wasi_sdk}/bin/clang"
-export CFLAGS_wasm32_unknown_unknown="-isystem ${wasi_sdk}/share/wasi-sysroot/include/wasm32-wasi"
+export CFLAGS_wasm32_unknown_unknown="--target=wasm32-wasip1 -isystem ${wasi_sdk}/share/wasi-sysroot/include/wasm32-wasip1"
 
 rustup run "${nightly_toolchain}" cargo build \
     --manifest-path "${repo_dir}/Cargo.toml" \

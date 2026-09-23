@@ -53,7 +53,7 @@ jobs:
       - name: Check WASM frontend
         env:
           CC_wasm32_unknown_unknown: ${{ github.workspace }}/target/wasi-sdk/bin/clang
-          CFLAGS_wasm32_unknown_unknown: -isystem ${{ github.workspace }}/target/wasi-sdk/share/wasi-sysroot/include/wasm32-wasi
+          CFLAGS_wasm32_unknown_unknown: --target=wasm32-wasip1 -isystem ${{ github.workspace }}/target/wasi-sdk/share/wasi-sysroot/include/wasm32-wasip1
         run: >-
           cargo +nightly check -p zed_web_workspace
           --target wasm32-unknown-unknown
