@@ -62,7 +62,7 @@ enum MainThreadItem {
 
 struct MainThreadMailbox {
     sender: PriorityQueueSender<MainThreadItem>,
-    receiver: parking_lot::Mutex<PriorityQueueReceiver<MainThreadItem>>,
+    receiver: std::sync::Mutex<PriorityQueueReceiver<MainThreadItem>>,
     signal: AtomicI32,
 }
 
@@ -71,7 +71,7 @@ impl MainThreadMailbox {
         let (sender, receiver) = PriorityQueueReceiver::new();
         Self {
             sender,
-            receiver: parking_lot::Mutex::new(receiver),
+            receiver: std::sync::Mutex::new(receiver),
             signal: AtomicI32::new(0),
         }
     }
@@ -94,7 +94,11 @@ impl MainThreadMailbox {
         const MAX_DRAIN_MILLIS: f64 = 4.0;
 
         let started_at = window.performance().map(|performance| performance.now());
-        let mut receiver = self.receiver.lock();
+        // Only the main thread accesses this receiver; never park if that changes.
+        let mut receiver = self
+            .receiver
+            .try_lock()
+            .expect("main-thread mailbox receiver must not be locked");
         for index in 0..MAX_ITEMS_PER_DRAIN {
             // We need these `spin` variants because we can't acquire a lock on the main thread.
             // TODO-WASM: Should we do something different?

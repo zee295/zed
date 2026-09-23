@@ -193,7 +193,7 @@ server paths and open them by their container path. Set
 
 Host prerequisites:
 
-- Rust `1.97.1`
+- Rust `1.98.1`
 - Rust nightly with `rust-src`
 - `wasm32-unknown-unknown`
 - `wasm-bindgen-cli 0.2.127`

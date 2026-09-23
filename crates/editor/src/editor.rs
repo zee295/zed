@@ -369,7 +369,7 @@ pub fn init(cx: &mut App) {
     workspace::register_serializable_item::<Editor>(cx);
 
     cx.observe_new(
-        |workspace: &mut Workspace, _: Option<&mut Window>, _cx: &mut Context<Workspace>| {
+        |workspace: &mut Workspace, window: Option<&mut Window>, cx: &mut Context<Workspace>| {
             workspace.register_action(Editor::new_file);
             workspace.register_action(Editor::new_file_split);
             workspace.register_action(Editor::new_file_vertical);
@@ -377,6 +377,19 @@ pub fn init(cx: &mut App) {
             workspace.register_action(Editor::cancel_language_server_work);
             workspace.register_action(Editor::toggle_focus);
             workspace.register_action(Editor::view_bookmarks);
+            if let Some(window) = window {
+                cx.subscribe_in(
+                    workspace.project(),
+                    window,
+                    |workspace, _, event, window, cx| {
+                        if let project::Event::LanguageServerShowDocument(request) = event {
+                            items::handle_lsp_show_document(workspace, request, window, cx)
+                                .detach();
+                        }
+                    },
+                )
+                .detach();
+            }
         },
     )
     .detach();
@@ -1719,6 +1732,8 @@ struct GutterButtonTooltip {
     primary: GutterButtonIntent,
     secondary: GutterButtonIntent,
     focus_handle: FocusHandle,
+    #[cfg(test)]
+    on_render: Option<Rc<RefCell<Vec<(String, String)>>>>,
 }
 
 impl GutterButtonTooltip {
@@ -1730,7 +1745,7 @@ impl GutterButtonTooltip {
         }
     }
 
-    fn meta_text(&self, intent: GutterButtonIntent) -> String {
+    fn meta_text(&self) -> String {
         const RIGHT_CLICK_HINT: &str = "right-click for more options";
 
         if self.primary == self.secondary {
@@ -1740,11 +1755,11 @@ impl GutterButtonTooltip {
             modifiers: Modifiers::secondary_key(),
             ..Default::default()
         };
-        let other = match intent {
-            GutterButtonIntent::SetBookmark => "breakpoint",
-            GutterButtonIntent::SetBreakpoint => "bookmark",
+        let secondary = match self.secondary {
+            GutterButtonIntent::SetBookmark => "bookmark",
+            GutterButtonIntent::SetBreakpoint => "breakpoint",
         };
-        format!("{modifier_as_text}-click to add a {other}\n{RIGHT_CLICK_HINT}")
+        format!("{modifier_as_text}-click to add a {secondary}\n{RIGHT_CLICK_HINT}")
     }
 }
 
@@ -1752,7 +1767,14 @@ impl Render for GutterButtonTooltip {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let intent = self.active_intent(window.modifiers());
         let key_binding = KeyBinding::for_action_in(intent.action(), &self.focus_handle, cx);
-        let meta_text = self.meta_text(intent);
+        let meta_text = self.meta_text();
+
+        #[cfg(test)]
+        if let Some(on_render) = &self.on_render {
+            on_render
+                .borrow_mut()
+                .push((intent.as_str().to_owned(), meta_text.clone()));
+        }
 
         tooltip_container(cx, move |this, _| {
             this.child(
@@ -2071,6 +2093,9 @@ impl Editor {
                     project::Event::RefreshDocumentLinks { .. } => {
                         editor.refresh_document_links(None, cx);
                     }
+                    project::Event::RefreshDocumentHighlights { server_id } => {
+                        editor.refresh_document_highlights_for_server(*server_id, cx);
+                    }
                     project::Event::RefreshFoldingRanges { .. } => {
                         editor.refresh_folding_ranges(None, window, cx);
                     }
@@ -2095,6 +2120,7 @@ impl Editor {
                         editor.refresh_runnables(None, window, cx);
                         editor.update_lsp_data(None, window, cx);
                         editor.refresh_inlay_hints(InlayHintRefreshReason::ServerRemoved, cx);
+                        editor.refresh_document_highlights(cx);
                     }
                     project::Event::SnippetEdit(id, snippet_edits) => {
                         // todo(lw): Non singletons
@@ -3796,6 +3822,33 @@ impl Editor {
         None
     }
 
+    fn refresh_document_highlights_for_server(
+        &mut self,
+        server_id: Option<LanguageServerId>,
+        cx: &mut Context<Self>,
+    ) {
+        let server_relevant = server_id.is_none_or(|server_id| {
+            let Some(project) = self.project.as_ref() else {
+                return false;
+            };
+            let cursor_position = self.selections.newest_anchor().head();
+            self.buffer
+                .read(cx)
+                .text_anchor_for_position(cursor_position, cx)
+                .is_some_and(|(cursor_buffer, _)| {
+                    project
+                        .read(cx)
+                        .lsp_store()
+                        .read(cx)
+                        .relevant_server_ids_for_capability_check(&cursor_buffer, cx)
+                        .contains(&server_id)
+                })
+        });
+        if server_relevant {
+            self.refresh_document_highlights(cx);
+        }
+    }
+
     fn prepare_highlight_query_from_selection(
         &mut self,
         snapshot: &DisplaySnapshot,
@@ -4781,6 +4834,8 @@ impl Editor {
                         primary,
                         secondary,
                         focus_handle: focus_handle.clone(),
+                        #[cfg(test)]
+                        on_render: None,
                     })
                     .into()
                 })
@@ -9289,19 +9344,22 @@ impl Editor {
         self.highlighted_rows
             .values()
             .flat_map(|highlighted_rows| {
-                let start_index = highlighted_rows.partition_point(|highlight| {
-                    highlight
-                        .range
-                        .end
-                        .cmp(&anchor_range.start, buffer_snapshot)
-                        .is_lt()
-                });
                 let end_index = highlighted_rows.partition_point(|highlight| {
                     highlight
                         .range
                         .start
                         .cmp(&anchor_range.end, buffer_snapshot)
                         .is_le()
+                });
+                // Search within `..end_index` so a highlight whose anchors
+                // have drifted to `start > end` can't produce an inverted
+                // slice; the filter below drops it either way.
+                let start_index = highlighted_rows[..end_index].partition_point(|highlight| {
+                    highlight
+                        .range
+                        .end
+                        .cmp(&anchor_range.start, buffer_snapshot)
+                        .is_lt()
                 });
                 highlighted_rows[start_index..end_index]
                     .iter()
@@ -10077,6 +10135,7 @@ impl Editor {
                     self.invalidate_semantic_tokens(Some(*buffer_id));
                     self.update_lsp_data(Some(*buffer_id), window, cx);
                     self.refresh_inlay_hints(InlayHintRefreshReason::ServerRemoved, cx);
+                    self.refresh_document_highlights(cx);
                 }
                 jsx_tag_auto_close::refresh_enabled_in_any_buffer(self, multibuffer, cx);
                 cx.emit(EditorEvent::Reparsed(*buffer_id));

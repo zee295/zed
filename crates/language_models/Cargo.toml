@@ -61,6 +61,7 @@ ui.workspace = true
 ui_input.workspace = true
 util.workspace = true
 x_ai = { workspace = true, features = ["schemars"] }
+x_ai_subscribed.workspace = true
 
 # Native-only: AWS Bedrock + Tokio multi-thread + extension_host (wasmtime).
 # Browser wasm keeps host-side LLM via Agent::* RPC instead.

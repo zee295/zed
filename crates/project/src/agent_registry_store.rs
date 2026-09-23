@@ -39,6 +39,7 @@ pub struct RegistryAgentMetadata {
     pub version: SharedString,
     pub repository: Option<SharedString>,
     pub website: Option<SharedString>,
+    pub license_url: Option<SharedString>,
     pub icon_path: Option<SharedString>,
 }
 
@@ -93,6 +94,10 @@ impl RegistryAgent {
 
     pub fn website(&self) -> Option<&SharedString> {
         self.metadata().website.as_ref()
+    }
+
+    pub fn license_url(&self) -> Option<&SharedString> {
+        self.metadata().license_url.as_ref()
     }
 
     pub fn icon_path(&self) -> Option<&SharedString> {
@@ -403,6 +408,7 @@ async fn build_registry_agents(
             version: entry.version.into(),
             repository: entry.repository.map(Into::into),
             website: entry.website.map(Into::into),
+            license_url: entry.license_url.map(Into::into),
             icon_path,
         };
 
@@ -653,6 +659,8 @@ struct RegistryEntry {
     repository: Option<String>,
     #[serde(default)]
     website: Option<String>,
+    #[serde(default)]
+    license_url: Option<String>,
     #[serde(default)]
     icon: Option<String>,
     distribution: RegistryDistribution,

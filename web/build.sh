@@ -9,7 +9,7 @@ native_target="${ZED_WEB_NATIVE_TARGET:-${repo_dir}/target/web-native}"
 wasm_target="${CARGO_TARGET_DIR:-${repo_dir}/target/web-wasm}"
 wasi_sdk="${WASI_SDK_PATH:-${repo_dir}/target/wasi-sdk}"
 profile="${ZED_WEB_PROFILE:-web-release}"
-stable_toolchain="${RUST_STABLE_TOOLCHAIN:-1.97.1}"
+stable_toolchain="${RUST_STABLE_TOOLCHAIN:-1.98.1}"
 nightly_toolchain="${RUST_NIGHTLY_TOOLCHAIN:-nightly}"
 wasm_bindgen_version="${WASM_BINDGEN_VERSION:-0.2.127}"
 
