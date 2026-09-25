@@ -14,7 +14,7 @@ mod workspace_state;
 
 use std::{
     net::SocketAddr,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::Arc,
 };
 
@@ -22,16 +22,19 @@ use anyhow::{Context as _, Result};
 use axum::{
     Router,
     body::{Body, Bytes, boxed},
-    extract::{ConnectInfo, Form, OriginalUri, Path as AxumPath, State, WebSocketUpgrade},
+    extract::{
+        ConnectInfo, DefaultBodyLimit, Form, Multipart, OriginalUri, Path as AxumPath, State,
+        WebSocketUpgrade,
+    },
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware,
     response::{Html, IntoResponse, Redirect, Response},
-    routing::{any, get},
+    routing::{any, get, post},
 };
 use clap::Parser;
 use rand::RngCore as _;
-use serde::Deserialize;
-use tokio::fs;
+use serde::{Deserialize, Serialize};
+use tokio::{fs, io::AsyncWriteExt as _};
 
 #[derive(Parser)]
 #[command(about = "Native backend for Zed Web")]
@@ -131,6 +134,10 @@ async fn main() -> Result<()> {
     let protected = Router::new()
         .route("/rpc", get(websocket))
         .route("/sql", axum::routing::post(sql_http))
+        .route(
+            "/upload",
+            post(upload_files).layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
+        )
         .route("/proxy/:provider/*rest", any(proxy_http))
         .route("/", get(index))
         .route("/*path", get(static_file))
@@ -355,6 +362,99 @@ async fn logout(State(state): State<AppState>) -> Response {
 
 async fn favicon() -> Response {
     security_headers(StatusCode::NO_CONTENT.into_response())
+}
+
+#[derive(Serialize)]
+struct UploadResponse {
+    paths: Vec<String>,
+    roots: Vec<String>,
+}
+
+async fn upload_files(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> Result<axum::Json<UploadResponse>, (StatusCode, String)> {
+    let upload_root = state
+        .root
+        .join(".zed")
+        .join("browser-uploads")
+        .join(uuid::Uuid::new_v4().to_string());
+    fs::create_dir_all(&upload_root)
+        .await
+        .map_err(internal_upload_error)?;
+
+    let mut paths = Vec::new();
+    let mut roots = Vec::new();
+    while let Some(mut field) = multipart.next_field().await.map_err(bad_upload_request)? {
+        if field.name() != Some("files") {
+            continue;
+        }
+        let Some(filename) = field.file_name().map(str::to_owned) else {
+            continue;
+        };
+        let relative_path = safe_upload_path(&filename).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid upload path: {filename}"),
+            )
+        })?;
+        let destination = upload_root.join(&relative_path);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(internal_upload_error)?;
+        }
+        let mut output = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&destination)
+            .await
+            .map_err(internal_upload_error)?;
+        while let Some(chunk) = field.chunk().await.map_err(bad_upload_request)? {
+            output
+                .write_all(&chunk)
+                .await
+                .map_err(internal_upload_error)?;
+        }
+
+        paths.push(destination.to_string_lossy().into_owned());
+        if let Some(first_component) = relative_path.components().next() {
+            let root = upload_root.join(first_component.as_os_str());
+            let root = root.to_string_lossy().into_owned();
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+    }
+
+    if paths.is_empty() {
+        let _ = fs::remove_dir_all(&upload_root).await;
+        return Err((StatusCode::BAD_REQUEST, "no files were uploaded".into()));
+    }
+
+    Ok(axum::Json(UploadResponse { paths, roots }))
+}
+
+fn safe_upload_path(filename: &str) -> Option<PathBuf> {
+    let normalized = filename.replace('\\', "/");
+    let mut result = PathBuf::new();
+    for component in Path::new(&normalized).components() {
+        match component {
+            Component::Normal(component) => result.push(component),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    (!result.as_os_str().is_empty()).then_some(result)
+}
+
+fn bad_upload_request(error: impl std::fmt::Display) -> (StatusCode, String) {
+    (StatusCode::BAD_REQUEST, error.to_string())
+}
+
+fn internal_upload_error(error: impl std::fmt::Display) -> (StatusCode, String) {
+    tracing::error!(%error, "browser upload failed");
+    (StatusCode::INTERNAL_SERVER_ERROR, "upload failed".into())
 }
 
 async fn websocket(
@@ -904,5 +1004,25 @@ mod tests {
             canonical_workspace_location(&uri, Path::new("/workspace")),
             None
         );
+    }
+
+    #[test]
+    fn accepts_safe_browser_upload_paths() {
+        assert_eq!(
+            safe_upload_path("folder/nested/file.txt"),
+            Some(PathBuf::from("folder/nested/file.txt"))
+        );
+        assert_eq!(
+            safe_upload_path("folder\\nested\\file.txt"),
+            Some(PathBuf::from("folder/nested/file.txt"))
+        );
+    }
+
+    #[test]
+    fn rejects_browser_upload_path_traversal() {
+        assert_eq!(safe_upload_path("../secret"), None);
+        assert_eq!(safe_upload_path("folder/../../secret"), None);
+        assert_eq!(safe_upload_path("/absolute/path"), None);
+        assert_eq!(safe_upload_path(""), None);
     }
 }

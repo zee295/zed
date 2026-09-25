@@ -17,6 +17,7 @@ use gpui::{
     WindowKind, WindowParams, popup::PopupNotSupportedError,
 };
 use gpui_wgpu::{PreparedWebGraphics, WebBackendPreference, WgpuContext, wgpu};
+use serde::Deserialize;
 use std::{
     cell::{Cell, RefCell},
     path::{Path, PathBuf},
@@ -87,6 +88,76 @@ impl PlatformGestures for WebGestures {
 struct PreparedWebWindow {
     canvas: web_sys::HtmlCanvasElement,
     surface: wgpu::Surface<'static>,
+}
+
+#[derive(Deserialize)]
+struct BrowserUploadResponse {
+    paths: Vec<String>,
+    roots: Vec<String>,
+}
+
+async fn upload_browser_files(
+    files: Vec<web_sys::File>,
+    directories_only: bool,
+) -> Result<Option<Vec<PathBuf>>> {
+    if files.is_empty() {
+        return Ok(None);
+    }
+
+    let form = web_sys::FormData::new()
+        .map_err(|error| anyhow::anyhow!("failed to create upload form: {error:?}"))?;
+    for file in files {
+        let relative_path =
+            js_sys::Reflect::get(file.as_ref(), &JsValue::from_str("webkitRelativePath"))
+                .ok()
+                .and_then(|value| value.as_string())
+                .filter(|path| !path.is_empty())
+                .unwrap_or_else(|| file.name());
+        form.append_with_blob_and_filename(
+            "files",
+            file.unchecked_ref::<web_sys::Blob>(),
+            &relative_path,
+        )
+        .map_err(|error| anyhow::anyhow!("failed to add file to upload: {error:?}"))?;
+    }
+
+    let init = web_sys::RequestInit::new();
+    init.set_method("POST");
+    init.set_credentials(web_sys::RequestCredentials::SameOrigin);
+    init.set_body(form.as_ref());
+    let request = web_sys::Request::new_with_str_and_init("/upload", &init)
+        .map_err(|error| anyhow::anyhow!("failed to create upload request: {error:?}"))?;
+    let response = wasm_bindgen_futures::JsFuture::from(
+        web_sys::window()
+            .ok_or_else(|| anyhow::anyhow!("browser window is unavailable"))?
+            .fetch_with_request(&request),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("file upload failed: {error:?}"))?
+    .dyn_into::<web_sys::Response>()
+    .map_err(|error| anyhow::anyhow!("upload returned an invalid response: {error:?}"))?;
+    let status = response.status();
+    let text = wasm_bindgen_futures::JsFuture::from(
+        response
+            .text()
+            .map_err(|error| anyhow::anyhow!("failed to read upload response: {error:?}"))?,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("failed to read upload response: {error:?}"))?
+    .as_string()
+    .unwrap_or_default();
+    if !response.ok() {
+        anyhow::bail!("file upload failed with HTTP {status}: {text}");
+    }
+
+    let upload: BrowserUploadResponse = serde_json::from_str(&text)
+        .map_err(|error| anyhow::anyhow!("invalid upload response: {error}"))?;
+    let paths = if directories_only {
+        upload.roots
+    } else {
+        upload.paths
+    };
+    Ok(Some(paths.into_iter().map(PathBuf::from).collect()))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -504,14 +575,94 @@ impl Platform for WebPlatform {
 
     fn prompt_for_paths(
         &self,
-        _options: PathPromptOptions,
+        options: PathPromptOptions,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
-        let (tx, rx) = oneshot::channel();
-        tx.send(Err(anyhow::anyhow!(
-            "prompt_for_paths is not supported on the web"
-        )))
-        .ok();
-        rx
+        let (sender, receiver) = oneshot::channel();
+        let sender = Rc::new(RefCell::new(Some(sender)));
+        let picker_sender = sender.clone();
+        let result = (|| -> Result<()> {
+            let document = self
+                .browser_window
+                .document()
+                .ok_or_else(|| anyhow::anyhow!("browser document is unavailable"))?;
+            let input = document
+                .create_element("input")
+                .map_err(|error| anyhow::anyhow!("failed to create file picker: {error:?}"))?
+                .dyn_into::<web_sys::HtmlInputElement>()
+                .map_err(|error| anyhow::anyhow!("file picker has an invalid type: {error:?}"))?;
+            input.set_type("file");
+            input.set_multiple(options.multiple);
+            input
+                .style()
+                .set_property("display", "none")
+                .map_err(|error| anyhow::anyhow!("failed to hide file picker: {error:?}"))?;
+            let directories_only = options.directories && !options.files;
+            if directories_only {
+                input
+                    .set_attribute("webkitdirectory", "")
+                    .map_err(|error| {
+                        anyhow::anyhow!("failed to enable folder picker: {error:?}")
+                    })?;
+                input.set_attribute("directory", "").map_err(|error| {
+                    anyhow::anyhow!("failed to enable folder picker: {error:?}")
+                })?;
+            }
+            if options
+                .prompt
+                .as_deref()
+                .is_some_and(|prompt| prompt.to_ascii_lowercase().contains("image"))
+            {
+                input.set_accept("image/*");
+            }
+            document
+                .body()
+                .ok_or_else(|| anyhow::anyhow!("browser document body is unavailable"))?
+                .append_child(&input)
+                .map_err(|error| anyhow::anyhow!("failed to mount file picker: {error:?}"))?;
+
+            let input_for_event = input.clone();
+            let callback = wasm_bindgen::closure::Closure::once_into_js(move || {
+                let _ = js_sys::Reflect::set(
+                    input_for_event.as_ref(),
+                    &JsValue::from_str("onchange"),
+                    &JsValue::NULL,
+                );
+                let _ = js_sys::Reflect::set(
+                    input_for_event.as_ref(),
+                    &JsValue::from_str("oncancel"),
+                    &JsValue::NULL,
+                );
+                input_for_event.remove();
+
+                let files = input_for_event
+                    .files()
+                    .map(|files| {
+                        (0..files.length())
+                            .filter_map(|index| files.item(index))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let Some(sender) = picker_sender.borrow_mut().take() else {
+                    return;
+                };
+                wasm_bindgen_futures::spawn_local(async move {
+                    let _ = sender.send(upload_browser_files(files, directories_only).await);
+                });
+            });
+            js_sys::Reflect::set(input.as_ref(), &JsValue::from_str("onchange"), &callback)
+                .map_err(|error| anyhow::anyhow!("failed to attach file picker: {error:?}"))?;
+            js_sys::Reflect::set(input.as_ref(), &JsValue::from_str("oncancel"), &callback)
+                .map_err(|error| anyhow::anyhow!("failed to attach file picker: {error:?}"))?;
+            input.click();
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            if let Some(sender) = sender.borrow_mut().take() {
+                sender.send(Err(error)).ok();
+            }
+        }
+        receiver
     }
 
     fn prompt_for_new_path(

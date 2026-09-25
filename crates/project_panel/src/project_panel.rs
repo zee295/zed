@@ -389,6 +389,8 @@ actions!(
         NewDirectory,
         /// Creates a new file.
         NewFile,
+        /// Uploads files from the browser into the selected directory.
+        UploadFiles,
         /// Copies the selected file or directory.
         Copy,
         /// Duplicates the selected file or directory.
@@ -1198,6 +1200,9 @@ impl ProjectPanel {
                     } else {
                         menu.action("New File", Box::new(NewFile))
                             .action("New Folder", Box::new(NewDirectory))
+                            .when(cfg!(target_family = "wasm"), |menu| {
+                                menu.action("Upload Files…", Box::new(UploadFiles))
+                            })
                             .separator()
                             .when(is_local, |menu| {
                                 menu.action(
@@ -2441,6 +2446,32 @@ impl ProjectPanel {
 
     fn new_directory(&mut self, _: &NewDirectory, window: &mut Window, cx: &mut Context<Self>) {
         self.add_entry(true, window, cx)
+    }
+
+    fn upload_files(&mut self, _: &UploadFiles, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(entry_id) = self
+            .selection
+            .map(|selection| selection.entry_id)
+            .or(self.state.last_worktree_root_id)
+        else {
+            return;
+        };
+        let paths_receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Upload Files".into()),
+        });
+
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = paths_receiver.await {
+                this.update_in(cx, |this, window, cx| {
+                    this.drop_external_files(&paths, entry_id, window, cx);
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     fn add_entry(&mut self, is_dir: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -7510,6 +7541,7 @@ impl Render for ProjectPanel {
                 .when(!project.is_read_only(cx), |el| {
                     el.on_action(cx.listener(Self::new_file))
                         .on_action(cx.listener(Self::new_directory))
+                        .on_action(cx.listener(Self::upload_files))
                         .on_action(cx.listener(Self::rename))
                         .on_action(cx.listener(Self::delete))
                         .on_action(cx.listener(Self::cut))

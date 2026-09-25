@@ -24,9 +24,9 @@ use editor::{
 };
 use futures::{FutureExt as _, future::join_all};
 use gpui::{
-    AppContext, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, Image, ImageFormat, KeyContext, SharedString, Subscription, Task, TaskExt,
-    TextStyle, WeakEntity,
+    AppContext, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, ExternalPaths,
+    FocusHandle, Focusable, Image, ImageFormat, KeyContext, SharedString, Subscription, Task,
+    TaskExt, TextStyle, WeakEntity,
 };
 use language::{Buffer, language_settings::InlayHintKind};
 use parking_lot::RwLock;
@@ -321,6 +321,7 @@ async fn resolve_pasted_context_items(
     let mut items = Vec::new();
     let mut added_worktrees = Vec::new();
     let default_image_name: SharedString = "Image".into();
+    let fs = project.read_with(cx, |project, _| project.fs().clone());
 
     for entry in entries {
         match entry {
@@ -335,18 +336,12 @@ async fn resolve_pasted_context_items(
             }
             ClipboardEntry::ExternalPaths(paths) => {
                 for path in paths.paths().iter() {
-                    if let Some((image, name)) = cx
-                        .background_spawn({
-                            let path = path.clone();
-                            let default_image_name = default_image_name.clone();
-                            async move {
-                                crate::mention_set::load_external_image_from_path(
-                                    &path,
-                                    &default_image_name,
-                                )
-                            }
-                        })
-                        .await
+                    if let Some((image, name)) = crate::mention_set::load_external_image_from_fs(
+                        fs.clone(),
+                        path,
+                        &default_image_name,
+                    )
+                    .await
                     {
                         if supports_images {
                             items.push(ResolvedPastedContextItem::Image(image, name));
@@ -1623,6 +1618,11 @@ impl MessageEditor {
         let editor = self.editor.clone();
         let mention_set = self.mention_set.clone();
         let workspace = self.workspace.clone();
+        let Some(workspace_entity) = self.workspace.upgrade() else {
+            return;
+        };
+        let project = workspace_entity.read(cx).project().clone();
+        let fs = project.read(cx).fs().clone();
 
         let paths_receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: true,
@@ -1639,19 +1639,18 @@ impl MessageEditor {
                 };
 
                 let default_image_name: SharedString = "Image".into();
-                let images = cx
-                    .background_spawn(async move {
-                        paths
-                            .into_iter()
-                            .filter_map(|path| {
-                                crate::mention_set::load_external_image_from_path(
-                                    &path,
-                                    &default_image_name,
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .await;
+                let mut images = Vec::new();
+                for path in paths {
+                    if let Some(image) = crate::mention_set::load_external_image_from_fs(
+                        fs.clone(),
+                        &path,
+                        &default_image_name,
+                    )
+                    .await
+                    {
+                        images.push(image);
+                    }
+                }
 
                 crate::mention_set::insert_images_as_context(
                     images,
@@ -1659,6 +1658,53 @@ impl MessageEditor {
                     mention_set,
                     workspace,
                     cx,
+                )
+                .await;
+                Ok(())
+            })
+            .detach_and_log_err(cx);
+    }
+
+    pub fn add_files_from_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace_entity) = self.workspace.upgrade() else {
+            return;
+        };
+        let project = workspace_entity.read(cx).project().clone();
+        let project_is_local = project.read(cx).is_local();
+        let supports_images = self.session_capabilities.read().supports_images();
+        let editor = self.editor.clone();
+        let mention_set = self.mention_set.clone();
+        let workspace = self.workspace.clone();
+        let paths_receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Upload Files".into()),
+        });
+
+        window
+            .spawn(cx, async move |mut cx| {
+                let paths = match paths_receiver.await {
+                    Ok(Ok(Some(paths))) => paths,
+                    _ => return Ok::<(), anyhow::Error>(()),
+                };
+                let entries = vec![ClipboardEntry::ExternalPaths(ExternalPaths(paths.into()))];
+                let (items, added_worktrees) = resolve_pasted_context_items(
+                    project,
+                    project_is_local,
+                    supports_images,
+                    entries,
+                    &mut cx,
+                )
+                .await;
+                insert_resolved_pasted_context_items(
+                    items,
+                    added_worktrees,
+                    editor,
+                    mention_set,
+                    workspace,
+                    supports_images,
+                    &mut cx,
                 )
                 .await;
                 Ok(())

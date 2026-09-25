@@ -1019,6 +1019,23 @@ pub(crate) fn load_external_image_from_path(
     default_name: &SharedString,
 ) -> Option<(Image, SharedString)> {
     let content = std::fs::read(path).ok()?;
+    load_external_image(content, path, default_name)
+}
+
+pub(crate) async fn load_external_image_from_fs(
+    fs: Arc<dyn fs::Fs>,
+    path: &Path,
+    default_name: &SharedString,
+) -> Option<(Image, SharedString)> {
+    let content = fs.load_bytes(path).await.ok()?;
+    load_external_image(content, path, default_name)
+}
+
+fn load_external_image(
+    content: Vec<u8>,
+    path: &Path,
+    default_name: &SharedString,
+) -> Option<(Image, SharedString)> {
     let format = image::guess_format(&content)
         .ok()
         .and_then(image_format_from_external_content)?;

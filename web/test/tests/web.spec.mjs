@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
-import { readFile } from "node:fs/promises";
+import { readFile, rm } from "node:fs/promises";
+import { dirname } from "node:path";
 
 const tokenPath =
   process.env.ZED_WEB_TOKEN_PATH ?? ".zed/web-auth-token";
@@ -44,6 +45,43 @@ test("protects the application with authentication", async ({
   await authenticate(context, baseURL);
   const authorized = await context.request.get(baseURL, { maxRedirects: 0 });
   expect(authorized.status()).toBe(307);
+  await context.close();
+});
+
+test("uploads browser files through the authenticated server", async ({
+  browser,
+  baseURL,
+}) => {
+  const context = await browser.newContext();
+  const unauthorized = await context.request.post(`${baseURL}/upload`, {
+    multipart: {
+      files: {
+        name: "browser-upload.txt",
+        mimeType: "text/plain",
+        buffer: Buffer.from("uploaded through the browser"),
+      },
+    },
+  });
+  expect(unauthorized.status()).toBe(401);
+
+  await authenticate(context, baseURL);
+  const response = await context.request.post(`${baseURL}/upload`, {
+    multipart: {
+      files: {
+        name: "browser-upload.txt",
+        mimeType: "text/plain",
+        buffer: Buffer.from("uploaded through the browser"),
+      },
+    },
+  });
+  expect(response.status()).toBe(200);
+  const upload = await response.json();
+  expect(upload.paths).toHaveLength(1);
+  expect(upload.paths[0]).toMatch(/browser-upload\.txt$/);
+  expect(await readFile(upload.paths[0], "utf8")).toBe(
+    "uploaded through the browser",
+  );
+  await rm(dirname(upload.paths[0]), { recursive: true, force: true });
   await context.close();
 });
 
