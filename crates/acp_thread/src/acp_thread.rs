@@ -4299,6 +4299,11 @@ impl AcpThread {
             return;
         }
 
+        if cfg!(target_arch = "wasm32") {
+            self.idle_sleep_prevention = IdleSleepPrevention::Failed;
+            return;
+        }
+
         if !matches!(self.idle_sleep_prevention, IdleSleepPrevention::Inactive) {
             return;
         }
@@ -4307,17 +4312,19 @@ impl AcpThread {
         self.idle_sleep_prevention = IdleSleepPrevention::Acquiring {
             _task: cx.spawn(async move |thread, cx| {
                 let result = acquisition.await;
-                thread
-                    .update(cx, |thread, _| {
-                        thread.idle_sleep_prevention = match result {
-                            Ok(guard) => IdleSleepPrevention::Active { _guard: guard },
-                            Err(error) => {
-                                log::error!("Failed to prevent idle sleep: {error:#}");
-                                IdleSleepPrevention::Failed
-                            }
-                        };
-                    })
-                    .log_err();
+                cx.update_or_defer(move |cx| {
+                    thread
+                        .update(cx, |thread, _| {
+                            thread.idle_sleep_prevention = match result {
+                                Ok(guard) => IdleSleepPrevention::Active { _guard: guard },
+                                Err(error) => {
+                                    log::error!("Failed to prevent idle sleep: {error:#}");
+                                    IdleSleepPrevention::Failed
+                                }
+                            };
+                        })
+                        .log_err();
+                });
             }),
         };
     }
