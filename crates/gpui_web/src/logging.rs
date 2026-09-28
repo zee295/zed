@@ -17,10 +17,22 @@ impl Log for ConsoleLogger {
             return;
         }
 
+        let location = if record.level() == Level::Error {
+            record.file().zip(record.line()).map(|(file, line)| {
+                let path = file
+                    .split_once("crates/")
+                    .map(|(_, path)| format!("crates/{path}"))
+                    .unwrap_or_else(|| file.to_owned());
+                format!(" [{path}:{line}]")
+            })
+        } else {
+            None
+        };
         let message = format!(
-            "[{}] {}: {}",
+            "[{}] {}{}: {}",
             record.level(),
             record.target(),
+            location.as_deref().unwrap_or(""),
             record.args()
         );
         let js_string = wasm_bindgen::JsValue::from_str(&message);

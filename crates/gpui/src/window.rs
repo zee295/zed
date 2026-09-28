@@ -46,7 +46,7 @@ use smallvec::SmallVec;
 use std::{
     any::{Any, TypeId},
     borrow::Cow,
-    cell::{Cell, RefCell},
+    cell::{BorrowMutError, Cell, RefCell},
     cmp,
     fmt::{Debug, Display},
     hash::{Hash, Hasher},
@@ -1692,6 +1692,7 @@ impl Window {
             let next_frame_callbacks = next_frame_callbacks.clone();
             let input_rate_tracker = input_rate_tracker.clone();
             let mut deferred_force_render = false;
+            let mut deferred_require_presentation = false;
             move |request_frame_options| {
                 #[cfg(feature = "profiler")]
                 let _foreground_turn = profiler::journal::foreground_turn();
@@ -1713,6 +1714,7 @@ impl Window {
                 if draw_in_progress() {
                     log::debug!("deferring re-entrant window draw request");
                     deferred_force_render |= request_frame_options.force_render;
+                    deferred_require_presentation |= request_frame_options.require_presentation;
                     return;
                 }
                 // Take the deferred flag first: `||` short-circuits, and leaving
@@ -1720,17 +1722,29 @@ impl Window {
                 // force a second, redundant render on the next frame.
                 let force_render =
                     mem::take(&mut deferred_force_render) || request_frame_options.force_render;
+                let require_presentation = mem::take(&mut deferred_require_presentation)
+                    || request_frame_options.require_presentation;
 
-                let thermal_state = handle
-                    .update(&mut cx, |_, _, cx| cx.thermal_state())
-                    .log_err();
+                let thermal_state = match handle.update(&mut cx, |_, _, cx| cx.thermal_state()) {
+                    Ok(thermal_state) => Some(thermal_state),
+                    Err(error) if error.is::<BorrowMutError>() => {
+                        deferred_force_render |= force_render;
+                        deferred_require_presentation |= require_presentation;
+                        let invalidator = invalidator.clone();
+                        cx.update_or_defer(move |_| invalidator.wake_platform());
+                        return;
+                    }
+                    Err(error) => {
+                        Err::<(), _>(error).log_err();
+                        None
+                    }
+                };
 
                 // Throttle frame rate based on conditions:
                 // - Thermal pressure (Serious/Critical): cap to ~60fps
                 // - Inactive window (not focused): cap to ~30fps to save energy
-                let min_frame_interval = if request_frame_options.require_presentation
-                    || (!request_frame_options.force_render
-                        && next_frame_callbacks.borrow().is_empty())
+                let min_frame_interval = if require_presentation
+                    || (!force_render && next_frame_callbacks.borrow().is_empty())
                 {
                     None
                 } else if !active.get() && !input_rate_tracker.borrow_mut().is_high_rate() {
@@ -1778,7 +1792,7 @@ impl Window {
                 // Keep presenting if input was recently arriving at a high rate (>= 60fps).
                 // Once high-rate input is detected, we sustain presentation for 1 second
                 // to prevent display underclocking during active input.
-                let needs_present = request_frame_options.require_presentation
+                let needs_present = require_presentation
                     || needs_present.get()
                     || input_rate_tracker.borrow_mut().is_high_rate();
 
@@ -7780,6 +7794,25 @@ mod tests {
             test_window.frame_wake_count() > baseline,
             "scheduling a next-frame callback in an idle window must wake the frame source"
         );
+    }
+
+    #[gpui::test]
+    fn test_frame_request_retries_after_app_borrow(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let test_window = cx.test_window(window.into());
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        let baseline = test_window.frame_wake_count();
+
+        let app_borrow = cx.app.borrow_mut();
+        test_window.simulate_frame_request(RequestFrameOptions {
+            require_presentation: true,
+            force_render: true,
+        });
+        assert_eq!(test_window.frame_wake_count(), baseline);
+        drop(app_borrow);
+
+        assert!(test_window.frame_wake_count() > baseline);
+        test_window.simulate_frame_request(RequestFrameOptions::default());
     }
 
     /// A frame request that arrives while next-frame callbacks are pending
