@@ -85,6 +85,14 @@ impl NotificationTarget {
         if !self.senders.is_empty() {
             return;
         }
+        if let Message::Text(text) = &message
+            && let Ok(value) = serde_json::from_str::<Value>(text)
+            && value["method"].as_str().is_some_and(|method| {
+                method.starts_with("Terminal::data:") || method.starts_with("Terminal::exit:")
+            })
+        {
+            return;
+        }
         if self.backlog.len() == 2048 {
             self.backlog.pop_front();
         }
@@ -1338,6 +1346,29 @@ mod tests {
             third_receiver.recv().await,
             Some(Message::Text("replayed".into()))
         );
+    }
+
+    #[test]
+    fn disconnected_terminal_output_is_not_queued_for_replay() {
+        let mut target = NotificationTarget {
+            senders: HashMap::new(),
+            next_generation: 0,
+            backlog: VecDeque::new(),
+        };
+        target.forward(Message::Text(
+            json!({"method": "Terminal::data:terminal-1", "params": {"data": "AA=="}})
+                .to_string()
+                .into(),
+        ));
+        target.forward(Message::Text(
+            json!({"method": "Terminal::exit:terminal-1", "params": {"status": 0}})
+                .to_string()
+                .into(),
+        ));
+        assert!(target.backlog.is_empty());
+
+        target.forward(Message::Text("other notification".into()));
+        assert_eq!(target.backlog.len(), 1);
     }
 
     #[tokio::test]

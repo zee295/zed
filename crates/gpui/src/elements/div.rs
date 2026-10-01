@@ -470,6 +470,7 @@ impl Interactivity {
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     #[track_caller]
+    #[inline(always)]
     pub fn on_action<A: Action>(&mut self, listener: impl Fn(&A, &mut Window, &mut App) + 'static) {
         self.action_listeners.push((
             TypeId::of::<A>(),
@@ -573,10 +574,7 @@ impl Interactivity {
         &mut self,
         listener: impl Fn(&ModifiersChangedEvent, &mut Window, &mut App) + 'static,
     ) {
-        self.modifiers_changed_listeners
-            .push(Box::new(move |event, window, cx| {
-                listener(event, window, cx)
-            }));
+        self.modifiers_changed_listeners.push(Box::new(listener));
     }
 
     /// Bind the given callback to drop events of the given type, whether or not the drag started on this element.
@@ -605,13 +603,12 @@ impl Interactivity {
     /// The imperative API equivalent to [`StatefulInteractiveElement::on_click`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
+    #[inline(always)]
     pub fn on_click(&mut self, listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static)
     where
         Self: Sized,
     {
-        self.click_listeners.push(Rc::new(move |event, window, cx| {
-            listener(event, window, cx)
-        }));
+        self.click_listeners.push(Rc::new(listener));
     }
 
     /// Bind the given callback to non-primary click events of this element.
@@ -622,10 +619,7 @@ impl Interactivity {
     where
         Self: Sized,
     {
-        self.aux_click_listeners
-            .push(Rc::new(move |event, window, cx| {
-                listener(event, window, cx)
-            }));
+        self.aux_click_listeners.push(Rc::new(listener));
     }
 
     /// On drag initiation, this callback will be used to create a new view to render the dragged value for a
@@ -887,6 +881,7 @@ pub trait InteractiveElement: Sized {
     /// The fluent API equivalent to [`Interactivity::on_mouse_down`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to the view state from this callback.
+    #[inline(always)]
     fn on_mouse_down(
         mut self,
         button: MouseButton,
@@ -1129,6 +1124,7 @@ pub trait InteractiveElement: Sized {
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     #[track_caller]
+    #[inline(always)]
     fn on_action<A: Action>(
         mut self,
         listener: impl Fn(&A, &mut Window, &mut App) + 'static,
@@ -1204,6 +1200,7 @@ pub trait InteractiveElement: Sized {
     /// The fluent API equivalent to [`Interactivity::on_modifiers_changed`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
+    #[inline(always)]
     fn on_modifiers_changed(
         mut self,
         listener: impl Fn(&ModifiersChangedEvent, &mut Window, &mut App) + 'static,
@@ -1524,6 +1521,7 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     /// The handler is called when a screen reader requests the given action.
     ///
     /// See the [accessibility guide](crate::_accessibility) for an overview.
+    #[inline(always)]
     fn on_a11y_action(
         mut self,
         action: accesskit::Action,
@@ -1610,6 +1608,7 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     /// The fluent API equivalent to [`Interactivity::on_click`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
+    #[inline(always)]
     fn on_click(mut self, listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Self
     where
         Self: Sized,
@@ -2554,8 +2553,7 @@ impl Interactivity {
                 if let Some(debug_selector) = &self.debug_selector {
                     window
                         .next_frame
-                        .debug_bounds
-                        .insert(debug_selector.clone(), bounds);
+                        .record_debug_bounds(debug_selector.clone(), bounds);
                 }
 
                 self.paint_hover_group_handler(window, cx);

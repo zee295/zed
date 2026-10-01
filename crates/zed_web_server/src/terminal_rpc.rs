@@ -15,6 +15,9 @@ use tokio::sync::mpsc;
 
 use crate::fs_rpc::FsRpc;
 
+const MAX_TERMINAL_HISTORY_BYTES: usize = 512 * 1024;
+const HISTORY_TRIM_BYTES: usize = 64 * 1024;
+
 pub fn handles(method: &str) -> bool {
     method.starts_with("Terminal::")
 }
@@ -43,6 +46,23 @@ struct TerminalOutput {
     data_method: String,
     exit_method: String,
     exit_status: Option<i32>,
+}
+
+impl TerminalOutput {
+    fn append_history(&mut self, bytes: &[u8]) {
+        if bytes.len() >= MAX_TERMINAL_HISTORY_BYTES {
+            self.history.clear();
+            self.history
+                .extend_from_slice(&bytes[bytes.len() - MAX_TERMINAL_HISTORY_BYTES..]);
+            return;
+        }
+        self.history.extend_from_slice(bytes);
+        if self.history.len() > MAX_TERMINAL_HISTORY_BYTES {
+            let excess = self.history.len() - MAX_TERMINAL_HISTORY_BYTES;
+            let trim = (excess + HISTORY_TRIM_BYTES).min(self.history.len());
+            self.history.drain(..trim);
+        }
+    }
 }
 
 impl TerminalManager {
@@ -197,7 +217,7 @@ impl TerminalManager {
                         let Ok(mut output) = reader_output.lock() else {
                             break;
                         };
-                        output.history.extend_from_slice(&buffer[..count]);
+                        output.append_history(&buffer[..count]);
                         output.data_method.clone()
                     };
                     notify(&outgoing, &method, terminal_data(term_id, &buffer[..count]));
@@ -505,8 +525,31 @@ mod tests {
     use serde_json::json;
     use tokio::sync::mpsc;
 
-    use super::{TerminalManager, is_external_agent_npm_prefix};
+    use super::{
+        MAX_TERMINAL_HISTORY_BYTES, TerminalManager, TerminalOutput, is_external_agent_npm_prefix,
+    };
     use crate::fs_rpc::FsRpc;
+
+    #[test]
+    fn terminal_history_stays_bounded_under_repeated_tui_redraws() {
+        let mut output = TerminalOutput {
+            history: Vec::new(),
+            data_method: String::new(),
+            exit_method: String::new(),
+            exit_status: None,
+        };
+        let frame = b"\x1b[?1049h\x1b[H\x1b[2Jframe\r\n";
+        for _ in 0..50_000 {
+            output.append_history(frame);
+        }
+        assert!(output.history.len() <= MAX_TERMINAL_HISTORY_BYTES);
+        assert!(output.history.ends_with(frame));
+
+        let oversized = vec![b'x'; MAX_TERMINAL_HISTORY_BYTES + 1];
+        output.append_history(&oversized);
+        assert_eq!(output.history.len(), MAX_TERMINAL_HISTORY_BYTES);
+        assert!(output.history.iter().all(|byte| *byte == b'x'));
+    }
 
     #[test]
     fn recognizes_external_agent_npm_prefix() {
