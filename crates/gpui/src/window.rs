@@ -1854,19 +1854,19 @@ impl Window {
         }));
         invalidator.set_platform_waker(platform_window.frame_waker());
         platform_window.on_visual_viewport_changed(Box::new({
-            let mut cx = cx.to_async();
+            let cx = cx.to_async();
             move || {
-                handle
-                    .update(&mut cx, |_, window, _| window.refresh())
-                    .log_err();
+                cx.update_or_defer(move |cx| {
+                    handle.update(cx, |_, window, _| window.refresh()).log_err();
+                });
             }
         }));
         platform_window.on_insets_changed(Box::new({
-            let mut cx = cx.to_async();
+            let cx = cx.to_async();
             move |_| {
-                handle
-                    .update(&mut cx, |_, window, _| window.refresh())
-                    .log_err();
+                cx.update_or_defer(move |cx| {
+                    handle.update(cx, |_, window, _| window.refresh()).log_err();
+                });
             }
         }));
         platform_window.on_resize(Box::new({
@@ -1933,13 +1933,15 @@ impl Window {
             }
         }));
         platform_window.on_visibility_change(Box::new({
-            let mut cx = cx.to_async();
+            let cx = cx.to_async();
             move |_| {
-                handle
-                    .update(&mut cx, |_, window, cx| {
-                        window.refresh_visibility(cx);
-                    })
-                    .log_err();
+                cx.update_or_defer(move |cx| {
+                    handle
+                        .update(cx, |_, window, cx| {
+                            window.refresh_visibility(cx);
+                        })
+                        .log_err();
+                });
             }
         }));
         platform_window.on_hover_status_change(Box::new({
@@ -1958,10 +1960,25 @@ impl Window {
         platform_window.on_input({
             let mut cx = cx.to_async();
             Box::new(move |event| {
-                handle
-                    .update(&mut cx, |_, window, cx| window.dispatch_event(event, cx))
-                    .log_err()
-                    .unwrap_or(DispatchEventResult::default())
+                let mut event = Some(event);
+                match handle.update(&mut cx, |_, window, cx| {
+                    window.dispatch_event(event.take().expect("input dispatched once"), cx)
+                }) {
+                    Ok(result) => result,
+                    Err(error) if error.is::<BorrowMutError>() => {
+                        let event = event.expect("input was not dispatched while app was borrowed");
+                        cx.update_or_defer(move |cx| {
+                            handle
+                                .update(cx, |_, window, cx| window.dispatch_event(event, cx))
+                                .log_err();
+                        });
+                        DispatchEventResult::default()
+                    }
+                    Err(error) => {
+                        Err::<(), _>(error).log_err();
+                        DispatchEventResult::default()
+                    }
+                }
             })
         });
         platform_window.on_hit_test_window_control({
@@ -7735,6 +7752,32 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_visibility_callback_waits_for_reentrant_app_borrow(cx: &mut TestAppContext) {
+        use crate::WindowVisibility;
+
+        let window = cx.add_window(|_, _| EmptyView);
+        let observed = Rc::new(Cell::new(None));
+        let _subscription = window
+            .update(cx, {
+                let observed = observed.clone();
+                move |_, window, _| {
+                    window.observe_window_visibility(move |visibility, _, _| {
+                        observed.set(Some(visibility));
+                    })
+                }
+            })
+            .unwrap();
+        let platform_window = cx.test_window(window.into());
+
+        let app_borrow = cx.app.borrow_mut();
+        platform_window.simulate_visibility_change(WindowVisibility::Hidden);
+        assert_eq!(observed.get(), None);
+        drop(app_borrow);
+
+        assert_eq!(observed.get(), Some(WindowVisibility::Hidden));
+    }
+
+    #[gpui::test]
     fn test_fully_visible_bounds_preserve_layout_viewport(cx: &mut TestAppContext) {
         let window = cx.add_window(|_, _| EmptyView);
         let mut platform_window = cx.test_window(window.into());
@@ -7804,6 +7847,75 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_viewport_callbacks_wait_for_reentrant_app_borrow(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let platform_window = cx.test_window(window.into());
+        platform_window.simulate_frame_request(RequestFrameOptions::default());
+        let wakes = platform_window.frame_wake_count();
+
+        let app_borrow = cx.app.borrow_mut();
+        platform_window.simulate_visual_viewport_change(Bounds::new(
+            point(px(10.), px(20.)),
+            size(px(300.), px(400.)),
+        ));
+        platform_window.simulate_insets_change(crate::WindowInsets {
+            ime: crate::Edges {
+                bottom: px(100.),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert_eq!(platform_window.frame_wake_count(), wakes);
+        drop(app_borrow);
+
+        assert!(platform_window.frame_wake_count() > wakes);
+        window
+            .update(cx, |_, window, _| {
+                assert_eq!(
+                    window.visual_viewport_bounds().origin,
+                    point(px(10.), px(20.))
+                );
+                assert_eq!(window.platform_window.insets().ime.bottom, px(100.));
+            })
+            .unwrap();
+    }
+
+    struct DeferredInputView(Rc<Cell<usize>>);
+
+    impl Render for DeferredInputView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let count = self.0.clone();
+            div()
+                .id("deferred-input")
+                .size_full()
+                .on_mouse_down(MouseButton::Left, move |_, _, _| count.set(count.get() + 1))
+        }
+    }
+
+    #[gpui::test]
+    fn test_input_waits_for_reentrant_app_borrow(cx: &mut TestAppContext) {
+        let count = Rc::new(Cell::new(0));
+        let window = cx.add_window({
+            let count = count.clone();
+            move |_, _| DeferredInputView(count)
+        });
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+
+        let mut platform_window = cx.test_window(window.into());
+        let app_borrow = cx.app.borrow_mut();
+        platform_window.simulate_input(PlatformInput::MouseDown(MouseDownEvent {
+            position: point(px(10.), px(10.)),
+            button: MouseButton::Left,
+            click_count: 1,
+            ..Default::default()
+        }));
+        assert_eq!(count.get(), 0);
+        drop(app_borrow);
+        assert_eq!(count.get(), 1);
     }
 
     struct EmptyView;

@@ -209,6 +209,48 @@ test("resizes mobile docks without re-entering entity updates", async ({
   await context.close();
 });
 
+test("handles viewport and input bursts without GPUI borrow errors", async ({
+  browser,
+  baseURL,
+}) => {
+  const context = await browser.newContext();
+  await authenticate(context, baseURL);
+  const page = await context.newPage();
+  const failures = [];
+  page.on("console", (message) => {
+    if (
+      message.type() === "error" &&
+      /RefCell already borrowed|already mutably borrowed|panicked|RuntimeError: unreachable/.test(
+        message.text(),
+      )
+    ) {
+      failures.push(message.text());
+    }
+  });
+  page.on("pageerror", (error) => failures.push(error.message));
+  await openWorkspace(page, baseURL);
+
+  for (let index = 0; index < 30; index += 1) {
+    await page.setViewportSize({
+      width: 1100 + (index % 3) * 140,
+      height: 700 + (index % 4) * 50,
+    });
+    await page.mouse.move(500 + (index % 5) * 20, 350);
+    await page.mouse.wheel(0, 120);
+    await page.keyboard.press("Escape");
+  }
+
+  await page.evaluate(() => new Promise((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(resolve));
+  }));
+
+  await expect
+    .poll(() => page.evaluate(() => self.__zedRpcConnectionState))
+    .toBe("open");
+  expect(failures).toEqual([]);
+  await context.close();
+});
+
 test("accepts pasted images exposed only through clipboard files", async ({
   browser,
   baseURL,
