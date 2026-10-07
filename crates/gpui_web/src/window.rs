@@ -212,7 +212,7 @@ impl WebWindow {
             title: String::new(),
             input_handler: None,
             is_fullscreen: false,
-            is_active: true,
+            is_active: document_is_active(&browser_window),
             visibility: document_visibility(&browser_window),
             is_hovered: false,
             mouse_position: Point::default(),
@@ -439,6 +439,16 @@ impl WebWindowInner {
         );
     }
 
+    pub(crate) fn refresh_active_status(&self) {
+        let active = document_is_active(&self.browser_window);
+        if std::mem::replace(&mut self.state.borrow_mut().is_active, active) != active {
+            self.with_callback(
+                |callbacks| &mut callbacks.active_status_change,
+                |callback| callback(active),
+            );
+        }
+    }
+
     /// Invokes a registered callback with take/call/restore semantics.
     ///
     /// The callback is removed from the slot for the duration of the call, so
@@ -543,16 +553,11 @@ impl WebWindowInner {
                 if !is_visible {
                     this.cancel_active_touches();
                 }
-
                 let visibility_changed = {
                     let mut state = this.state.borrow_mut();
-                    state.is_active = is_visible;
                     std::mem::replace(&mut state.visibility, visibility) != visibility
                 };
-                this.with_callback(
-                    |callbacks| &mut callbacks.active_status_change,
-                    |callback| callback(is_visible),
-                );
+                this.refresh_active_status();
                 if visibility_changed {
                     this.with_callback(
                         |callbacks| &mut callbacks.visibility_change,
@@ -1017,6 +1022,14 @@ fn document_visibility(browser_window: &web_sys::Window) -> WindowVisibility {
     }
 }
 
+fn document_is_active(browser_window: &web_sys::Window) -> bool {
+    document_visibility(browser_window).is_visible()
+        && browser_window
+            .document()
+            .and_then(|document| document.has_focus().ok())
+            .unwrap_or(true)
+}
+
 struct MqlHandle {
     mql: web_sys::MediaQueryList,
     _closure: Closure<dyn FnMut(JsValue)>,
@@ -1366,7 +1379,7 @@ impl PlatformWindow for WebWindow {
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
-        Some(self.inner.state.borrow().renderer.gpu_specs())
+        self.inner.state.borrow().renderer.gpu_specs()
     }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {}

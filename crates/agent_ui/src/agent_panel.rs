@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, ThreadStatus, line_range_suffix};
+use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, line_range_suffix};
 use agent::{ContextServerRegistry, SharedThread, ThreadStore};
 use agent_client_protocol::schema::v1 as acp;
 use agent_servers::AgentServer;
@@ -88,7 +88,7 @@ use language::LanguageRegistry;
 use language_model::LanguageModelRegistry;
 use notifications::status_toast::StatusToast;
 use project::{Project, ProjectPath, Worktree};
-use settings::{NotifyWhenAgentWaiting, Settings, update_settings_file};
+use settings::{NotifyWhenAgentWaiting, Settings, SettingsStore, update_settings_file};
 
 use search::{BufferSearchBar, buffer_search::Deploy as DeployBufferSearch};
 use terminal::Event as TerminalEvent;
@@ -162,17 +162,6 @@ fn terminal_program_to_report(
         };
     *last_observed_program = current_program;
     program_to_report
-}
-
-/// Maximum number of idle threads kept in the agent panel's retained list.
-/// Set as a GPUI global to override; otherwise defaults to 5.
-pub struct MaxIdleRetainedThreads(pub usize);
-impl gpui::Global for MaxIdleRetainedThreads {}
-
-impl MaxIdleRetainedThreads {
-    pub fn global(cx: &App) -> usize {
-        cx.try_global::<Self>().map_or(5, |g| g.0)
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -1162,6 +1151,8 @@ pub struct AgentPanel {
     _draft_editor_observation: Option<Subscription>,
     _active_draft_reclaim_observation: Option<Subscription>,
     _thread_metadata_store_subscription: Subscription,
+    _settings_subscription: Subscription,
+    retained_thread_subscriptions: HashMap<ThreadId, Subscription>,
     last_context_source: Option<AgentContextSource>,
 
     is_active: bool,
@@ -1577,11 +1568,15 @@ impl AgentPanel {
             &ThreadMetadataStore::global(cx),
             |this, _store, event, cx| {
                 let ThreadMetadataStoreEvent::ThreadArchived(thread_id) = event;
-                if this.retained_threads.remove(thread_id).is_some() {
+                if this.remove_retained_thread(thread_id).is_some() {
                     cx.notify();
                 }
             },
         );
+
+        let _settings_subscription = cx.observe_global::<SettingsStore>(|this, cx| {
+            this.cleanup_retained_threads(cx);
+        });
 
         cx.on_release(|this, cx| {
             this.dismiss_all_terminal_notifications(cx);
@@ -1624,6 +1619,8 @@ impl AgentPanel {
             _draft_editor_observation: None,
             _active_draft_reclaim_observation: None,
             _thread_metadata_store_subscription,
+            _settings_subscription,
+            retained_thread_subscriptions: HashMap::default(),
             last_context_source: None,
             is_active: false,
         };
@@ -1862,7 +1859,7 @@ impl AgentPanel {
                 let draft_id = draft.read(cx).thread_id;
                 self.draft_thread = None;
                 self._draft_editor_observation = None;
-                self.retained_threads.insert(draft_id, draft);
+                self.insert_retained_thread(draft_id, draft, cx);
             } else if *draft.read(cx).agent_key() != self.selected_agent {
                 let old_draft_id = draft.read(cx).thread_id;
                 ThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -2286,6 +2283,7 @@ impl AgentPanel {
                     this.request_close_terminal_from_terminal_event(terminal_id, cx);
                 }
                 TerminalEvent::BlinkChanged(_)
+                | TerminalEvent::OutputReplaced
                 | TerminalEvent::SelectionsChanged
                 | TerminalEvent::NewNavigationTarget(_)
                 | TerminalEvent::Open(_) => {}
@@ -3245,7 +3243,7 @@ impl AgentPanel {
             return false;
         }
 
-        self.retained_threads.remove(&thread_id);
+        self.remove_retained_thread(&thread_id);
         self.set_ephemeral_draft(conversation_view, cx);
         true
     }
@@ -3312,8 +3310,7 @@ impl AgentPanel {
             self.set_selected_agent_and_persist(original, cx);
         }
         let thread_id = thread.conversation_view.read(cx).thread_id;
-        self.retained_threads
-            .insert(thread_id, thread.conversation_view);
+        self.insert_retained_thread(thread_id, thread.conversation_view, cx);
         thread_id
     }
 
@@ -3324,7 +3321,7 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let conversation_view = if let Some(view) = self.retained_threads.remove(&id) {
+        let conversation_view = if let Some(view) = self.remove_retained_thread(&id) {
             self.try_make_empty_draft_ephemeral(view.clone(), cx);
             view
         } else if let Some(draft) = &self.draft_thread {
@@ -3376,7 +3373,7 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.retained_threads.remove(&id);
+        self.remove_retained_thread(&id);
         ThreadMetadataStore::global(cx).update(cx, |store, cx| {
             store.delete(id, cx);
         });
@@ -4265,7 +4262,7 @@ impl AgentPanel {
                 let thread_id = conversation_view.read(cx).thread_id;
                 self.draft_thread = None;
                 self._draft_editor_observation = None;
-                self.retained_threads.insert(thread_id, conversation_view);
+                self.insert_retained_thread(thread_id, conversation_view, cx);
                 self.cleanup_retained_threads(cx);
             }
             return;
@@ -4277,8 +4274,55 @@ impl AgentPanel {
             return;
         }
 
-        self.retained_threads.insert(thread_id, conversation_view);
+        self.insert_retained_thread(thread_id, conversation_view, cx);
         self.cleanup_retained_threads(cx);
+    }
+
+    fn insert_retained_thread(
+        &mut self,
+        thread_id: ThreadId,
+        conversation_view: Entity<ConversationView>,
+        cx: &mut Context<Self>,
+    ) {
+        self.retained_threads
+            .insert(thread_id, conversation_view.clone());
+        self.observe_retained_thread(thread_id, conversation_view, cx);
+    }
+
+    fn observe_retained_thread(
+        &mut self,
+        thread_id: ThreadId,
+        conversation_view: Entity<ConversationView>,
+        cx: &mut Context<Self>,
+    ) {
+        let subscription = if let Some(acp_thread) = conversation_view.read(cx).root_thread(cx) {
+            let subscription = cx.subscribe(&acp_thread, |this, acp_thread, event, cx| {
+                if matches!(
+                    event,
+                    AcpThreadEvent::StatusChanged
+                        | AcpThreadEvent::SubmissionUpdated(_)
+                        | AcpThreadEvent::ToolAuthorizationReceived(_)
+                        | AcpThreadEvent::ElicitationResponded(_)
+                ) && acp_thread.read(cx).is_idle_for_retention()
+                {
+                    this.cleanup_retained_threads(cx);
+                }
+            });
+            subscription
+        } else {
+            cx.observe(&conversation_view, move |this, conversation_view, cx| {
+                if conversation_view.read(cx).root_thread(cx).is_some() {
+                    this.observe_retained_thread(thread_id, conversation_view, cx);
+                }
+            })
+        };
+        self.retained_thread_subscriptions
+            .insert(thread_id, subscription);
+    }
+
+    fn remove_retained_thread(&mut self, thread_id: &ThreadId) -> Option<Entity<ConversationView>> {
+        self.retained_thread_subscriptions.remove(thread_id);
+        self.retained_threads.remove(thread_id)
     }
 
     fn cleanup_retained_threads(&mut self, cx: &App) {
@@ -4290,11 +4334,11 @@ impl AgentPanel {
                     return true;
                 };
                 let thread = thread_view.read(cx).thread.read(cx);
-                thread.connection().supports_load_session() && thread.status() == ThreadStatus::Idle
+                thread.connection().supports_load_session() && thread.is_idle_for_retention()
             })
             .collect::<Vec<_>>();
 
-        let max_idle = MaxIdleRetainedThreads::global(cx);
+        let max_idle = AgentSettings::get_global(cx).max_idle_retained_threads;
 
         potential_removals.sort_unstable_by_key(|(_, view)| view.read(cx).updated_at(cx));
         let n = potential_removals.len().saturating_sub(max_idle);
@@ -4304,7 +4348,7 @@ impl AgentPanel {
             .take(n)
             .collect::<Vec<_>>();
         for id in to_remove {
-            self.retained_threads.remove(&id);
+            self.remove_retained_thread(&id);
         }
     }
 
@@ -4439,7 +4483,7 @@ impl AgentPanel {
                             this.draft_thread = None;
                             this._draft_editor_observation = None;
                         }
-                        this.retained_threads.remove(&thread_id);
+                        this.remove_retained_thread(&thread_id);
                         cx.emit(AgentPanelEvent::ThreadInteracted { thread_id });
                     }
                 },
@@ -4515,7 +4559,7 @@ impl AgentPanel {
             );
             return;
         }
-        if let Some(conversation_view) = self.retained_threads.remove(&thread_id) {
+        if let Some(conversation_view) = self.remove_retained_thread(&thread_id) {
             self.try_make_empty_draft_ephemeral(conversation_view.clone(), cx);
             self.set_base_view(
                 BaseView::AgentThread { conversation_view },
@@ -4776,16 +4820,16 @@ pub(crate) fn apply_native_model_override(
         );
         return;
     };
-    let configured = LanguageModelRegistry::global(cx)
+    let model = LanguageModelRegistry::global(cx)
         .update(cx, |registry, cx| registry.select_model(&selected, cx));
-    let Some(configured) = configured else {
+    let Some(model) = model else {
         log::warn!(
             "create_thread: no model registered for {model_id:?}; using thread's default model"
         );
         return;
     };
     thread.update(cx, |thread, cx| {
-        thread.set_model(configured.model, cx);
+        thread.set_model(model, cx);
     });
 }
 
@@ -6255,9 +6299,7 @@ impl AgentPanel {
                 if LanguageModelRegistry::global(cx)
                     .read(cx)
                     .default_model()
-                    .is_some_and(|model| {
-                        model.provider.id() != language_model::ZED_CLOUD_PROVIDER_ID
-                    })
+                    .is_some_and(|model| model.provider_id != language_model::ZED_CLOUD_PROVIDER_ID)
                 {
                     return false;
                 }
@@ -6657,7 +6699,7 @@ impl AgentPanel {
     /// Drops a thread's `ConversationView` from `retained_threads` without
     /// deleting its metadata or kvp state. Simulates the post-restart
     pub fn test_unload_retained_thread(&mut self, id: ThreadId) -> bool {
-        self.retained_threads.remove(&id).is_some()
+        self.remove_retained_thread(&id).is_some()
     }
 
     /// Opens an external thread using an arbitrary AgentServer.
@@ -11412,6 +11454,16 @@ mod tests {
             thread_ids.push(thread_id);
         }
 
+        cx.update(|_window, cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    max_idle_retained_threads: 6,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+
         let base_time = Instant::now();
 
         for session_id in session_ids.iter().take(6) {
@@ -11430,6 +11482,13 @@ mod tests {
                     view.set_updated_at(base_time + Duration::from_secs(index as u64), cx);
                 });
             }
+            AgentSettings::override_global(
+                AgentSettings {
+                    max_idle_retained_threads: 5,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
             panel.cleanup_retained_threads(cx);
         });
 
@@ -11452,6 +11511,88 @@ mod tests {
             assert!(
                 !panel.retained_threads.contains_key(&thread_ids[6]),
                 "the active thread should not also be stored as a retained thread"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_cleanup_retained_threads_runs_when_retained_thread_limit_changes(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = StubAgentConnection::new()
+            .with_supports_load_session(true)
+            .with_agent_id("loadable-stub".into())
+            .with_telemetry_id("loadable-stub".into());
+        let mut session_ids = Vec::new();
+
+        for _ in 0..2 {
+            let (session_id, _) =
+                open_generating_thread_with_loadable_connection(&panel, &connection, &mut cx);
+            session_ids.push(session_id);
+        }
+
+        for session_id in session_ids.iter() {
+            connection.end_turn(session_id.clone(), acp::StopReason::EndTurn);
+        }
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert_eq!(panel.retained_threads.len(), 1);
+        });
+
+        cx.update(|_window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(r#"{ "agent": { "max_idle_retained_threads": 0 } }"#, cx)
+                    .expect("user settings should load");
+            });
+        });
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert!(
+                panel.retained_threads.is_empty(),
+                "changing the retained thread limit should unload idle threads immediately"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_completed_retained_thread_is_unloaded_when_retained_thread_limit_is_zero(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = StubAgentConnection::new()
+            .with_supports_load_session(true)
+            .with_agent_id("loadable-stub".into())
+            .with_telemetry_id("loadable-stub".into());
+        let (session_id, thread_id) =
+            open_generating_thread_with_loadable_connection(&panel, &connection, &mut cx);
+
+        open_generating_thread_with_loadable_connection(&panel, &connection, &mut cx);
+
+        cx.update(|_window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(r#"{ "agent": { "max_idle_retained_threads": 0 } }"#, cx)
+                    .expect("user settings should load");
+            });
+        });
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert!(
+                panel.retained_threads.contains_key(&thread_id),
+                "a retained thread must stay loaded while its turn is running"
+            );
+        });
+
+        connection.end_turn(session_id, acp::StopReason::EndTurn);
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert!(
+                !panel.retained_threads.contains_key(&thread_id),
+                "a retained thread should unload when its turn completes"
             );
         });
     }
@@ -11487,6 +11628,16 @@ mod tests {
             loadable_thread_ids.push(thread_id);
         }
 
+        cx.update(|_window, cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    max_idle_retained_threads: 6,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+
         let base_time = Instant::now();
 
         for session_id in loadable_session_ids.iter().take(6) {
@@ -11505,6 +11656,13 @@ mod tests {
                     view.set_updated_at(base_time + Duration::from_secs(index as u64), cx);
                 });
             }
+            AgentSettings::override_global(
+                AgentSettings {
+                    max_idle_retained_threads: 5,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
             panel.cleanup_retained_threads(cx);
         });
 
@@ -13789,7 +13947,7 @@ mod tests {
         // so on_release → close_all_sessions fires only on A.
         drop(retained_conversation_a);
         panel.update(&mut cx, |panel, _cx| {
-            panel.retained_threads.remove(&_thread_id_a);
+            panel.remove_retained_thread(&_thread_id_a);
         });
         cx.run_until_parked();
 

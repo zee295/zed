@@ -263,8 +263,9 @@ fn forward_exit_notification(params: serde_json::Value, events_tx: &UnboundedSen
 }
 
 fn forward_exit(events_tx: &UnboundedSender<PtyEvent>) {
-    let _ = events_tx.unbounded_send(PtyEvent::Event(TerminalBackendEvent::Exit));
-    let _ = events_tx.unbounded_send(PtyEvent::Event(TerminalBackendEvent::ChildExit(
-        ExitStatus::default(),
-    )));
+    let _ = events_tx.unbounded_send(PtyEvent::Event(TerminalBackendEvent::Exit, 0));
+    let _ = events_tx.unbounded_send(PtyEvent::Event(
+        TerminalBackendEvent::ChildExit(ExitStatus::default()),
+        0,
+    ));
 }

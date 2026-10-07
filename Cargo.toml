@@ -22,6 +22,7 @@ members = [
     "crates/auto_update_ui",
     "crates/aws_http_client",
     "crates/bedrock",
+    "crates/bench_metrics",
     "crates/benchmarks",
     "crates/breadcrumbs",
     "crates/buffer_diff",
@@ -76,6 +77,7 @@ members = [
     "crates/extension_cli",
     "crates/extension_host",
     "crates/extension_runtime_cli",
+    "crates/extension_suggest",
     "crates/extensions_ui",
     "crates/feature_flags",
     "crates/feature_flags_macros",
@@ -105,6 +107,7 @@ members = [
     "crates/gpui_wgpu",
     "crates/gpui_windows",
     "crates/grammars",
+    "crates/hang_telemetry",
     "crates/html_to_markdown",
     "crates/http_client",
     "crates/http_client_tls",
@@ -302,6 +305,7 @@ anthropic = { path = "crates/anthropic" }
 askpass = { path = "crates/askpass" }
 assets = { path = "crates/assets" }
 audio = { path = "crates/audio" }
+bench_metrics = { path = "crates/bench_metrics" }
 auto_update = { path = "crates/auto_update" }
 auto_update_ui = { path = "crates/auto_update_ui" }
 aws_http_client = { path = "crates/aws_http_client" }
@@ -354,6 +358,7 @@ etw_tracing = { path = "crates/etw_tracing" }
 eval_utils = { path = "crates/eval_utils" }
 extension = { path = "crates/extension" }
 extension_host = { path = "crates/extension_host" }
+extension_suggest = { path = "crates/extension_suggest" }
 extensions_ui = { path = "crates/extensions_ui" }
 feature_flags = { path = "crates/feature_flags" }
 feature_flags_macros = { path = "crates/feature_flags_macros" }
@@ -382,6 +387,7 @@ gpui_web = { path = "crates/gpui_web" }
 gpui_wgpu = { path = "crates/gpui_wgpu" }
 gpui_windows = { path = "crates/gpui_windows", default-features = false }
 grammars = { path = "crates/grammars" }
+hang_telemetry = { path = "crates/hang_telemetry" }
 html_to_markdown = { path = "crates/html_to_markdown" }
 http_client = { path = "crates/http_client" }
 http_client_tls = { path = "crates/http_client_tls" }
@@ -530,7 +536,7 @@ accesskit = { version = "0.24.0", features = ["enumn"] }
 accesskit_macos = "0.26.0"
 accesskit_unix = "0.22"
 accesskit_windows = "0.34"
-agent-client-protocol = { version = "=2.2.0", features = ["unstable"] }
+agent-client-protocol = { version = "=2.2.0", features = ["unstable", "unstable_protocol_v2"] }
 aho-corasick = "1.1"
 alacritty_terminal = { path = "crates/alacritty_terminal" }
 any_vec = "0.14"
@@ -562,13 +568,17 @@ async-task = "4.7"
 async-trait = "0.1"
 async-tungstenite = "0.33"
 async_zip = { version = "0.0.18", features = ["deflate", "deflate64"] }
-aws-config = { version = "1.8.10", features = ["behavior-version-latest"] }
+aws-config = { version = "1.8.10", default-features = false, features = [
+    "behavior-version-latest",
+    "credentials-process",
+    "rt-tokio",
+    "sso",
+] }
 aws-credential-types = { version = "1.2.8", features = [
     "hardcoded-credentials",
 ] }
 aws-sdk-bedrockruntime = { version = "1.112.0", default-features = false, features = [
     "behavior-version-latest",
-    "default-https-client",
     "rt-tokio",
 ] }
 aws-sigv4 = { version = "1.4.0", features = ["http1"] }
@@ -578,7 +588,6 @@ backtrace = "0.3"
 base64 = "0.22"
 betlang = "0.1.1"
 bitflags = "2.6.0"
-block = "0.1"
 block2 = "0.6"
 brush-parser = "0.3"
 bytes = "1.0"
@@ -604,8 +613,9 @@ core-text = "21"
 core-video = { version = "0.5.2", features = ["metal"] }
 cpal = "0.17"
 crash-handler = "0.8"
-criterion = { version = "0.5", features = ["html_reports"] }
-crossbeam = "0.8.4"
+criterion = { version = "0.8.2", features = ["html_reports"] }
+perf-event = { package = "perf-event2", version = "0.7.4" }
+crossbeam-queue = "0.3.12"
 ctor = "1.0.12"
 dap-types = { git = "https://github.com/zed-industries/dap-types", rev = "1b461b310481d01e02b2603c16d7144b926339f8" }
 dashmap = "6.0"
@@ -622,6 +632,7 @@ derive_more = { version = "2.1.1", features = [
     "not",
 ] }
 dialoguer = { version = "0.12", default-features = false }
+diffy = "0.4.2"
 dirs = "6.0"
 documented = "0.10"
 dotenvy = "0.15.0"
@@ -861,7 +872,6 @@ swash = "0.2.6"
 syn = { version = "2.0.101", features = ["full", "extra-traits", "visit-mut"] }
 sys-locale = "0.3.1"
 sysinfo = "0.39"
-take-until = "0.2.0"
 tempfile = "3.20.0"
 thiserror = "2.0.12"
 time = { version = "0.3", features = [
@@ -874,6 +884,7 @@ time = { version = "0.3", features = [
 ] }
 tiny_http = "0.12"
 tokio = { version = "1" }
+tokio-rustls = { version = "0.26", default-features = false }
 toml = "0.8"
 toml_edit = { version = "0.22", default-features = false, features = [
     "display",
@@ -935,7 +946,7 @@ wasm_rpc = { path = "crates/wasm_rpc" }
 wasm_remote = { path = "crates/wasm_remote" }
 wasm-bindgen = "=0.2.127"
 wasm-bindgen-futures = "=0.4.77"
-wasmtime-wasi = "48"
+wasmtime-wasi = { version = "48", default-features = false, features = ["p2"] }
 wax = "0.7"
 web-time = "1.1.0"
 webpki-roots = "1.0.8"
@@ -945,7 +956,7 @@ which = "8"
 windows-core = "0.62"
 windows-registry = "0.6.0"
 yaml-rust2 = "0.8"
-yawc = { git = "https://github.com/zed-industries/yawc", rev = "71a452f551cac178367eaac5d7418a09afa1f3a2", version = "0.3.3" }
+yawc = "0.4.2"
 zeroize = "1.8"
 zstd = "0.11"
 
