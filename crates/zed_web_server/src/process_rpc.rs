@@ -112,6 +112,8 @@ pub struct OrphanedProcessReap {
 struct AcpActivity {
     input: Vec<u8>,
     output: Vec<u8>,
+    initialize_request: Option<Value>,
+    initialize_response: Option<Value>,
     prompts: HashMap<String, String>,
     suspended_sessions: HashSet<String>,
     deferred_output: VecDeque<(String, Vec<u8>)>,
@@ -119,10 +121,13 @@ struct AcpActivity {
 }
 
 impl AcpActivity {
-    fn feed_input(&mut self, bytes: &[u8]) {
+    fn feed_input(&mut self, bytes: &[u8]) -> (Vec<u8>, Vec<Vec<u8>>) {
         self.input.extend_from_slice(bytes);
+        let mut forwarded = Vec::new();
+        let mut responses = Vec::new();
         for line in take_lines(&mut self.input) {
             let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+                forwarded.extend(with_newline(line));
                 continue;
             };
             let method = value
@@ -134,11 +139,23 @@ impl AcpActivity {
                 .or_else(|| value.pointer("/params/session_id"))
                 .and_then(Value::as_str);
             match method {
+                "initialize" => {
+                    if let Some(id) = value.get("id") {
+                        // Reload creates a new client, not a new agent process. ACP
+                        // initialization is process-scoped and must only run once.
+                        if let Some(response) = &self.initialize_response {
+                            let mut response = response.clone();
+                            response["id"] = id.clone();
+                            responses.push(with_newline(serde_json::to_vec(&response).unwrap()));
+                            continue;
+                        }
+                        self.initialize_request = Some(id.clone());
+                    }
+                }
                 "session/prompt" | "session.prompt" => {
-                    let Some(id) = value.get("id").map(Value::to_string) else {
-                        continue;
-                    };
-                    if let Some(session_id) = session_id {
+                    if let Some(id) = value.get("id").map(Value::to_string)
+                        && let Some(session_id) = session_id
+                    {
                         self.prompts.insert(id, session_id.to_string());
                     }
                 }
@@ -149,7 +166,9 @@ impl AcpActivity {
                 }
                 _ => {}
             }
+            forwarded.extend(with_newline(line));
         }
+        (forwarded, responses)
     }
 
     fn route_output(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
@@ -161,6 +180,16 @@ impl AcpActivity {
                 continue;
             };
             if value.get("result").is_some() || value.get("error").is_some() {
+                if self
+                    .initialize_request
+                    .as_ref()
+                    .is_some_and(|id| value.get("id") == Some(id))
+                {
+                    if value.get("result").is_some() {
+                        self.initialize_response = Some(value.clone());
+                    }
+                    self.initialize_request = None;
+                }
                 if let Some(id) = value.get("id").map(Value::to_string) {
                     self.prompts.remove(&id);
                 }
@@ -694,9 +723,25 @@ impl ProcessManager {
                 .and_then(Value::as_str)
                 .unwrap_or_default(),
         )?;
-        if let Ok(mut activity) = entry.acp_activity.lock() {
-            activity.feed_input(&data);
-        }
+        let data = if entry.kind == ProcessKind::AcpAgent {
+            let (data, responses) = entry
+                .acp_activity
+                .lock()
+                .map_err(|_| anyhow::anyhow!("ACP activity lock poisoned"))?
+                .feed_input(&data);
+            for response in responses {
+                notify_process_output(
+                    &self.outgoing,
+                    "Process::stdout",
+                    proc_id,
+                    response,
+                    entry.compressed_output.load(Ordering::Relaxed),
+                );
+            }
+            data
+        } else {
+            data
+        };
         let mut rewriter = entry.stdin_rewriter.lock().await;
         let chunks = rewriter.feed(&data);
         let mut stdin = entry.stdin.lock().await;
@@ -1306,11 +1351,11 @@ mod tests {
         sync::{Arc, atomic::AtomicBool},
     };
 
-    use anyhow::Result;
+    use anyhow::{Context as _, Result, bail};
     use axum::extract::ws::Message;
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use flate2::read::ZlibDecoder;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use tokio::{io::AsyncWriteExt as _, sync::mpsc};
 
     use super::{
@@ -1318,6 +1363,134 @@ mod tests {
         pump_output, rewrite_process_value, sanitize_lldb_frame,
     };
     use crate::fs_rpc::FsRpc;
+
+    #[test]
+    fn reload_reuses_successful_acp_initialization_with_new_request_id() {
+        let mut activity = AcpActivity::default();
+        let initial = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n";
+        let (forwarded, responses) = activity.feed_input(initial);
+        assert_eq!(forwarded, initial);
+        assert!(responses.is_empty());
+        let result = json!({"protocolVersion": 1, "agentCapabilities": {"loadSession": true},
+            "agentInfo": {"name": "codex", "version": "test"}});
+        let response =
+            serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 1, "result": result})).unwrap();
+        activity.route_output(&response);
+        activity.route_output(b"\n");
+        activity.suspend_active_sessions();
+
+        let reload = b"{\"jsonrpc\":\"2.0\",\"id\":\"reload-init\",\"method\":\"initialize\"}\n";
+        let (forwarded, responses) = activity.feed_input(&reload[..20]);
+        assert!(forwarded.is_empty());
+        assert!(responses.is_empty());
+        let load = b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/load\",\"params\":{\"sessionId\":\"codex-session\"}}\n";
+        let (forwarded, responses) = activity.feed_input(&[&reload[20..], load].concat());
+        assert_eq!(forwarded, load);
+        assert_eq!(responses.len(), 1);
+        let response: Value = serde_json::from_slice(&responses[0]).unwrap();
+        assert_eq!(
+            response,
+            json!({"jsonrpc": "2.0", "id": "reload-init", "result": result})
+        );
+    }
+
+    #[test]
+    fn failed_acp_initialization_is_not_cached() {
+        let mut activity = AcpActivity::default();
+        let request = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n";
+        activity.feed_input(request);
+        activity.route_output(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32603}}\n");
+        let (forwarded, responses) = activity.feed_input(request);
+        assert_eq!(forwarded, request);
+        assert!(responses.is_empty());
+        assert!(activity.initialize_response.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reload_does_not_initialize_running_acp_agent_twice() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let fs = Arc::new(FsRpc::new(root.path().to_path_buf(), false)?);
+        let (outgoing, mut notifications) = mpsc::unbounded_channel::<Message>();
+        let mut processes = ProcessManager::new(fs, outgoing);
+        let spawn = |proc_id| {
+            json!({
+                "proc_id": proc_id, "program": "/bin/sh", "cwd": "/workspace",
+                "args": ["-c", r#"
+                initialized=false
+                while IFS= read -r line; do
+                    case "$line" in
+                        *'"method":"initialize"'*)
+                            if "$initialized"; then
+                                printf '%s\n' '{"jsonrpc":"2.0","id":99,"error":{"code":-32603,"data":{"details":"Already initialized"}}}'
+                            else
+                                initialized=true
+                                printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}'
+                            fi ;;
+                        *'"method":"session/load"'*)
+                            printf '%s\n' '{"jsonrpc":"2.0","id":100,"result":{}}' ;;
+                    esac
+                done
+            "#],
+                "env": [["ZED_WEB_PROCESS_KIND", "acp-agent"]],
+                "stdin_pipe": true, "stdout_pipe": true, "stderr_pipe": true,
+            })
+        };
+        processes.dispatch("Process::spawn", &spawn(91), 1).await?;
+        processes
+            .dispatch(
+                "Process::write_stdin",
+                &json!({"proc_id": 91,
+            "data": BASE64.encode(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n")}),
+                1,
+            )
+            .await?;
+        tokio::time::timeout(std::time::Duration::from_secs(2), notifications.recv())
+            .await?
+            .context("missing initial ACP response")?;
+        processes.dispatch("Process::write_stdin", &json!({"proc_id": 91,
+            "data": BASE64.encode(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/prompt\",\"params\":{\"sessionId\":\"codex-session\"}}\n")}), 1).await?;
+        processes.detach_generation(1);
+        assert_eq!(
+            processes.dispatch("Process::spawn", &spawn(92), 2).await?["proc_id"],
+            91
+        );
+        processes.dispatch("Process::write_stdin", &json!({"proc_id": 91,
+            "data": BASE64.encode(b"{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"initialize\"}\n{\"jsonrpc\":\"2.0\",\"id\":100,\"method\":\"session/load\",\"params\":{\"sessionId\":\"codex-session\"}}\n")}), 2).await?;
+        let mut responses = Vec::new();
+        for _ in 0..2 {
+            let notification =
+                tokio::time::timeout(std::time::Duration::from_secs(2), notifications.recv())
+                    .await?
+                    .context("missing reloaded ACP response")?;
+            let Message::Text(notification) = notification else {
+                bail!("expected text notification")
+            };
+            let notification: Value = serde_json::from_str(&notification)?;
+            let output = BASE64.decode(
+                notification["params"]["data"]
+                    .as_str()
+                    .context("missing ACP data")?,
+            )?;
+            responses.push(serde_json::from_slice::<Value>(&output)?);
+        }
+        assert_eq!(responses[0]["id"], 99);
+        assert_eq!(responses[0]["result"]["protocolVersion"], 1);
+        assert_eq!(responses[1]["id"], 100);
+        assert!(
+            responses
+                .iter()
+                .all(|response| response.get("error").is_none())
+        );
+        assert_eq!(
+            processes.running_sessions()?,
+            json!({"sessions": ["codex-session"]})
+        );
+        processes
+            .dispatch("Process::kill", &json!({"proc_id": 91}), 2)
+            .await?;
+        Ok(())
+    }
 
     #[test]
     fn tracks_acp_prompt_until_response() {
