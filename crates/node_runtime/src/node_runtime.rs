@@ -932,6 +932,7 @@ impl SystemNode {
         configured_path: Option<PathBuf>,
         search_path: Option<OsString>,
     ) -> std::result::Result<Self, NodeDiscoveryError> {
+        #[cfg(not(target_family = "wasm"))]
         let path = smol::unblock({
             let search_path = search_path.clone();
             move || {
@@ -943,6 +944,10 @@ impl SystemNode {
             }
         })
         .await?;
+        // Browser commands execute on the server. Local `which` and filesystem
+        // absolute-path resolution cannot inspect that server's environment.
+        #[cfg(target_family = "wasm")]
+        let path = configured_path.unwrap_or_else(|| PathBuf::from("node"));
         let mut command = util::command::new_command(&path);
         command.arg("--version").kill_on_drop(true);
         if let Some(search_path) = search_path {
@@ -959,7 +964,8 @@ impl SystemNode {
         Ok(Self { path, version })
     }
 
-    /// Returns the absolute executable path without resolving symlinks.
+    /// Returns the executable path without resolving symlinks. In the browser,
+    /// a basename is resolved by the server's process bridge.
     pub fn path(&self) -> &Path {
         &self.path
     }

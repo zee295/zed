@@ -1266,7 +1266,9 @@ fn init_app_state(
         None,
         watch::channel(Some(node_runtime::NodeBinaryOptions {
             allow_path_lookup: true,
-            allow_binary_download: true,
+            // Node is provided by the server (including our Docker image).
+            // The native managed installer cannot run in a browser.
+            allow_binary_download: false,
             use_paths: None,
         }))
         .1,

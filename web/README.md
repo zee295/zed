@@ -266,6 +266,14 @@ pushing `zed-web`.
 and test-only uses and fails when an upstream update introduces another one.
 Review every allowlist change rather than accepting it mechanically.
 
+Node.js discovery in WASM must probe through the remote process bridge;
+browser-local `which`, PATH lookup, and absolute-path resolution cannot inspect
+the server. Preserve the WASM branch of `SystemNode::discover` when merging
+upstream changes. The web workspace disables native managed Node downloads:
+the server must provide Node.js 22 or newer and npm (included in our image).
+An unavailable server runtime should report its discovery error, not attempt
+to select a native download using the browser's empty OS identifier.
+
 The threaded WASM build reserves a 128 MB initial shared heap and runs
 `web/scripts/patch-wasm-bindgen-memory.sh` after wasm-bindgen. This prevents
 normal startup from repeatedly growing shared memory and retries generated
