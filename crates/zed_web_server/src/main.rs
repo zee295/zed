@@ -1,4 +1,5 @@
 mod agent_rpc;
+mod binary_rpc;
 mod auth;
 mod auth_callback;
 mod debug_adapter;

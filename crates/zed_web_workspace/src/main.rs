@@ -1217,6 +1217,7 @@ fn init_app_state(
         }
     });
     smol::set_remote_client(remote_client.clone());
+    http_client::github_download::set_remote_client(remote_client.clone());
     terminal::set_remote_client(remote_client.clone());
     web_agent_panel::set_remote_client(remote_client.clone());
     // Server-side SQLite for workspace/KVP persistence.

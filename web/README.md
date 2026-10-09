@@ -274,6 +274,21 @@ the server must provide Node.js 22 or newer and npm (included in our image).
 An unavailable server runtime should report its discovery error, not attempt
 to select a native download using the browser's empty OS identifier.
 
+Archive/raw-binary ACP installations must use the shared
+`http_client::github_download` WASM bridge and `Binary::download` on the host.
+Keep upstream digest verification, staging, extraction, and executable handling
+in the native implementation; do not reintroduce browser download stubs or
+agent-specific installers. Downloads run outside the RPC receive loop so agent
+installation does not block filesystem and terminal requests.
+
+`RemoteWatcher::add`/`remove` must forward additional subscriptions, particularly
+Git metadata and linked-worktree directories. The initial recursive project
+watch deliberately excludes `.git`; ignoring watch additions makes Git status
+stale after external commits. Use the server's exclusion list to deduplicate
+ordinary descendant directories, and release subscriptions when watchers drop.
+The browser Git regression test edits and commits in a temporary repository
+without reloading the page.
+
 The threaded WASM build reserves a 128 MB initial shared heap and runs
 `web/scripts/patch-wasm-bindgen-memory.sh` after wasm-bindgen. This prevents
 normal startup from repeatedly growing shared memory and retries generated

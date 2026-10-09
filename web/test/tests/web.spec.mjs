@@ -1,6 +1,11 @@
 import { expect, test } from "@playwright/test";
-import { readFile, rm } from "node:fs/promises";
+import { readFile, rm, mkdtemp, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import { tmpdir } from "node:os";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { createServer } from "node:http";
+import { createHash } from "node:crypto";
 
 const tokenPath =
   process.env.ZED_WEB_TOKEN_PATH ?? ".zed/web-auth-token";
@@ -46,6 +51,94 @@ test("protects the application with authentication", async ({
   const authorized = await context.request.get(baseURL, { maxRedirects: 0 });
   expect(authorized.status()).toBe(307);
   await context.close();
+});
+
+test("refreshes Git status after external edits and commits without reload", async ({ browser, baseURL }) => {
+  const root = await mkdtemp(`${tmpdir()}/zed-web-git-watch-`);
+  const git = (...args) => promisify(execFile)("git", ["-C", root, ...args]);
+  const context = await browser.newContext();
+  try {
+    await git("init");
+    await git("config", "user.name", "Web Test");
+    await git("config", "user.email", "test@example.invalid");
+    await writeFile(`${root}/tracked.txt`, "original\n");
+    await git("add", ".");
+    await git("commit", "-m", "initial");
+    await authenticate(context, baseURL);
+    const page = await context.newPage();
+    const statuses = [];
+    const watches = [];
+    page.on("websocket", socket => {
+      const statusIds = new Set();
+      socket.on("framesent", ({ payload }) => {
+        const message = JSON.parse(payload.toString());
+        if (message.method === "Fs::watch") watches.push(message.params.path);
+        if (message.method === "GitRepository::status") statusIds.add(message.id);
+      });
+      socket.on("framereceived", ({ payload }) => {
+        const message = JSON.parse(payload.toString());
+        if (statusIds.delete(message.id) && !message.error) statuses.push(message.result);
+      });
+    });
+    await openWorkspace(page, `${baseURL}/?path=${encodeURIComponent(root)}`);
+    await page.keyboard.press("Control+Shift+g");
+    await expect.poll(() => watches.some(path => path.endsWith("/.git"))).toBe(true);
+    await expect.poll(() => statuses.length).toBeGreaterThan(0);
+    statuses.length = 0;
+    await writeFile(`${root}/tracked.txt`, "modified\n");
+    await expect.poll(() => statuses.some(status => status.includes("tracked.txt"))).toBe(true);
+    statuses.length = 0;
+    await git("add", "tracked.txt");
+    await git("commit", "-m", "external commit");
+    await expect.poll(() => statuses.some(status => status === "")).toBe(true);
+    // The response precedes GPUI's next render of the updated repository.
+    await page.waitForTimeout(750);
+    await page.screenshot({ path: test.info().outputPath("git-after-commit.png") });
+  } finally {
+    await context.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("installs agent binaries over RPC without blocking filesystem requests", async ({ browser, baseURL }) => {
+  const root = await mkdtemp(`${tmpdir()}/zed-web-agent-install-`);
+  const body = "#!/bin/sh\necho agent-ready\n";
+  const server = createServer((_request, response) => {
+    setTimeout(() => response.end(body), 500);
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  const context = await browser.newContext();
+  try {
+    await authenticate(context, baseURL);
+    const page = await context.newPage();
+    await openWorkspace(page, baseURL);
+    const responses = await page.evaluate(params => new Promise((resolve, reject) => {
+      const ws = new WebSocket(`${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/rpc`);
+      const messages = [];
+      const timeout = setTimeout(() => { ws.close(); reject(new Error("download RPC timed out")); }, 15000);
+      ws.onopen = () => {
+        ws.send(JSON.stringify({ id: 1, method: "Binary::download", params }));
+        ws.send(JSON.stringify({ id: 2, method: "Fs::is_dir", params: { path: "/workspace" } }));
+      };
+      ws.onmessage = ({ data }) => {
+        const message = JSON.parse(data);
+        if (![1, 2].includes(message.id)) return;
+        messages.push(message);
+        if (messages.length === 2) { clearTimeout(timeout); ws.close(); resolve(messages); }
+      };
+    }), {
+      url: `http://127.0.0.1:${server.address().port}/agent`,
+      digest: createHash("sha256").update(body).digest("hex"),
+      destination: `${root}/installed`, kind: "raw", file_name: "agent",
+    });
+    expect(responses.map(message => message.id)).toEqual([2, 1]);
+    expect(responses.every(message => !message.error)).toBe(true);
+    expect(await readFile(`${root}/installed/agent`, "utf8")).toBe(body);
+  } finally {
+    await context.close();
+    await new Promise(resolve => server.close(resolve));
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("uploads browser files through the authenticated server", async ({

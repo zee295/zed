@@ -371,14 +371,17 @@ pub async fn serve(socket: WebSocket, state: AppState) {
             .to_string();
         let request_id = envelope.get("id").cloned().unwrap_or(Value::Null);
         let params = envelope.get("params").cloned().unwrap_or_else(|| json!({}));
-        if crate::extension_rpc::handles_network(&method) {
+        if crate::extension_rpc::handles_network(&method) || method == "Binary::download" {
             let fs = session.lock().await.fs.clone();
             let http = state.http.clone();
             let outgoing = outgoing.clone();
             let events = state.events.clone();
             tokio::spawn(async move {
-                let result =
-                    crate::extension_rpc::dispatch_network(fs, http, method.clone(), params).await;
+                let result = if method == "Binary::download" {
+                    crate::binary_rpc::download(&fs, params).await
+                } else {
+                    crate::extension_rpc::dispatch_network(fs, http, method.clone(), params).await
+                };
                 let succeeded = result.is_ok();
                 let response = match result {
                     Ok(result) => json!({"id": request_id, "result": result, "error": null}),
@@ -587,7 +590,10 @@ pub async fn serve(socket: WebSocket, state: AppState) {
                             key: group_key.unwrap_or(key),
                         },
                     );
-                    Ok(json!({"subscription_id": subscription_id}))
+                    Ok(json!({
+                        "subscription_id": subscription_id,
+                        "excluded_directories": WATCH_EXCLUDED_DIRECTORIES,
+                    }))
                 }
                 Err(error) => Err(error),
             }
@@ -1393,6 +1399,48 @@ mod tests {
             second_receiver.recv().await,
             Some(Message::Text("shared".into()))
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_git_watch_reports_index_and_head_changes() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::create_dir(root.path().join(".git"))?;
+        fs::write(root.path().join(".git/HEAD"), "ref: refs/heads/main\n")?;
+        let fs_rpc = Arc::new(FsRpc::new(root.path().to_path_buf(), false)?);
+        let key = watch_key(
+            &fs_rpc,
+            &json!({"path": "/workspace/.git", "latency": 0.05}),
+        )?;
+        let subscription_paths = Arc::new(StdMutex::new(HashMap::from([(7, key.path.clone())])));
+        let (outgoing, mut notifications) = mpsc::unbounded_channel();
+        let task = start_watch(fs_rpc, key, subscription_paths, outgoing);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        fs::write(root.path().join(".git/index.lock"), "new index")?;
+        fs::rename(
+            root.path().join(".git/index.lock"),
+            root.path().join(".git/index"),
+        )?;
+        fs::write(root.path().join(".git/HEAD"), "ref: refs/heads/other\n")?;
+        let observed = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut index = false;
+            let mut head = false;
+            while let Some(Message::Text(message)) = notifications.recv().await {
+                let value: Value = serde_json::from_str(&message)?;
+                for event in value["params"]["events"].as_array().unwrap() {
+                    let path = event["path"].as_str().unwrap();
+                    index |= path.ends_with("/.git/index");
+                    head |= path.ends_with("/.git/HEAD");
+                }
+                if index && head {
+                    return Ok::<_, anyhow::Error>(());
+                }
+            }
+            bail!("watch closed before reporting Git changes")
+        })
+        .await;
+        task.abort();
+        observed??;
+        Ok(())
     }
 
     #[tokio::test]

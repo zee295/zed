@@ -8485,6 +8485,7 @@ dependencies = [
  "tempfile",
  "url",
  "util",
+ "wasm_rpc",
 ]
 
 [[package]]
@@ -23532,11 +23533,13 @@ dependencies = [
  "futures 0.3.34",
  "hex",
  "hmac",
+ "http_client",
  "libc",
  "mime_guess",
  "notify 9.0.0-rc.4",
  "portable-pty",
  "rand 0.9.4",
+ "reqwest_client",
  "rusqlite",
  "serde",
  "serde_json",

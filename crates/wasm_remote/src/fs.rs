@@ -233,41 +233,25 @@ impl FileHandle for RemoteFileHandle {
 #[derive(Deserialize)]
 struct WatchResponse {
     subscription_id: u64,
+    #[serde(default)]
+    excluded_directories: Option<Vec<String>>,
 }
 
 struct RemoteWatcher {
-    subscriptions: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Vec<PathEvent>>>>>,
-    subscription_id: u64,
-    client: RemoteClient,
-    executor: BackgroundExecutor,
+    changes: mpsc::UnboundedSender<(std::path::PathBuf, bool)>,
 }
 
 impl Watcher for RemoteWatcher {
-    fn add(&self, _path: &std::path::Path) -> Result<()> {
-        Ok(())
+    fn add(&self, path: &std::path::Path) -> Result<()> {
+        self.changes
+            .unbounded_send((path.to_path_buf(), true))
+            .map_err(Into::into)
     }
 
-    fn remove(&self, _path: &std::path::Path) -> Result<()> {
-        Ok(())
-    }
-}
-
-impl Drop for RemoteWatcher {
-    fn drop(&mut self) {
-        lock_shared(&self.subscriptions).remove(&self.subscription_id);
-        let client = self.client.clone();
-        let subscription_id = self.subscription_id;
-        self.executor
-            .spawn(async move {
-                client
-                    .call_void(
-                        "Fs::unwatch",
-                        &json!({ "subscription_id": subscription_id }),
-                    )
-                    .await
-                    .ok();
-            })
-            .detach();
+    fn remove(&self, path: &std::path::Path) -> Result<()> {
+        self.changes
+            .unbounded_send((path.to_path_buf(), false))
+            .map_err(Into::into)
     }
 }
 
@@ -645,24 +629,90 @@ impl Fs for RemoteFs {
                 }),
             )
             .await
-            .unwrap_or(WatchResponse { subscription_id: 0 });
+            .unwrap_or(WatchResponse {
+                subscription_id: 0,
+                excluded_directories: None,
+            });
 
         let (tx, rx) = mpsc::unbounded::<Vec<PathEvent>>();
-        lock_shared(&self.watch_subscriptions).insert(response.subscription_id, tx);
+        lock_shared(&self.watch_subscriptions).insert(response.subscription_id, tx.clone());
 
         let subscriptions = self.watch_subscriptions.clone();
         let subscription_id = response.subscription_id;
+        let excluded_directories = response.excluded_directories;
         let stream = stream::unfold(rx, move |mut rx| async move {
             let item = rx.next().await;
             item.map(|events| (events, rx))
         });
 
-        let watcher = Arc::new(RemoteWatcher {
-            subscriptions,
-            subscription_id,
-            client: self.client.clone(),
-            executor: self.executor.clone(),
-        });
+        let (changes, mut changes_rx) = mpsc::unbounded::<(std::path::PathBuf, bool)>();
+        let client = self.client.clone();
+        let root = path.to_path_buf();
+        // Serialize add/remove requests, including Git metadata and linked
+        // worktree directories outside the initial recursive subscription.
+        self.executor
+            .spawn(async move {
+                let mut paths = HashMap::from([(root, subscription_id)]);
+                while let Some((path, add)) = changes_rx.next().await {
+                    if add {
+                        if paths.contains_key(&path) {
+                            continue;
+                        }
+                        // Server watches are recursive except for explicitly
+                        // excluded trees. Avoid one RPC/subscription per scanned
+                        // directory, while still registering .git separately.
+                        if let Some(excluded) = &excluded_directories
+                            && paths.keys().any(|root| {
+                                path.strip_prefix(root).is_ok_and(|relative| {
+                                    !relative.components().any(|part| {
+                                        part.as_os_str().to_str().is_some_and(|name| {
+                                            excluded.iter().any(|entry| entry == name)
+                                        })
+                                    })
+                                })
+                            })
+                        {
+                            continue;
+                        }
+                        match client
+                            .call::<_, WatchResponse>(
+                                "Fs::watch",
+                                &json!({
+                                    "path": path_arg(&path), "latency": latency.as_secs_f64(),
+                                }),
+                            )
+                            .await
+                        {
+                            Ok(response) => {
+                                lock_shared(&subscriptions)
+                                    .insert(response.subscription_id, tx.clone());
+                                paths.insert(path.clone(), response.subscription_id);
+                                // Cover changes between requesting the watch and
+                                // registering its notification destination.
+                                let _ = tx.unbounded_send(vec![PathEvent { path, kind: None }]);
+                            }
+                            Err(error) => {
+                                log::error!("failed to watch {}: {error:#}", path.display())
+                            }
+                        }
+                    } else if let Some(id) = paths.remove(&path) {
+                        lock_shared(&subscriptions).remove(&id);
+                        let _ = client
+                            .call_void("Fs::unwatch", &json!({"subscription_id": id}))
+                            .await;
+                    }
+                }
+                // Dropping the watcher closes the command stream. This also cleans
+                // up watches whose registration was in flight during the drop.
+                for id in paths.into_values() {
+                    lock_shared(&subscriptions).remove(&id);
+                    let _ = client
+                        .call_void("Fs::unwatch", &json!({"subscription_id": id}))
+                        .await;
+                }
+            })
+            .detach();
+        let watcher = Arc::new(RemoteWatcher { changes });
 
         (
             Box::pin(stream) as Pin<Box<dyn Send + Stream<Item = Vec<PathEvent>>>>,
