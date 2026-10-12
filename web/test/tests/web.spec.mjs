@@ -141,6 +141,113 @@ test("installs agent binaries over RPC without blocking filesystem requests", as
   }
 });
 
+test("keeps user settings subscribed and reloads profile and permission edits", async ({ browser, baseURL }) => {
+  const context = await browser.newContext();
+  let settingsPath;
+  let original;
+  try {
+    await authenticate(context, baseURL);
+    const page = await context.newPage();
+    const loads = [];
+    const removed = new Set();
+    let watchId;
+    page.on("websocket", socket => {
+      const watches = new Set();
+      const loadIds = new Set();
+      socket.on("framesent", ({ payload }) => {
+        const message = JSON.parse(payload.toString());
+        if (message.method === "Fs::watch" && message.params.path.endsWith("/settings.json")) {
+          settingsPath = message.params.path;
+          watches.add(message.id);
+        }
+        if (message.method === "Fs::unwatch") removed.add(message.params.subscription_id);
+        if (message.method === "Fs::load_bytes" && message.params.path.endsWith("/settings.json")) loadIds.add(message.id);
+      });
+      socket.on("framereceived", ({ payload }) => {
+        const message = JSON.parse(payload.toString());
+        if (watches.delete(message.id)) watchId = message.result?.subscription_id;
+        if (loadIds.delete(message.id) && !message.error) loads.push(Buffer.from(message.result, "base64").toString("utf8"));
+      });
+    });
+    await openWorkspace(page, baseURL);
+    await expect.poll(() => watchId).toBeDefined();
+    expect(removed.has(watchId)).toBe(false);
+    original = await readFile(settingsPath, "utf8").catch(error => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    const edited = JSON.stringify({ agent: {
+      profiles: { "browser-watch-test": { name: "Browser Watch Test", tools: {} } },
+      tool_permissions: { default: "allow" },
+    }});
+    await writeFile(settingsPath, edited);
+    await expect.poll(() => loads.includes(edited)).toBe(true);
+    expect(removed.has(watchId)).toBe(false);
+    const primary = await page.evaluate(() => /Mac/.test(navigator.platform) ? "Meta" : "Control");
+    await page.keyboard.press(`${primary}+Shift+p`);
+    await page.keyboard.type("agent: manage profiles");
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(750);
+    await page.screenshot({ path: test.info().outputPath("updated-profiles.png") });
+    await page.mouse.click(600, 273);
+    await page.keyboard.type("Browser Created");
+    await page.keyboard.press("Enter");
+    await expect.poll(async () => {
+      const saved = JSON.parse(await readFile(settingsPath, "utf8"));
+      return saved.agent?.profiles?.["browser-created"]?.name;
+    }).toBe("Browser Created");
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(500);
+    await page.screenshot({ path: test.info().outputPath("created-profiles.png") });
+  } finally {
+    if (settingsPath && original !== undefined) {
+      if (original === null) await rm(settingsPath, { force: true });
+      else await writeFile(settingsPath, original);
+    }
+    await context.close();
+  }
+});
+
+test("continues Markdown lists in the agent composer", async ({ browser, baseURL }) => {
+  const context = await browser.newContext();
+  try {
+    await authenticate(context, baseURL);
+    const page = await context.newPage();
+    let agentReady = false;
+    page.on("console", message => {
+      if (message.text().includes("agent panel attached")) agentReady = true;
+    });
+    await openWorkspace(page, `${baseURL}/?path=${encodeURIComponent(dirname(dirname(tokenPath)))}`);
+    await expect.poll(() => agentReady).toBe(true);
+    const primary = await page.evaluate(() => /Mac/.test(navigator.platform) ? "Meta" : "Control");
+    await page.keyboard.press(`${primary}+Shift+p`);
+    await page.keyboard.type("agent: toggle focus");
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(500);
+    await page.keyboard.press(`${primary}+n`);
+    await page.waitForTimeout(500);
+    await page.screenshot({ path: test.info().outputPath("composer-start.png") });
+    const input = page.locator("textarea").first();
+    await page.keyboard.type("- first");
+    await page.keyboard.press("Shift+Enter");
+    await page.keyboard.type("second");
+    await expect.poll(() => input.inputValue()).toContain("- first\n- second");
+    await page.keyboard.press(`${primary}+a`);
+    await page.keyboard.type("1. first");
+    await page.keyboard.press("Shift+Enter");
+    await page.keyboard.type("second");
+    await expect.poll(() => input.inputValue()).toContain("1. first\n2. second");
+    await page.keyboard.press(`${primary}+a`);
+    await page.keyboard.type("- [x] first");
+    await page.keyboard.press("Shift+Enter");
+    await page.keyboard.type("second");
+    await expect.poll(() => input.inputValue()).toContain("- [x] first\n- [ ] second");
+    await page.screenshot({ path: test.info().outputPath("composer-lists.png") });
+  } finally {
+    await context.close();
+  }
+});
+
 test("uploads browser files through the authenticated server", async ({
   browser,
   baseURL,

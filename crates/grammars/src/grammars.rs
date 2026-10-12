@@ -63,7 +63,8 @@ pub fn load_config(name: &str) -> LanguageConfig {
 }
 
 /// Load and parse the `config.toml` for a given language name, stripping fields
-/// that require grammar support when grammars are not loaded.
+/// that require grammar support when grammars are not loaded. Editor behavior
+/// such as list continuation and bracket pairs does not require a parser.
 pub fn load_config_for_feature(name: &str, grammars_loaded: bool) -> LanguageConfig {
     let config = load_config(name);
 
@@ -71,10 +72,8 @@ pub fn load_config_for_feature(name: &str, grammars_loaded: bool) -> LanguageCon
         config
     } else {
         LanguageConfig {
-            name: config.name,
-            matcher: config.matcher,
-            jsx_tag_auto_close: config.jsx_tag_auto_close,
-            ..Default::default()
+            grammar: None,
+            ..config
         }
     }
 }

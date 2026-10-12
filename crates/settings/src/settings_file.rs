@@ -176,7 +176,7 @@ pub fn watch_config_file(
     let (tx, rx) = mpsc::unbounded();
     let task = executor.spawn(async move {
         let path = fs.canonicalize(&path).await.unwrap_or_else(|_| path);
-        let (events, _) = fs.watch(&path, Duration::from_millis(100)).await;
+        let (events, _watcher) = fs.watch(&path, Duration::from_millis(100)).await;
         futures::pin_mut!(events);
 
         let contents = fs.load(&path).await.unwrap_or_default();
@@ -217,7 +217,7 @@ pub fn watch_config_dir(
                 }
             }
 
-            let (events, _) = fs.watch(&dir_path, Duration::from_millis(100)).await;
+            let (events, _watcher) = fs.watch(&dir_path, Duration::from_millis(100)).await;
             futures::pin_mut!(events);
 
             while let Some(event_batch) = events.next().await {

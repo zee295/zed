@@ -1158,19 +1158,20 @@ fn web_default_settings() -> String {
 }
 
 #[cfg(target_family = "wasm")]
-fn load_user_settings(fs: Arc<dyn fs::Fs>, cx: &mut App) {
+fn watch_user_settings(fs: Arc<dyn fs::Fs>, cx: &mut App) {
+    use futures::StreamExt as _;
+    let (mut contents, watcher) =
+        settings::watch_config_file(cx.background_executor(), fs, paths::settings_file().clone());
     cx.spawn(async move |cx| {
-        match settings::SettingsStore::load_settings(&fs).await {
-            Ok(content) => {
-                cx.update_global(|store: &mut settings::SettingsStore, cx| {
-                    let result = store.set_user_settings(&content, cx);
-                    if let settings::ParseStatus::Failed { error } = result.parse_status {
-                        log::error!("failed to parse remote user settings: {error}");
-                    }
-                    cx.refresh_windows();
-                });
-            }
-            Err(error) => log::error!("failed to load remote user settings: {error:#}"),
+        let _watcher = watcher;
+        while let Some(content) = contents.next().await {
+            cx.update_global(|store: &mut settings::SettingsStore, cx| {
+                let result = store.set_user_settings(&content, cx);
+                if let settings::ParseStatus::Failed { error } = result.parse_status {
+                    log::error!("failed to parse remote user settings: {error}");
+                }
+                cx.refresh_windows();
+            });
         }
         anyhow::Ok(())
     })
@@ -1234,7 +1235,7 @@ fn init_app_state(
     }
     let fs: Arc<dyn Fs> = remote_fs;
     <dyn Fs>::set_global(fs.clone(), cx);
-    load_user_settings(fs.clone(), cx);
+    watch_user_settings(fs.clone(), cx);
 
     let mut languages = language::LanguageRegistry::new(cx.background_executor().clone());
     languages.set_language_server_download_dir(paths::languages_dir().clone());

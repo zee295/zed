@@ -289,6 +289,14 @@ ordinary descendant directories, and release subscriptions when watchers drop.
 The browser Git regression test edits and commits in a temporary repository
 without reloading the page.
 
+Keep the web user-settings subscription alive after startup, including its
+filesystem watch handle. Agent profile and permission changes must reach the
+running SettingsStore and existing composer controls without a page reload.
+`watch_config_file` and `watch_config_dir` must retain their `Watcher` handles.
+When loading language configs without parsers, strip only the grammar reference;
+preserve Markdown list, checkbox, bracket, and wrapping rules so the composer
+continues to use the desktop editor's formatting behavior.
+
 The threaded WASM build reserves a 128 MB initial shared heap and runs
 `web/scripts/patch-wasm-bindgen-memory.sh` after wasm-bindgen. This prevents
 normal startup from repeatedly growing shared memory and retries generated
