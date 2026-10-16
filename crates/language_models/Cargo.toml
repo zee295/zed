@@ -36,7 +36,6 @@ futures.workspace = true
 google_ai = { workspace = true, features = ["schemars"] }
 gpui.workspace = true
 http_client.workspace = true
-language.workspace = true
 language_model.workspace = true
 language_models_cloud.workspace = true
 llama_cpp = { workspace = true, features = ["schemars"] }
@@ -48,7 +47,7 @@ ollama = { workspace = true, features = ["schemars"] }
 open_ai = { workspace = true, features = ["schemars"] }
 openai_subscribed.workspace = true
 opencode = { workspace = true, features = ["schemars"] }
-open_router = { workspace = true, features = ["schemars"] }
+open_router.workspace = true
 paths.workspace = true
 rand.workspace = true
 release_channel.workspace = true

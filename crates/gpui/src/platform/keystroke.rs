@@ -672,6 +672,12 @@ impl AsKeystroke for KeybindingKeystroke {
     }
 }
 
+impl<T: AsKeystroke + ?Sized> AsKeystroke for &T {
+    fn as_keystroke(&self) -> &Keystroke {
+        (**self).as_keystroke()
+    }
+}
+
 fn display_modifiers(modifiers: &Modifiers, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     let operating_system = crate::operating_system();
     let is_mac = operating_system == crate::OperatingSystem::Mac;

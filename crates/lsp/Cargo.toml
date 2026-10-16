@@ -18,7 +18,7 @@ test-support = ["async-pipe"]
 [dependencies]
 web-time.workspace = true
 anyhow.workspace = true
-async-channel.workspace = true
+async-channel = { workspace = true, features = ["std"] }
 async-pipe = { workspace = true, optional = true }
 collections.workspace = true
 futures-lite.workspace = true

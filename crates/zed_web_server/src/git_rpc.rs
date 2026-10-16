@@ -75,6 +75,16 @@ pub fn dispatch(fs: &FsRpc, method: &str, params: &Value) -> Result<Value> {
         "GitRepository::diff" => diff(fs, params),
         "GitRepository::default_branch" => default_branch(fs, params),
         "GitRepository::update_ref" => update_ref(fs, params),
+        "GitRepository::create_ref" => null_command(
+            fs,
+            params,
+            &[
+                "update-ref",
+                string(params, "ref_name"),
+                string(params, "commit"),
+                "",
+            ],
+        ),
         "GitRepository::delete_ref" => delete_ref(fs, params),
         "GitRepository::repair_worktrees" => null_command(fs, params, &["worktree", "repair"]),
         "GitRepository::commit" => commit(fs, params),
@@ -1536,6 +1546,60 @@ fn default_branch(fs: &FsRpc, params: &Value) -> Result<Value> {
         }
     }
     Ok(Value::Null)
+}
+
+#[cfg(test)]
+mod ref_tests {
+    use super::*;
+
+    #[test]
+    fn create_ref_never_overwrites_an_existing_ref() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let fs = FsRpc::new(root.path().to_path_buf(), true)?;
+        let mut params = json!({"repo_path": "/workspace"});
+        git(&fs, &params, &["init"])?;
+        git(
+            &fs,
+            &params,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "first",
+            ],
+        )?;
+        let first = git_text(&fs, &params, &["rev-parse", "HEAD"])?
+            .trim()
+            .to_string();
+        params["ref_name"] = json!("refs/heads/created");
+        params["commit"] = json!(first);
+        dispatch(&fs, "GitRepository::create_ref", &params)?;
+        git(
+            &fs,
+            &params,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "second",
+            ],
+        )?;
+        params["commit"] = json!(git_text(&fs, &params, &["rev-parse", "HEAD"])?.trim());
+        assert!(dispatch(&fs, "GitRepository::create_ref", &params).is_err());
+        assert_eq!(
+            git_text(&fs, &params, &["rev-parse", "refs/heads/created"])?.trim(),
+            first
+        );
+        Ok(())
+    }
 }
 
 fn initial_graph_data(fs: &FsRpc, params: &Value) -> Result<Value> {

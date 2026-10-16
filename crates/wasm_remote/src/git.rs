@@ -1578,6 +1578,24 @@ impl GitRepository for RemoteGitRepository {
         ))
     }
 
+    fn create_ref(&self, ref_name: String, commit: String) -> BoxFuture<'_, Result<()>> {
+        let client = self.client.clone();
+        let repo_path = self.repo_path.clone();
+        async move {
+            client
+                .call_void(
+                    "GitRepository::create_ref",
+                    &json!({
+                        "repo_path": repo_path.to_string_lossy(),
+                        "ref_name": ref_name,
+                        "commit": commit,
+                    }),
+                )
+                .await
+        }
+        .boxed()
+    }
+
     fn update_ref(&self, ref_name: String, commit: String) -> BoxFuture<'_, Result<()>> {
         let client = self.client.clone();
         let repo_path = self.repo_path.clone();

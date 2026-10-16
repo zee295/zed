@@ -18,5 +18,5 @@ test-support = ["dep:parking_lot"]
 [dependencies]
 web-time.workspace = true
 parking_lot = { workspace = true, optional = true }
-serde.workspace = true
+serde = { workspace = true, features = ["derive"] }
 smallvec.workspace = true

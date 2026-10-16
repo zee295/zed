@@ -1,6 +1,7 @@
 #[cfg(not(target_family = "wasm"))]
 pub use extension_host::{
-    Event, ExtensionManifest, ExtensionOperation, ExtensionStore, is_version_compatible,
+    Event, ExtensionIndexEntry, ExtensionManifest, ExtensionOperation, ExtensionStatus,
+    ExtensionStore, is_version_compatible,
 };
 
 #[cfg(target_family = "wasm")]
@@ -62,6 +63,15 @@ mod remote {
         Upgrade,
         Install,
         Remove,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum ExtensionStatus {
+        NotInstalled,
+        Installing,
+        Upgrading,
+        Installed(Arc<str>),
+        Removing,
     }
 
     #[derive(Clone)]
@@ -1150,7 +1160,7 @@ mod remote {
                 .collect::<Vec<_>>();
             SettingsStore::update_global(cx, |store, cx| {
                 for language in &old_languages {
-                    store.remove_language_semantic_token_rules(language.as_ref(), cx);
+                    store.remove_language_semantic_token_rules(language.as_ref());
                 }
             });
             self.languages
@@ -1461,7 +1471,7 @@ mod remote {
 
             SettingsStore::update_global(cx, |store, cx| {
                 for (language, rules) in semantic_token_rules_to_add {
-                    store.set_language_semantic_token_rules(language.0, rules, cx);
+                    store.set_language_semantic_token_rules(language.0, rules);
                 }
             });
 
@@ -1477,6 +1487,24 @@ mod remote {
 
         pub fn outstanding_operations(&self) -> &BTreeMap<Arc<str>, ExtensionOperation> {
             &self.outstanding
+        }
+
+        pub fn extension_status(&self, extension_id: &str) -> ExtensionStatus {
+            match self.outstanding.get(extension_id) {
+                Some(ExtensionOperation::Install) => ExtensionStatus::Installing,
+                Some(ExtensionOperation::Remove) => ExtensionStatus::Removing,
+                Some(ExtensionOperation::Upgrade) => ExtensionStatus::Upgrading,
+                None => match self.installed.get(extension_id) {
+                    Some(entry) => ExtensionStatus::Installed(entry.manifest.version.clone()),
+                    None => ExtensionStatus::NotInstalled,
+                },
+            }
+        }
+
+        pub fn is_dev_extension(&self, extension_id: &str) -> bool {
+            self.installed
+                .get(extension_id)
+                .is_some_and(|entry| entry.dev)
         }
 
         pub fn installed_extensions(&self) -> &BTreeMap<Arc<str>, ExtensionIndexEntry> {

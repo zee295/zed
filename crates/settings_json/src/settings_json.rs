@@ -7,8 +7,6 @@ use std::ops::Range;
 use std::sync::LazyLock;
 #[cfg(all(feature = "editing", not(target_family = "wasm")))]
 use tree_sitter::{Query, StreamingIterator as _};
-#[cfg(all(feature = "editing", not(target_family = "wasm")))]
-use util::RangeExt;
 
 #[cfg(all(feature = "editing", not(target_family = "wasm")))]
 pub fn update_value_in_json_text<'a>(
@@ -143,7 +141,7 @@ pub fn replace_value_in_json_text<T: AsRef<str>>(
 
         // Don't enter sub objects until we find an exact
         // match for the current keypath
-        if last_value_range.contains_inclusive(&value_range) {
+        if last_value_range.start <= value_range.start && value_range.end <= last_value_range.end {
             continue;
         }
 

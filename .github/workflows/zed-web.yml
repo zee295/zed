@@ -18,6 +18,12 @@ on:
       - "crates/**"
       - "web/**"
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Optional versioned web release, for example v1.24.2-web.1"
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -35,6 +41,18 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Validate release version
+        if: inputs.release_tag != ''
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re, tomllib
+          version = tomllib.loads(pathlib.Path("crates/zed/Cargo.toml").read_text())["package"]["version"]
+          tag = os.environ["RELEASE_TAG"]
+          assert re.fullmatch(r"v" + re.escape(version) + r"-web\.[1-9][0-9]*", tag), "release tag must match the merged upstream version"
+          assert pathlib.Path(f"web/releases/{tag}.md").is_file(), "release notes are required"
+          PY
       - name: Install Linux dependencies
         timeout-minutes: 20
         env:
@@ -105,6 +123,11 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Authenticate Docker Hub base-image pulls
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Resolve upstream revision
         id: revisions
         run: |
@@ -151,3 +174,48 @@ jobs:
             --tag "${image}:zed-web-${{ github.sha }}" \
             "${image}:${{ github.sha }}-amd64" \
             "${image}:${{ github.sha }}-arm64"
+
+  release:
+    if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+    needs: manifest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Publish versioned images
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          image="ghcr.io/${{ github.repository_owner }}/zed-web"
+          if git rev-parse --verify "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            test "$(git rev-list -n 1 "${RELEASE_TAG}")" = "${{ github.sha }}"
+          fi
+          docker buildx imagetools create --tag "${image}:${version}" "${image}:zed-web-${{ github.sha }}"
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+          skopeo copy --all --preserve-digests "docker://${image}:${version}" "docker://${DOCKERHUB_USERNAME}/zed-web:${version}"
+          docker buildx imagetools create --tag "${DOCKERHUB_USERNAME}/zed-web:latest" "${DOCKERHUB_USERNAME}/zed-web:${version}"
+      - name: Publish GitHub release
+        run: |
+          version="${RELEASE_TAG#v}"
+          gh release create "${RELEASE_TAG}" --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" --title "Zed Web ${version}" \
+            --notes-file "web/releases/${RELEASE_TAG}.md" --latest

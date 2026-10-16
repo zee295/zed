@@ -396,7 +396,7 @@ fn register_plain_languages(languages: &language::LanguageRegistry, node_runtime
 
     for (name, suffixes, line_comments) in specs {
         let name = LanguageName::new(name);
-        let suffixes: Vec<String> = suffixes.iter().map(|s| (*s).to_string()).collect();
+        let suffixes: Vec<SharedString> = suffixes.iter().map(|s| (*s).into()).collect();
         let line_comments: Vec<Arc<str>> = line_comments.iter().map(|c| Arc::from(*c)).collect();
         let config = LanguageConfig {
             name: name.clone(),

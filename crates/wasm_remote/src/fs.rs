@@ -424,7 +424,10 @@ impl Fs for RemoteFs {
         }))
     }
 
-    async fn open_sync(&self, path: &std::path::Path) -> Result<Box<dyn io::Read + Send + Sync>> {
+    async fn open_sync(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<Box<dyn fs::ReadSeek + Send + Sync>> {
         let encoded: String = self
             .client
             .call("Fs::open_sync", &json!({ "path": path_arg(path) }))

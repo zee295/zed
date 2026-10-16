@@ -306,3 +306,14 @@ updates, then run `test-patch-wasm-bindgen-memory.sh` before the browser suite.
 
 Release images are tagged with both the web branch revision and the upstream
 base revision through `build-info.json`.
+
+For a versioned release, commit `web/releases/<tag>.md`, then dispatch the web
+workflow with a tag matching the merged Zed version:
+
+```sh
+gh workflow run zed-web.yml --ref zed-web -f release_tag=v1.24.2-web.1
+```
+
+The release job waits for backend/WASM checks and both architecture builds,
+copies the complete multi-architecture image to GHCR and Docker Hub under the
+versioned tag, then creates the GitHub release at the built source revision.

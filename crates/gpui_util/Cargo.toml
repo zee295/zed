@@ -10,7 +10,7 @@ doctest = false
 
 [dependencies]
 web-time.workspace = true
-log.workspace = true
+log = { workspace = true, features = ["serde"] }
 anyhow.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]

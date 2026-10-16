@@ -26,6 +26,6 @@ flate2 = "1"
 futures = "0.3"
 serde.workspace = true
 serde_json.workspace = true
-uuid = { workspace = true, features = ["js"] }
+uuid = { workspace = true, features = ["v4", "js"] }
 wasm-bindgen-futures.workspace = true
 wasm_rpc = { workspace = true }

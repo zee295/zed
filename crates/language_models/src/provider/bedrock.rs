@@ -133,6 +133,67 @@ impl BedrockCredentials {
     }
 }
 
+#[derive(Default, Clone, Debug, PartialEq)]
+pub struct AmazonBedrockSettings {
+    pub available_models: Vec<AvailableModel>,
+    pub mantle_available_models: Vec<MantleAvailableModel>,
+    pub custom_headers: CustomHeaders,
+    pub region: Option<String>,
+    pub endpoint: Option<String>,
+    pub profile_name: Option<String>,
+    pub role_arn: Option<String>,
+    pub authentication_method: Option<BedrockAuthMethod>,
+    pub allow_global: Option<bool>,
+    pub guardrail_identifier: Option<String>,
+    pub guardrail_version: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, EnumIter, IntoStaticStr, JsonSchema)]
+pub enum BedrockAuthMethod {
+    #[serde(rename = "named_profile")]
+    NamedProfile,
+    #[serde(rename = "sso")]
+    SingleSignOn,
+    #[serde(rename = "api_key")]
+    ApiKey,
+    /// IMDSv2, PodIdentity, env vars, etc.
+    #[serde(rename = "default")]
+    Automatic,
+}
+
+impl From<settings::BedrockAuthMethodContent> for BedrockAuthMethod {
+    fn from(value: settings::BedrockAuthMethodContent) -> Self {
+        match value {
+            settings::BedrockAuthMethodContent::SingleSignOn => BedrockAuthMethod::SingleSignOn,
+            settings::BedrockAuthMethodContent::Automatic => BedrockAuthMethod::Automatic,
+            settings::BedrockAuthMethodContent::NamedProfile => BedrockAuthMethod::NamedProfile,
+            settings::BedrockAuthMethodContent::ApiKey => BedrockAuthMethod::ApiKey,
+        }
+    }
+}
+
+fn thinking_from_settings(
+    thinking: Option<&settings::BedrockThinkingSettings>,
+) -> Option<bedrock::BedrockThinkingConfig> {
+    match thinking {
+        None | Some(settings::BedrockThinkingSettings::Enabled(false)) => None,
+        Some(settings::BedrockThinkingSettings::Enabled(true)) => {
+            Some(bedrock::BedrockThinkingConfig {
+                adaptive: false,
+                has_xhigh: false,
+                budget_tokens: None,
+            })
+        }
+        Some(settings::BedrockThinkingSettings::Config(thinking)) => {
+            Some(bedrock::BedrockThinkingConfig {
+                adaptive: thinking.adaptive.unwrap_or(false),
+                has_xhigh: thinking.has_xhigh.unwrap_or(false),
+                budget_tokens: thinking.budget_tokens,
+            })
+        }
+    }
+}
+
 fn mantle_protocol_from_settings(value: settings::BedrockMantleProtocolContent) -> MantleProtocol {
     match value {
         settings::BedrockMantleProtocolContent::ChatCompletions => MantleProtocol::ChatCompletions,
@@ -617,6 +678,9 @@ impl BedrockLanguageModelProvider {
                             min_total_token: config.min_total_token,
                         }
                     }),
+                    supports_tool_use: model.supports_tools,
+                    supports_images: model.supports_images,
+                    thinking: thinking_from_settings(model.thinking.as_ref()),
                 },
             );
         }
@@ -1010,7 +1074,7 @@ impl BedrockLanguageModelProvider {
 
         let request = match into_bedrock(
             request,
-            model_id,
+            model_id.clone(),
             config.default_temperature(),
             config.max_output_tokens(),
             config.thinking_mode(),
@@ -1024,7 +1088,6 @@ impl BedrockLanguageModelProvider {
         };
 
         let request = self.stream_bedrock_request(request, cx);
-        let display_name = config.display_name().to_string();
         let executor = cx.background_executor().clone();
         let future = request_limiter.stream(async move {
             let response = request.await.map_err(|err| match err {
@@ -1034,10 +1097,7 @@ impl BedrockLanguageModelProvider {
                             PROVIDER_NAME,
                             None,
                             Some("ValidationException".to_string()),
-                            format!(
-                                "{display_name} is not available in {region}. \
-                                 Try switching to a region where this model is supported."
-                            ),
+                            format!("Bedrock rejected model ID `{model_id}` in {region}: {msg}"),
                             None,
                             ProviderErrorCategory::InvalidRequest,
                         )
@@ -1980,7 +2040,7 @@ fn deny_tool_use_events(
 pub fn into_bedrock(
     request: LanguageModelRequest,
     model: String,
-    default_temperature: f32,
+    default_temperature: Option<f32>,
     max_output_tokens: u64,
     thinking_mode: BedrockModelMode,
     supports_caching: bool,
@@ -2334,7 +2394,7 @@ pub fn into_bedrock(
         thinking,
         metadata: None,
         stop_sequences: Vec::new(),
-        temperature: request.temperature.or(Some(default_temperature)),
+        temperature: request.temperature.or(default_temperature),
         top_k: None,
         top_p: None,
         guardrail_identifier,
@@ -2919,7 +2979,7 @@ mod tests {
                 ..Default::default()
             },
             "claude-sonnet-4-5".to_string(),
-            1.0,
+            Some(1.0),
             4096,
             BedrockModelMode::Default,
             true,
@@ -2983,6 +3043,101 @@ mod tests {
             config,
             BedrockModelConfig::Mantle(model) if model.display_name() == "Mantle Shared"
         ));
+    }
+
+    #[gpui::test]
+    fn custom_converse_model_capabilities_come_from_settings(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            gpui_tokio::init(cx);
+            let content = serde_json::json!({
+                "language_models": {
+                    "bedrock": {
+                        "available_models": [{
+                            "name": "us.anthropic.claude-custom-v1:0",
+                            "display_name": "Custom Claude",
+                            "max_tokens": 200000,
+                            "supports_tools": true,
+                            "supports_images": true,
+                            "thinking": {
+                                "budget_tokens": 8192
+                            }
+                        }],
+                    }
+                }
+            })
+            .to_string();
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store
+                    .set_user_settings(&content, cx)
+                    .expect("test settings should parse");
+            });
+        });
+        let provider = cx.update(|cx| {
+            BedrockLanguageModelProvider::new(
+                http_client::FakeHttpClient::with_404_response(),
+                Arc::new(NoCredentialsProvider),
+                cx,
+            )
+        });
+
+        let custom = cx
+            .update(|cx| provider.provided_models(cx))
+            .into_iter()
+            .find(|model| model.id.0.as_ref() == "us.anthropic.claude-custom-v1:0")
+            .expect("custom converse model should be offered");
+        assert!(custom.supports_tools);
+        assert!(custom.supports_images);
+        assert!(custom.supports_thinking);
+
+        let config = cx
+            .update(|cx| provider.config(&custom, cx))
+            .expect("the offered model should resolve");
+        match config {
+            BedrockModelConfig::Converse(model) => {
+                assert!(model.supports_tool_use());
+                assert!(model.supports_images());
+                assert!(model.supports_thinking());
+                assert_eq!(
+                    model.thinking_mode(),
+                    BedrockModelMode::Thinking {
+                        budget_tokens: Some(8192)
+                    }
+                );
+            }
+            BedrockModelConfig::Mantle(_) => panic!("expected a converse model"),
+        }
+    }
+
+    #[test]
+    fn thinking_settings_accept_bool_or_object() {
+        assert_eq!(
+            thinking_from_settings(Some(&settings::BedrockThinkingSettings::Enabled(true))),
+            Some(bedrock::BedrockThinkingConfig {
+                adaptive: false,
+                has_xhigh: false,
+                budget_tokens: None,
+            })
+        );
+        assert_eq!(
+            thinking_from_settings(Some(&settings::BedrockThinkingSettings::Enabled(false))),
+            None
+        );
+        assert_eq!(
+            thinking_from_settings(Some(&settings::BedrockThinkingSettings::Config(
+                settings::BedrockThinkingConfigSettings {
+                    adaptive: Some(true),
+                    has_xhigh: Some(true),
+                    budget_tokens: Some(10_000),
+                }
+            ))),
+            Some(bedrock::BedrockThinkingConfig {
+                adaptive: true,
+                has_xhigh: true,
+                budget_tokens: Some(10_000),
+            })
+        );
     }
 
     #[test]
@@ -3198,7 +3353,7 @@ mod tests {
                     ..Default::default()
                 },
                 model.to_string(),
-                1.0,
+                Some(1.0),
                 128_000,
                 BedrockModelMode::AdaptiveThinking {
                     effort: bedrock::BedrockAdaptiveThinkingEffort::High,
@@ -3223,6 +3378,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_custom_models_omit_temperature_unless_configured() {
+        let messages = vec![LanguageModelRequestMessage {
+            role: Role::User,
+            content: vec![MessageContent::Text("Hi".into())],
+            cache: false,
+            reasoning_details: None,
+        }];
+
+        let omitted = into_bedrock(
+            LanguageModelRequest {
+                messages: messages.clone(),
+                ..Default::default()
+            },
+            "us.xai.grok-4.6".to_string(),
+            None,
+            4096,
+            BedrockModelMode::Default,
+            false,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(omitted.temperature, None);
+
+        let configured = into_bedrock(
+            LanguageModelRequest {
+                messages,
+                ..Default::default()
+            },
+            "us.anthropic.claude-sonnet-4-7".to_string(),
+            Some(0.7),
+            4096,
+            BedrockModelMode::Default,
+            false,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(configured.temperature, Some(0.7));
     }
 
     #[test]

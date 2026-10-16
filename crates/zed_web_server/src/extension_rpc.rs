@@ -576,7 +576,7 @@ impl ExtensionHost {
                 let metadata = index.get(&id).and_then(Value::as_object);
                 let manifest = fs::read_to_string(self.directory.join(&id).join("extension.toml"))
                     .unwrap_or_default();
-                let parsed = manifest.parse::<toml::Value>().ok();
+                let parsed = toml::from_str::<toml::Value>(&manifest).ok();
                 let field = |name: &str| {
                     metadata
                         .and_then(|value| value.get(name))
@@ -618,7 +618,7 @@ impl ExtensionHost {
             let directory = self.directory.join(id);
             let manifest = fs::read_to_string(directory.join("extension.toml"))
                 .ok()
-                .and_then(|text| text.parse::<toml::Value>().ok());
+                .and_then(|text| toml::from_str::<toml::Value>(&text).ok());
             let themes = manifest_text_assets(&directory, manifest.as_ref(), "themes")?;
             let icon_themes = manifest_text_assets(&directory, manifest.as_ref(), "icon_themes")?;
             let icon_assets = text_assets(&directory, ".", "svg")?;
@@ -744,7 +744,7 @@ impl ExtensionHost {
             bail!("extension path is outside the workspace");
         }
         let manifest_text = fs::read_to_string(source.join("extension.toml"))?;
-        let manifest = manifest_text.parse::<toml::Value>()?;
+        let manifest = toml::from_str::<toml::Value>(&manifest_text)?;
         let id = manifest
             .get("id")
             .and_then(toml::Value::as_str)
@@ -1075,7 +1075,7 @@ mod tests {
             language.join("semantic_token_rules.json"),
             "[{\"token_type\":\"variable\",\"style\":[\"italic\"]}]",
         )?;
-        let manifest = r#"languages = ["languages/example"]"#.parse::<toml::Value>()?;
+        let manifest = toml::from_str::<toml::Value>(r#"languages = ["languages/example"]"#)?;
 
         let assets = language_assets(temporary.path(), Some(&manifest))?;
         assert_eq!(assets.len(), 1);
@@ -1099,7 +1099,7 @@ mod tests {
             temporary.path().join("custom/theme.json"),
             "{\"name\":\"Example\"}",
         )?;
-        let manifest = r#"themes = ["custom/theme.json"]"#.parse::<toml::Value>()?;
+        let manifest = toml::from_str::<toml::Value>(r#"themes = ["custom/theme.json"]"#)?;
 
         let assets = manifest_text_assets(temporary.path(), Some(&manifest), "themes")?;
         assert_eq!(assets.len(), 1);
@@ -1116,11 +1116,12 @@ mod tests {
             temporary.path().join("schemas/example.json"),
             "{\"type\":\"object\",\"required\":[\"program\"]}",
         )?;
-        let manifest = r#"
+        let manifest = toml::from_str::<toml::Value>(
+            r#"
             [debug_adapters.example]
             schema_path = "schemas/example.json"
-        "#
-        .parse::<toml::Value>()?;
+        "#,
+        )?;
 
         let assets = debug_adapter_assets(temporary.path(), Some(&manifest))?;
         assert_eq!(assets.len(), 1);
