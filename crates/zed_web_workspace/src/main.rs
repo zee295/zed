@@ -1249,7 +1249,7 @@ fn init_app_state(
     cx.set_http_client(proxy_http.clone());
     let http_client = Arc::new(HttpClientWithUrl::new(
         proxy_http.clone(),
-        &server_origin,
+        &<client::ClientSettings as settings::Settings>::get_global(cx).server_url,
         None,
     ));
     let client = Client::new(clock, http_client, cx);
@@ -1366,6 +1366,9 @@ fn init_app_state(
     // Model providers (Anthropic / OpenAI / …) talk over the wasm Fetch HTTP
     // client; API keys come from the host via the wasm credentials shim.
     language_models::init(app_state.user_store.clone(), app_state.client.clone(), cx);
+    client
+        .restore_sign_in(&cx.to_async())
+        .detach_and_log_err(cx);
     // Use the proxy-backed client (not the blocked `client.http_client()`) so the
     // ACP registry CDN fetch and other direct requests work in the browser.
     project::AgentRegistryStore::init_global(cx, app_state.fs.clone(), proxy_http.clone());

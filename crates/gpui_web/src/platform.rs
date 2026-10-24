@@ -96,6 +96,38 @@ struct BrowserUploadResponse {
     roots: Vec<String>,
 }
 
+async fn browser_credentials(request: serde_json::Value) -> Result<serde_json::Value> {
+    let init = web_sys::RequestInit::new();
+    init.set_method("POST");
+    init.set_credentials(web_sys::RequestCredentials::SameOrigin);
+    init.set_body(&JsValue::from_str(&serde_json::to_string(&request)?));
+    let request = web_sys::Request::new_with_str_and_init("/credentials", &init)
+        .map_err(|error| anyhow::anyhow!("credential request failed: {error:?}"))?;
+    request
+        .headers()
+        .set("content-type", "application/json")
+        .map_err(|error| anyhow::anyhow!("credential request headers failed: {error:?}"))?;
+    let window = web_sys::window().ok_or_else(|| anyhow::anyhow!("browser window unavailable"))?;
+    let response = wasm_bindgen_futures::JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|error| anyhow::anyhow!("credential storage request failed: {error:?}"))?
+        .dyn_into::<web_sys::Response>()
+        .map_err(|_| anyhow::anyhow!("invalid credential response"))?;
+    if !response.ok() {
+        anyhow::bail!("credential storage returned HTTP {}", response.status());
+    }
+    let text = wasm_bindgen_futures::JsFuture::from(
+        response
+            .text()
+            .map_err(|_| anyhow::anyhow!("invalid credential response body"))?,
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("failed to read credential response"))?
+    .as_string()
+    .ok_or_else(|| anyhow::anyhow!("invalid credential response text"))?;
+    Ok(serde_json::from_str(&text)?)
+}
+
 async fn upload_browser_files(
     files: Vec<web_sys::File>,
     directories_only: bool,
@@ -889,20 +921,26 @@ impl Platform for WebPlatform {
         }
     }
 
-    fn write_credentials(&self, _url: &str, _username: &str, _password: &[u8]) -> Task<Result<()>> {
-        Task::ready(Err(anyhow::anyhow!(
-            "credential storage is not available on the web"
-        )))
+    fn write_credentials(&self, url: &str, username: &str, password: &[u8]) -> Task<Result<()>> {
+        let request = serde_json::json!({"operation": "write", "url": url, "username": username, "password": password});
+        self.foreground_executor.spawn(async move {
+            browser_credentials(request).await?;
+            Ok(())
+        })
     }
 
-    fn read_credentials(&self, _url: &str) -> Task<Result<Option<(String, Vec<u8>)>>> {
-        Task::ready(Ok(None))
+    fn read_credentials(&self, url: &str) -> Task<Result<Option<(String, Vec<u8>)>>> {
+        let request = serde_json::json!({"operation": "read", "url": url});
+        self.foreground_executor
+            .spawn(async move { Ok(serde_json::from_value(browser_credentials(request).await?)?) })
     }
 
-    fn delete_credentials(&self, _url: &str) -> Task<Result<()>> {
-        Task::ready(Err(anyhow::anyhow!(
-            "credential storage is not available on the web"
-        )))
+    fn delete_credentials(&self, url: &str) -> Task<Result<()>> {
+        let request = serde_json::json!({"operation": "delete", "url": url});
+        self.foreground_executor.spawn(async move {
+            browser_credentials(request).await?;
+            Ok(())
+        })
     }
 
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {

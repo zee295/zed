@@ -81,6 +81,26 @@
             font-size: 22px;
             line-height: 1;
         }
+        #zed-oauth-dialog {
+            position: fixed; inset: 0; margin: auto;
+            width: min(440px, calc(100vw - 32px)); box-sizing: border-box;
+            padding: 20px; color: #e4e4e7; background: #292c33;
+            border: 1px solid #555963; border-radius: 6px;
+            font: 14px/1.5 system-ui, sans-serif;
+        }
+        #zed-oauth-dialog::backdrop { background: #0008; }
+        #zed-oauth-dialog h2 { margin: 0 0 8px; font-size: 18px; }
+        #zed-oauth-dialog input {
+            display: block; width: 100%; box-sizing: border-box; margin: 12px 0;
+            padding: 8px; color: inherit; background: #202329;
+            border: 1px solid #626773; border-radius: 4px; font: inherit;
+        }
+        #zed-oauth-dialog .actions { display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end; }
+        #zed-oauth-dialog button, #zed-oauth-dialog a {
+            color: inherit; font: inherit; padding: 6px 12px;
+        }
+        #zed-oauth-dialog button { background: #383d46; border: 1px solid #626773; border-radius: 4px; cursor: pointer; }
+        #zed-oauth-dialog [role="alert"] { color: #ffa7a7; overflow-wrap: anywhere; }
     </style>
 </head>
 <body>
@@ -89,6 +109,94 @@
         import init from "./zed_web_workspace.js";
 
         const allowedExternalProtocols = new Set(["http:", "https:", "mailto:"]);
+        const oauthCallbacks = new Map();
+
+        globalThis.__zedCancelOAuthCallback = (redirectUri) => oauthCallbacks.get(redirectUri)?.cancel();
+        globalThis.__zedWaitOAuthCallback = (redirectUri) => {
+            const redirect = new URL(redirectUri);
+            if (redirect.protocol !== "http:" || !["localhost", "127.0.0.1", "[::1]"].includes(redirect.hostname) || !redirect.port) {
+                return Promise.reject(new Error("Invalid sign-in redirect"));
+            }
+            oauthCallbacks.get(redirectUri)?.cancel();
+            return new Promise((resolve, reject) => {
+                let dialog;
+                let timer;
+                const finish = (error, query) => {
+                    clearTimeout(timer);
+                    oauthCallbacks.delete(redirectUri);
+                    dialog?.remove();
+                    if (error) reject(new Error(error)); else resolve(query);
+                };
+                const pending = {
+                    cancel: () => finish("Sign-in canceled"),
+                    open: (authorizationUrl) => {
+                        if (dialog) return;
+                        // A registered loopback redirect cannot be changed to the remote host.
+                        // Let the user relay it without exposing a listener on their device.
+                        document.getElementById("zed-oauth-dialog")?.dispatchEvent(new Event("cancel", {cancelable: true}));
+                        dialog = document.createElement("dialog");
+                        dialog.id = "zed-oauth-dialog";
+                        dialog.setAttribute("aria-label", "Complete provider sign-in");
+                        const title = document.createElement("h2");
+                        title.textContent = "Complete sign-in";
+                        const description = document.createElement("p");
+                        description.textContent = "After signing in, paste the full localhost URL from the browser address bar here. The localhost page may not open on this device.";
+                        const form = document.createElement("form");
+                        const input = document.createElement("input");
+                        input.type = "url";
+                        input.required = true;
+                        input.autocomplete = "off";
+                        input.spellcheck = false;
+                        input.placeholder = `${redirect.origin}${redirect.pathname}?...`;
+                        input.setAttribute("aria-label", "Sign-in callback URL");
+                        const error = document.createElement("p");
+                        error.setAttribute("role", "alert");
+                        const actions = document.createElement("div");
+                        actions.className = "actions";
+                        const open = document.createElement("a");
+                        open.href = authorizationUrl.href;
+                        open.target = "_blank";
+                        open.rel = "noopener noreferrer";
+                        open.textContent = "Open Sign In";
+                        const cancel = document.createElement("button");
+                        cancel.type = "button";
+                        cancel.textContent = "Cancel";
+                        cancel.addEventListener("click", pending.cancel);
+                        const submit = document.createElement("button");
+                        submit.type = "submit";
+                        submit.textContent = "Continue";
+                        actions.append(open, cancel, submit);
+                        form.append(input, error, actions);
+                        form.addEventListener("submit", (event) => {
+                            event.preventDefault();
+                            try {
+                                const callback = new URL(input.value.trim());
+                                if (callback.origin !== redirect.origin || callback.pathname !== redirect.pathname || callback.username || callback.password) {
+                                    throw new Error("Paste the callback URL for this sign-in attempt.");
+                                }
+                                const state = authorizationUrl.searchParams.get("state");
+                                if (state && callback.searchParams.get("state") !== state) {
+                                    throw new Error("The sign-in state does not match. Try signing in again.");
+                                }
+                                if (!callback.searchParams.has("error") && (state
+                                    ? !callback.searchParams.get("code")
+                                    : !(callback.searchParams.get("user_id") && callback.searchParams.get("access_token")))) {
+                                    throw new Error("The callback URL is missing sign-in details.");
+                                }
+                                finish(null, callback.search.slice(1));
+                            } catch (failure) { error.textContent = failure.message; }
+                        });
+                        dialog.addEventListener("cancel", (event) => { event.preventDefault(); pending.cancel(); });
+                        dialog.append(title, description, form);
+                        document.body.append(dialog);
+                        dialog.showModal();
+                        open.focus();
+                    },
+                };
+                oauthCallbacks.set(redirectUri, pending);
+                timer = setTimeout(() => finish("Sign-in expired"), 120000);
+            });
+        };
 
         function showExternalLinkPrompt(url) {
             document.getElementById("zed-external-link-prompt")?.remove();
@@ -133,6 +241,18 @@
             if (!allowedExternalProtocols.has(url.protocol)) {
                 console.warn(`Zed refused external URL protocol ${url.protocol}`);
                 return false;
+            }
+
+            let redirectUri = url.searchParams.get("redirect_uri");
+            if (!redirectUri && ["zed.dev", "staging.zed.dev"].includes(url.hostname) && url.pathname === "/native_app_signin") {
+                redirectUri = `http://127.0.0.1:${url.searchParams.get("native_app_port")}/`;
+            }
+            const oauth = oauthCallbacks.get(redirectUri);
+            if (oauth) {
+                oauth.open(url);
+                const opened = window.open(url.href, "_blank");
+                if (opened) opened.opener = null;
+                return Boolean(opened);
             }
 
             const opened = window.open(url.href, "_blank");

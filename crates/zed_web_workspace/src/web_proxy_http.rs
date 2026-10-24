@@ -25,7 +25,21 @@ struct ProxyRoute {
 /// Maps a provider API URI to the proxy provider id used by the Rust server.
 fn proxy_route(uri: &http::Uri) -> Option<ProxyRoute> {
     let host = uri.host().unwrap_or_default();
-    if host.eq_ignore_ascii_case("api.anthropic.com") {
+    if let Some(provider) = match host.to_ascii_lowercase().as_str() {
+        "auth.openai.com" => Some("openai-auth"),
+        "chatgpt.com" => Some("chatgpt"),
+        "auth.x.ai" => Some("xai-auth"),
+        "api.x.ai" => Some("xai"),
+        "zed.dev" => Some("zed"),
+        "api.zed.dev" => Some("zed-api"),
+        "cloud.zed.dev" => Some("zed-cloud"),
+        _ => None,
+    } {
+        Some(ProxyRoute {
+            provider,
+            strip_auth: false,
+        })
+    } else if host.eq_ignore_ascii_case("api.anthropic.com") {
         Some(ProxyRoute {
             provider: "anthropic",
             strip_auth: true,
@@ -163,6 +177,29 @@ impl HttpClient for ProxyHttpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscription_auth_and_model_requests_keep_their_authorization() -> anyhow::Result<()> {
+        for (host, provider) in [
+            ("auth.openai.com", "openai-auth"),
+            ("chatgpt.com", "chatgpt"),
+            ("auth.x.ai", "xai-auth"),
+            ("api.x.ai", "xai"),
+            ("zed.dev", "zed"),
+            ("api.zed.dev", "zed-api"),
+            ("cloud.zed.dev", "zed-cloud"),
+        ] {
+            let uri = format!("https://{host}/oauth/token?test=1").parse()?;
+            let route =
+                proxy_route(&uri).ok_or_else(|| anyhow::anyhow!("missing provider route"))?;
+            assert_eq!(route.provider, provider);
+            assert!(!route.strip_auth);
+        }
+        assert!(
+            proxy_route(&"https://auth.openai.com.attacker.example/oauth/token".parse()?).is_none()
+        );
+        Ok(())
+    }
 
     #[test]
     fn maps_default_local_model_endpoints() {

@@ -67,6 +67,7 @@ rpc = { workspace = true, features = ["gpui"] }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 rpc = { path = "../rpc", default-features = false, features = ["gpui"] }
+oauth_callback_server.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 semver.workspace = true

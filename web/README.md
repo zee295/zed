@@ -112,6 +112,21 @@ The one image contains:
 - compressed fonts, icons, themes, prompts, images, and sounds
 - Git, SSH, Node/npm, shells, and terminal runtime dependencies
 
+## Provider Sign-In
+
+ChatGPT Subscription, SuperGrok, and Zed account sign-in use the upstream
+authorization flow. In a remote browser deployment their registered localhost
+redirect cannot reach the container automatically. After signing in in the new
+tab, copy its full localhost callback URL into **Complete sign-in** in Zed Web.
+The dialog validates the callback address and OAuth state. Canceling or timing
+out discards the pending attempt. Do not share callback URLs.
+
+Provider credentials are stored encrypted in `.zed/web-credentials` on the
+server, not in browser local storage. Keep the persistent workspace and its
+web access token; changing that token requires signing into providers again.
+The container account can access these credentials, just as it can access ACP
+agent credentials and project files. Use HTTPS for remote access.
+
 ## MCP Servers
 
 The image includes the server-side MCP runtime, but it does not preconfigure a
@@ -269,6 +284,17 @@ Review every allowlist change rather than accepting it mechanically.
 Keep `zed_web_workspace` explicitly opted into `gpui_web/multithreaded`.
 Upstream disables default features on the workspace dependency, so inheriting
 it alone no longer starts the browser's background worker pool.
+
+Preserve the browser callback implementation in `oauth_callback_server`, the
+GPUI credential bridge, and `WasmCredentialsProvider` delegation when merging
+provider changes. Subscription token/model requests and Zed Cloud requests must
+remain server-proxied; the Zed account client's base URL must be its configured
+Zed server, not the web workspace origin. Keep desktop OAuth redirect addresses
+unchanged and validate each relayed callback against its pending state.
+Subscription token expiry and refresh checks must use `web_time::SystemTime`;
+`std::time::SystemTime::now()` also panics in the browser. Keep the mocked
+native ChatGPT/SuperGrok sign-in tests covering callback, PKCE exchange, and
+credential persistence so a successful token response cannot hide that panic.
 
 Node.js discovery in WASM must probe through the remote process bridge;
 browser-local `which`, PATH lookup, and absolute-path resolution cannot inspect

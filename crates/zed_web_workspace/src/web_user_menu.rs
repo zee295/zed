@@ -197,10 +197,8 @@ pub fn render_user_menu_button(_workspace: WeakEntity<Workspace>, _cx: &mut App)
                                 .child(Label::new("Sign In").color(Color::Muted))
                                 .into_any_element()
                         },
-                        move |_, cx| {
-                            // Account auth needs the collab client; open the
-                            // account page until web sign-in is wired.
-                            cx.open_url("https://zed.dev/sign_in");
+                        move |window, cx| {
+                            window.dispatch_action(Box::new(client::SignIn), cx);
                         },
                     )
             })

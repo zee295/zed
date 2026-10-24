@@ -54,6 +54,7 @@ crates/docs_preprocessor/actions.json
 /.zed/extensions/
 /.zed/remote.sqlite*
 /.zed/web-auth-token
+/.zed/web-credentials/
 /.zed/web-workspace-state.json
 
 # Visual test baseline images (these will be stored outside

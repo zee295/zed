@@ -493,10 +493,12 @@ pub use server::{
 };
 
 #[cfg(target_family = "wasm")]
-mod wasm_stub {
+mod browser {
     use anyhow::{Result, anyhow};
     use futures::channel::oneshot;
+    use futures::{FutureExt as _, future::Either};
     use url::Url;
+    use wasm_bindgen::{JsCast as _, JsValue};
 
     /// Parsed OAuth callback parameters from the authorization server redirect.
     pub struct OAuthCallbackParams {
@@ -513,8 +515,9 @@ mod wasm_stub {
             let mut state = None;
             for (key, value) in url.query_pairs() {
                 match key.as_ref() {
-                    "code" => code = Some(value.into_owned()),
-                    "state" => state = Some(value.into_owned()),
+                    "error" => anyhow::bail!("OAuth authorization failed: {value}"),
+                    "code" if !value.is_empty() => code = Some(value.into_owned()),
+                    "state" if !value.is_empty() => state = Some(value.into_owned()),
                     _ => {}
                 }
             }
@@ -526,25 +529,116 @@ mod wasm_stub {
     }
 
     /// Configuration for the loopback OAuth callback server.
-    pub struct OAuthCallbackServerConfig;
+    #[derive(Clone, Copy)]
+    pub struct OAuthCallbackServerConfig {
+        pub host: &'static str,
+        pub preferred_port: u16,
+        pub fallback_port: Option<u16>,
+        pub path: &'static str,
+    }
+
+    impl Default for OAuthCallbackServerConfig {
+        fn default() -> Self {
+            Self {
+                host: "127.0.0.1",
+                preferred_port: 49152,
+                fallback_port: None,
+                path: "/callback",
+            }
+        }
+    }
+
+    pub fn wait_for_browser_callback(
+        redirect_uri: &str,
+    ) -> Result<oneshot::Receiver<Result<String>>> {
+        let window = web_sys::window().ok_or_else(|| anyhow!("browser window unavailable"))?;
+        let register = js_sys::Reflect::get(&window, &JsValue::from_str("__zedWaitOAuthCallback"))
+            .map_err(|_| anyhow!("browser authentication bridge unavailable"))?
+            .dyn_into::<js_sys::Function>()
+            .map_err(|_| anyhow!("browser authentication bridge unavailable"))?;
+        let promise = register
+            .call1(&window, &JsValue::from_str(redirect_uri))
+            .map_err(|_| anyhow!("failed to start browser authentication"))?
+            .dyn_into::<js_sys::Promise>()
+            .map_err(|_| anyhow!("invalid authentication bridge response"))?;
+        let redirect_uri = redirect_uri.to_string();
+        let (mut sender, receiver) = oneshot::channel();
+        wasm_bindgen_futures::spawn_local(async move {
+            let callback = wasm_bindgen_futures::JsFuture::from(promise).fuse();
+            let result = {
+                let canceled = sender.cancellation().fuse();
+                futures::pin_mut!(callback, canceled);
+                match futures::future::select(callback, canceled).await {
+                    Either::Left((result, _)) => Some(result),
+                    Either::Right(_) => None,
+                }
+            };
+            if let Some(result) = result {
+                let result = result
+                    .map_err(|_| anyhow!("sign-in canceled or expired"))
+                    .and_then(|value| {
+                        value
+                            .as_string()
+                            .ok_or_else(|| anyhow!("invalid authentication callback"))
+                    });
+                if sender.send(result).is_err() {
+                    web_sys::console::debug_1(&JsValue::from_str("authentication receiver closed"));
+                }
+            } else if let Ok(cancel) =
+                js_sys::Reflect::get(&window, &JsValue::from_str("__zedCancelOAuthCallback"))
+                && let Ok(cancel) = cancel.dyn_into::<js_sys::Function>()
+                && cancel
+                    .call1(&window, &JsValue::from_str(&redirect_uri))
+                    .is_err()
+            {
+                web_sys::console::warn_1(&JsValue::from_str(
+                    "failed to cancel authentication callback",
+                ));
+            }
+        });
+        Ok(receiver)
+    }
 
     /// Start a loopback HTTP server to receive the OAuth authorization callback.
     pub fn start_oauth_callback_server()
     -> Result<(String, oneshot::Receiver<Result<OAuthCallbackParams>>)> {
-        Err(anyhow!(
-            "OAuth callback server is not supported in the browser"
-        ))
+        start_oauth_callback_server_with_config(OAuthCallbackServerConfig::default())
     }
 
     /// Start a loopback HTTP server with custom host/port/path.
     pub fn start_oauth_callback_server_with_config(
-        _config: OAuthCallbackServerConfig,
+        config: OAuthCallbackServerConfig,
     ) -> Result<(String, oneshot::Receiver<Result<OAuthCallbackParams>>)> {
-        Err(anyhow!(
-            "OAuth callback server is not supported in the browser"
-        ))
+        let port = if config.preferred_port == 0 {
+            49152
+        } else {
+            config.preferred_port
+        };
+        let redirect_uri = format!("http://{}:{port}{}", config.host, config.path);
+        let mut callback = wait_for_browser_callback(&redirect_uri)?;
+        let (mut sender, receiver) = oneshot::channel();
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = {
+                let canceled = sender.cancellation();
+                futures::pin_mut!(canceled);
+                match futures::future::select(&mut callback, canceled).await {
+                    Either::Left((result, _)) => Some(result),
+                    Either::Right(_) => None,
+                }
+            };
+            if let Some(result) = result {
+                let result = result
+                    .map_err(|_| anyhow!("OAuth callback canceled"))
+                    .and_then(|result| result)
+                    .and_then(|query| OAuthCallbackParams::parse_query(&query));
+                if sender.send(result).is_err() {
+                    web_sys::console::debug_1(&JsValue::from_str("OAuth receiver closed"));
+                }
+            }
+        });
+        Ok((redirect_uri, receiver))
     }
 }
 
 #[cfg(target_family = "wasm")]
-pub use wasm_stub::*;
+pub use browser::*;

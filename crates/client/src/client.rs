@@ -371,28 +371,31 @@ struct WasmCredentialsProvider;
 impl credentials_provider::CredentialsProvider for WasmCredentialsProvider {
     fn read_credentials<'a>(
         &'a self,
-        _url: &'a str,
-        _cx: &'a AsyncApp,
+        url: &'a str,
+        cx: &'a AsyncApp,
     ) -> Pin<Box<dyn Future<Output = Result<Option<(String, Vec<u8>)>>> + 'a>> {
-        Box::pin(async move { Ok(None) })
+        Box::pin(async move { cx.update(|cx| cx.read_credentials(url)).await })
     }
 
     fn write_credentials<'a>(
         &'a self,
-        _url: &'a str,
-        _username: &'a str,
-        _password: &'a [u8],
-        _cx: &'a AsyncApp,
+        url: &'a str,
+        username: &'a str,
+        password: &'a [u8],
+        cx: &'a AsyncApp,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
-        Box::pin(async move { Ok(()) })
+        Box::pin(async move {
+            cx.update(|cx| cx.write_credentials(url, username, password))
+                .await
+        })
     }
 
     fn delete_credentials<'a>(
         &'a self,
-        _url: &'a str,
-        _cx: &'a AsyncApp,
+        url: &'a str,
+        cx: &'a AsyncApp,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
-        Box::pin(async move { Ok(()) })
+        Box::pin(async move { cx.update(|cx| cx.delete_credentials(url)).await })
     }
 }
 
@@ -999,6 +1002,27 @@ impl Client {
         );
 
         Ok(credentials)
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub fn restore_sign_in(self: &Arc<Self>, cx: &AsyncApp) -> Task<Result<()>> {
+        let client = self.clone();
+        cx.spawn(async move |cx| {
+            let Some(credentials) = client.credentials_provider.read_credentials(cx).await else {
+                return Ok(());
+            };
+            if !client.validate_credentials(&credentials, cx).await? {
+                client.credentials_provider.delete_credentials(cx).await?;
+                return Ok(());
+            }
+            client.set_id(credentials.user_id);
+            client
+                .cloud_client
+                .set_credentials(credentials.user_id as u32, credentials.access_token.clone());
+            client.state.write().credentials = Some(credentials);
+            client.set_status(Status::Authenticated, cx);
+            Ok(())
+        })
     }
 
     async fn validate_credentials(
@@ -1649,8 +1673,33 @@ impl Client {
 
     #[cfg(target_family = "wasm")]
     pub fn authenticate_with_browser(self: &Arc<Self>, cx: &AsyncApp) -> Task<Result<Credentials>> {
-        cx.spawn(async move |_cx| {
-            anyhow::bail!("authenticate_with_browser is not supported on WASM")
+        let http = self.http.clone();
+        cx.spawn(async move |cx| {
+            let (public_key, private_key) = cx
+                .background_executor()
+                .spawn(async { rpc::auth::keypair() })
+                .await?;
+            let public_key = String::try_from(public_key)?;
+            let redirect_uri = "http://127.0.0.1:49153/";
+            let callback = oauth_callback_server::wait_for_browser_callback(redirect_uri)?;
+            let query = serde_urlencoded::to_string([
+                ("native_app_port", "49153"),
+                ("native_app_public_key", public_key.as_str()),
+            ])?;
+            let url = http.build_url(&format!("/native_app_signin?{query}"));
+            cx.update(|cx| cx.open_url(&url));
+            let query = callback.await.context("Zed sign-in canceled")??;
+            #[derive(Deserialize)]
+            struct CallbackParams {
+                user_id: String,
+                access_token: String,
+            }
+            let callback: CallbackParams = serde_urlencoded::from_str(&query)?;
+            let access_token = private_key.decrypt_string(&callback.access_token)?;
+            Ok(Credentials {
+                user_id: callback.user_id.parse()?,
+                access_token,
+            })
         })
     }
 

@@ -1,7 +1,8 @@
 mod agent_rpc;
-mod binary_rpc;
 mod auth;
 mod auth_callback;
+mod binary_rpc;
+mod credential_store;
 mod debug_adapter;
 mod extension_rpc;
 mod fs_rpc;
@@ -135,6 +136,7 @@ async fn main() -> Result<()> {
     let protected = Router::new()
         .route("/rpc", get(websocket))
         .route("/sql", axum::routing::post(sql_http))
+        .route("/credentials", post(credential_store::request))
         .route(
             "/upload",
             post(upload_files).layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
@@ -504,6 +506,13 @@ async fn proxy_http(
     body: Bytes,
 ) -> Response {
     let (upstream, key_variables, auth_header, forward_client_auth) = match provider.as_str() {
+        "openai-auth" => ("https://auth.openai.com".into(), &[][..], "", true),
+        "chatgpt" => ("https://chatgpt.com".into(), &[][..], "", true),
+        "xai-auth" => ("https://auth.x.ai".into(), &[][..], "", true),
+        "xai" => ("https://api.x.ai".into(), &[][..], "", true),
+        "zed" => ("https://zed.dev".into(), &[][..], "", true),
+        "zed-api" => ("https://api.zed.dev".into(), &[][..], "", true),
+        "zed-cloud" => ("https://cloud.zed.dev".into(), &[][..], "", true),
         "anthropic" => (
             "https://api.anthropic.com".to_string(),
             &["ANTHROPIC_API_KEY", "ZED_AGENT_API_KEY"][..],

@@ -18,8 +18,8 @@ use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::form_urlencoded;
+use web_time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const PROVIDER_ID: LanguageModelProviderId = LanguageModelProviderId::new("x_ai_subscribed");
 pub const PROVIDER_NAME: LanguageModelProviderName = LanguageModelProviderName::new("SuperGrok");
@@ -727,7 +727,6 @@ async fn do_oauth_flow(
     http_client: Arc<dyn HttpClient>,
     cx: &AsyncApp,
 ) -> Result<SuperGrokCredentials> {
-    #[cfg(not(target_family = "wasm"))]
     let (redirect_uri, callback_rx) =
         oauth_callback_server::start_oauth_callback_server_with_config(
             oauth_callback_server::OAuthCallbackServerConfig {
@@ -738,12 +737,6 @@ async fn do_oauth_flow(
             },
         )
         .context("Failed to start OAuth callback server")?;
-    #[cfg(target_family = "wasm")]
-    let (redirect_uri, callback_rx) =
-        oauth_callback_server::start_oauth_callback_server_with_config(
-            oauth_callback_server::OAuthCallbackServerConfig,
-        )
-        .context("OAuth callback server is not available in the browser")?;
 
     let pkce = new_pkce_authorize_request(redirect_uri)?;
     cx.update(|cx| cx.open_url(&pkce.authorize_url));

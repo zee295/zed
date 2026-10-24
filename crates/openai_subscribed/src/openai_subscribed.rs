@@ -23,8 +23,8 @@ use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::form_urlencoded;
+use web_time::{Duration, SystemTime, UNIX_EPOCH};
 
 use open_ai::completion::{OpenAiResponseEventMapper, into_open_ai_response};
 
@@ -1052,7 +1052,6 @@ async fn do_oauth_flow(
     cx: &AsyncApp,
 ) -> Result<CodexCredentials> {
     // Start the callback server FIRST so the redirect URI is ready.
-    #[cfg(not(target_family = "wasm"))]
     let (redirect_uri, callback_rx) =
         oauth_callback_server::start_oauth_callback_server_with_config(
             oauth_callback_server::OAuthCallbackServerConfig {
@@ -1063,12 +1062,6 @@ async fn do_oauth_flow(
             },
         )
         .context("Failed to start OAuth callback server")?;
-    #[cfg(target_family = "wasm")]
-    let (redirect_uri, callback_rx) =
-        oauth_callback_server::start_oauth_callback_server_with_config(
-            oauth_callback_server::OAuthCallbackServerConfig,
-        )
-        .context("OAuth callback server is not available in the browser")?;
 
     // PKCE verifier: 32 random bytes → base64url (no padding)
     let mut verifier_bytes = [0u8; 32];

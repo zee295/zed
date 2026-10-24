@@ -602,6 +602,7 @@ pub(crate) fn is_server_owned_workspace_path(root: &Path, path: &Path) -> bool {
     };
     if relative.starts_with(Path::new(".config/zed"))
         || relative.starts_with(Path::new(".zed/extensions"))
+        || relative.starts_with(Path::new(".zed/web-credentials"))
     {
         return true;
     }
@@ -806,10 +807,15 @@ mod tests {
         fs::create_dir_all(root.path().join("src/nested"))?;
         fs::create_dir_all(root.path().join("node_modules/package"))?;
         fs::create_dir_all(root.path().join(".zed/extensions/example"))?;
+        fs::create_dir_all(root.path().join(".zed/web-credentials"))?;
         fs::create_dir_all(root.path().join(".config/zed/node/cache"))?;
         fs::write(root.path().join("src/nested/main.rs"), "fn main() {}")?;
         fs::write(root.path().join(".zed/settings.json"), "{}")?;
         fs::write(root.path().join(".zed/remote.sqlite-wal"), "runtime state")?;
+        fs::write(
+            root.path().join(".zed/web-credentials/test"),
+            "encrypted credential",
+        )?;
         fs::write(
             root.path().join(".zed/extensions/example/extension.toml"),
             "id = \"example\"",
@@ -844,6 +850,7 @@ mod tests {
         let serialized = tree.to_string();
         assert!(!serialized.contains("remote.sqlite"));
         assert!(!serialized.contains(&path(".zed/extensions")));
+        assert!(!serialized.contains(&path(".zed/web-credentials")));
         assert!(!serialized.contains(&path(".config/zed")));
         Ok(())
     }

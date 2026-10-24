@@ -3071,6 +3071,7 @@ dependencies = [
  "http_client",
  "http_client_tls",
  "log",
+ "oauth_callback_server",
  "objc2-foundation 0.3.2",
  "parking_lot",
  "paths",
@@ -11729,9 +11730,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures 0.3.34",
+ "js-sys",
  "log",
  "tiny_http",
  "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
  "web-time",
 ]
 
@@ -12366,6 +12371,7 @@ dependencies = [
  "sha2",
  "smol",
  "url",
+ "web-time",
 ]
 
 [[package]]
@@ -22397,6 +22403,7 @@ dependencies = [
  "sha2",
  "smol",
  "url",
+ "web-time",
  "x_ai",
 ]
 
@@ -23132,6 +23139,7 @@ dependencies = [
  "portable-pty",
  "rand 0.9.4",
  "reqwest_client",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",

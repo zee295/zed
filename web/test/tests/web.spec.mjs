@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createServer } from "node:http";
-import { createHash } from "node:crypto";
+import { createHash, createPublicKey, publicEncrypt } from "node:crypto";
 
 const tokenPath =
   process.env.ZED_WEB_TOKEN_PATH ?? ".zed/web-auth-token";
@@ -251,6 +251,227 @@ test("continues Markdown lists in the agent composer", async ({ browser, baseURL
   } finally {
     await context.close();
   }
+});
+
+test("persists provider credentials only on the authenticated server", async ({ browser, baseURL }) => {
+  const context = await browser.newContext();
+  const url = `https://provider-test.invalid/${Date.now()}`;
+  const password = [...Buffer.from("fake-provider-refresh-token")];
+  const request = operation => ({ data: { operation, url, username: "Bearer", password } });
+  try {
+    const unauthorized = await context.request.post(`${baseURL}/credentials`, request("read"));
+    expect(unauthorized.status()).toBe(401);
+    await authenticate(context, baseURL);
+    const saved = await context.request.post(`${baseURL}/credentials`, request("write"));
+    expect(saved.status()).toBe(200);
+    expect(saved.headers()["cache-control"]).toBe("no-store");
+    const fresh = await browser.newContext();
+    try {
+      await authenticate(fresh, baseURL);
+      const read = await fresh.request.post(`${baseURL}/credentials`, request("read"));
+      expect(await read.json()).toEqual(["Bearer", password]);
+      const crossOrigin = await fresh.request.post(`${baseURL}/credentials`, {
+        ...request("read"), headers: { Origin: "https://untrusted.example" },
+      });
+      expect(crossOrigin.status()).toBe(403);
+    } finally { await fresh.close(); }
+  } finally {
+    await context.request.post(`${baseURL}/credentials`, request("delete"));
+    await context.close();
+  }
+});
+
+test("opens Zed account sign-in from the native command action", async ({ browser, baseURL }) => {
+  const context = await browser.newContext();
+  try {
+    await authenticate(context, baseURL);
+    const existing = await context.request.post(`${baseURL}/credentials`, {
+      data: { operation: "read", url: "https://zed.dev" },
+    });
+    test.skip(await existing.json() !== null, "Preserve an existing Zed account session");
+    const page = await context.newPage();
+    const errors = await openWorkspace(page, baseURL);
+    await page.evaluate(() => { window.open = () => null; });
+    const primary = await page.evaluate(() => /Mac/.test(navigator.platform) ? "Meta" : "Control");
+    await page.keyboard.press(`${primary}+Shift+p`);
+    await page.keyboard.type("client: sign in");
+    await page.keyboard.press("Enter");
+    const dialog = page.getByRole("dialog", { name: "Complete provider sign-in" });
+    await expect(dialog).toBeVisible();
+    const authorization = new URL(await dialog.getByRole("link", { name: "Open Sign In" }).getAttribute("href"));
+    expect(authorization.origin).toBe("https://zed.dev");
+    expect(authorization.pathname).toBe("/native_app_signin");
+    expect(authorization.searchParams.get("native_app_public_key")).toBeTruthy();
+    await page.screenshot({ path: test.info().outputPath("zed-sign-in.png") });
+    await dialog.getByRole("button", { name: "Cancel" }).click();
+    await expect(dialog).not.toBeVisible();
+    expect(errors.filter(error => /panicked|RefCell|unreachable/.test(error))).toEqual([]);
+  } finally { await context.close(); }
+});
+
+test("completes native Zed account sign-in and restores it after reload", async ({ browser, baseURL }) => {
+  const context = await browser.newContext();
+  let stored;
+  let restored = false;
+  try {
+    await authenticate(context, baseURL);
+    await context.route("**/credentials", async route => {
+      const request = route.request().postDataJSON();
+      if (request.url !== "https://zed.dev") return route.fallback();
+      if (request.operation === "write") stored = request;
+      if (request.operation === "read" && stored) restored = true;
+      await route.fulfill({ json: request.operation === "read" && stored ? [stored.username, stored.password] : null });
+    });
+    await context.route("**/proxy/zed-cloud/**", route => route.fulfill({ json: {} }));
+    const page = await context.newPage();
+    const errors = await openWorkspace(page, baseURL);
+    await page.evaluate(() => { window.open = () => null; });
+    const primary = await page.evaluate(() => /Mac/.test(navigator.platform) ? "Meta" : "Control");
+    await page.keyboard.press(`${primary}+Shift+p`);
+    await page.keyboard.type("client: sign in");
+    await page.keyboard.press("Enter");
+    const dialog = page.getByRole("dialog", { name: "Complete provider sign-in" });
+    await expect(dialog).toBeVisible();
+    const authorization = new URL(await dialog.getByRole("link", { name: "Open Sign In" }).getAttribute("href"));
+    const key = createPublicKey({
+      key: Buffer.from(authorization.searchParams.get("native_app_public_key"), "base64url"),
+      format: "der", type: "pkcs1",
+    });
+    const encrypted = publicEncrypt({ key, oaepHash: "sha256" }, Buffer.from("fake-zed-token"))
+      .toString("base64").replaceAll("+", "-").replaceAll("/", "_");
+    const callback = new URL(`http://127.0.0.1:${authorization.searchParams.get("native_app_port")}/`);
+    callback.searchParams.set("user_id", "123456");
+    callback.searchParams.set("access_token", encrypted);
+    await dialog.getByRole("textbox", { name: "Sign-in callback URL" }).fill(callback.href);
+    await dialog.getByRole("button", { name: "Continue" }).click();
+    await expect.poll(() => stored?.username).toBe("123456");
+    expect(Buffer.from(stored.password).toString("utf8")).toBe("fake-zed-token");
+    await openWorkspace(page, baseURL);
+    await expect.poll(() => restored).toBe(true);
+    await expect(dialog).not.toBeVisible();
+    expect(errors.filter(error => /panicked|RefCell|unreachable|not supported|not available in the browser/.test(error))).toEqual([]);
+  } finally { await context.close(); }
+});
+
+for (const provider of [
+  { name: "ChatGPT", host: "auth.openai.com", proxy: "openai-auth", slot: "https://chatgpt.com/backend-api/codex", scroll: 760 },
+  { name: "SuperGrok", host: "auth.x.ai", proxy: "xai-auth", slot: "https://auth.x.ai/zed-supergrok", scroll: 4000 },
+]) {
+  test(`completes native ${provider.name} provider sign-in with a mocked token exchange`, async ({ browser, baseURL }) => {
+    const context = await browser.newContext();
+    let stored;
+    let tokenRequest;
+    try {
+      await authenticate(context, baseURL);
+      await context.route("**/credentials", async route => {
+        const request = route.request().postDataJSON();
+        if (request.url !== provider.slot) return route.fallback();
+        if (request.operation === "write") stored = request;
+        await route.fulfill({ json: null });
+      });
+      await context.route(`**/proxy/${provider.proxy}/**`, async route => {
+        tokenRequest = new URLSearchParams(route.request().postData());
+        await route.fulfill({ json: {
+          access_token: "fake-access-token", refresh_token: "fake-refresh-token",
+          expires_in: 3600, email: "test@example.invalid",
+        } });
+      });
+      await context.route("**/proxy/chatgpt/**", route => route.fulfill({ json: { models: [] } }));
+      const page = await context.newPage();
+      const errors = await openWorkspace(page, baseURL);
+      await page.evaluate(() => { window.open = () => null; });
+      const primary = await page.evaluate(() => /Mac/.test(navigator.platform) ? "Meta" : "Control");
+      await page.keyboard.press(`${primary}+,`);
+      await page.waitForTimeout(400);
+      await page.mouse.click(310, 448);
+      await page.waitForTimeout(250);
+      await page.mouse.click(1096, 552);
+      await page.waitForTimeout(300);
+      await page.mouse.move(950, 570);
+      await page.mouse.wheel(0, provider.scroll);
+      await page.waitForTimeout(400);
+      await page.mouse.click(1114, 590);
+      const dialog = page.getByRole("dialog", { name: "Complete provider sign-in" });
+      await expect(dialog).toBeVisible();
+      const authorization = new URL(await dialog.getByRole("link", { name: "Open Sign In" }).getAttribute("href"));
+      expect(authorization.hostname).toBe(provider.host);
+      const callback = new URL(authorization.searchParams.get("redirect_uri"));
+      callback.searchParams.set("code", "test-code");
+      callback.searchParams.set("state", authorization.searchParams.get("state"));
+      await dialog.getByRole("textbox", { name: "Sign-in callback URL" }).fill(callback.href);
+      await dialog.getByRole("button", { name: "Continue" }).click();
+      await expect.poll(() => ({
+        username: stored?.username,
+        panics: errors.filter(error => /panicked|RefCell|unreachable/.test(error)),
+      })).toEqual({ username: "Bearer", panics: [] });
+      const saved = JSON.parse(Buffer.from(stored.password).toString("utf8"));
+      expect(saved.access_token).toBe("fake-access-token");
+      expect(saved.refresh_token).toBe("fake-refresh-token");
+      expect(tokenRequest.get("code")).toBe("test-code");
+      expect(createHash("sha256").update(tokenRequest.get("code_verifier")).digest("base64url"))
+        .toBe(authorization.searchParams.get("code_challenge"));
+      await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+      expect(errors.filter(error => /panicked|RefCell|unreachable|not supported|not available in the browser/.test(error))).toEqual([]);
+      await page.screenshot({ path: test.info().outputPath(`${provider.name.toLowerCase()}-signed-in.png`) });
+    } finally { await context.close(); }
+  });
+}
+
+test("validates subscription and Zed sign-in callbacks before completing", async ({ browser, baseURL }) => {
+  const context = await browser.newContext();
+  try {
+    await authenticate(context, baseURL);
+    const page = await context.newPage();
+    const errors = await openWorkspace(page, baseURL);
+    await page.setViewportSize({ width: 320, height: 650 });
+    for (const [redirect, authorization, query] of [
+      ["http://localhost:1455/auth/callback", "https://auth.openai.com/oauth/authorize?state=chatgpt-state", "code=test&state=chatgpt-state"],
+      ["http://127.0.0.1:56121/callback", "https://auth.x.ai/oauth2/authorize?state=grok-state", "code=test&state=grok-state"],
+      ["http://127.0.0.1:49153/", "https://zed.dev/native_app_signin?native_app_port=49153", "user_id=123&access_token=encrypted-test"],
+    ]) {
+      await page.evaluate(({ redirect, authorization }) => {
+        self.__zedOAuthTestResult = null;
+        self.__zedWaitOAuthCallback(redirect).then(
+          query => { self.__zedOAuthTestResult = { query }; },
+          error => { self.__zedOAuthTestResult = { error: error.message }; },
+        );
+        const url = new URL(authorization);
+        if (!url.searchParams.has("native_app_port")) url.searchParams.set("redirect_uri", redirect);
+        const open = window.open;
+        try { window.open = () => null; self.__zedOpenExternalUrl(url.href); }
+        finally { window.open = open; }
+      }, { redirect, authorization });
+      const dialog = page.getByRole("dialog", { name: "Complete provider sign-in" });
+      await expect(dialog).toBeVisible();
+      const bounds = await dialog.boundingBox();
+      expect(bounds.x).toBeGreaterThanOrEqual(0);
+      expect(bounds.x + bounds.width).toBeLessThanOrEqual(320);
+      await expect(dialog.getByRole("button", { name: "Continue" })).toBeInViewport();
+      const input = dialog.getByRole("textbox", { name: "Sign-in callback URL" });
+      await input.fill("http://untrusted.example/callback?code=stolen&state=wrong");
+      await dialog.getByRole("button", { name: "Continue" }).click();
+      await expect(dialog.getByRole("alert")).toContainText("callback URL for this sign-in");
+      expect(await page.evaluate(() => self.__zedOAuthTestResult)).toBeNull();
+      if (authorization.includes("state=")) {
+        await input.fill(`${redirect}?code=test&state=wrong`);
+        await dialog.getByRole("button", { name: "Continue" }).click();
+        await expect(dialog.getByRole("alert")).toContainText("state does not match");
+      }
+      await input.fill(`${redirect}?${query}`);
+      await dialog.getByRole("button", { name: "Continue" }).click();
+      await expect(dialog).not.toBeVisible();
+      await expect.poll(() => page.evaluate(() => self.__zedOAuthTestResult)).toEqual({ query });
+    }
+    await page.evaluate(() => {
+      self.__zedOAuthTestResult = null;
+      self.__zedWaitOAuthCallback("http://localhost:1455/auth/callback").catch(error => {
+        self.__zedOAuthTestResult = { error: error.message };
+      });
+      self.__zedCancelOAuthCallback("http://localhost:1455/auth/callback");
+    });
+    await expect.poll(() => page.evaluate(() => self.__zedOAuthTestResult?.error)).toBe("Sign-in canceled");
+    expect(errors).toEqual([]);
+  } finally { await context.close(); }
 });
 
 test("uploads browser files through the authenticated server", async ({

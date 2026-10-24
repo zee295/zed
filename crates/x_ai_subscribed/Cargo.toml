@@ -30,6 +30,7 @@ serde_json.workspace = true
 sha2.workspace = true
 smol.workspace = true
 url.workspace = true
+web-time.workspace = true
 x_ai.workspace = true
 
 [dev-dependencies]
