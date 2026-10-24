@@ -266,6 +266,10 @@ pushing `zed-web`.
 and test-only uses and fails when an upstream update introduces another one.
 Review every allowlist change rather than accepting it mechanically.
 
+Keep `zed_web_workspace` explicitly opted into `gpui_web/multithreaded`.
+Upstream disables default features on the workspace dependency, so inheriting
+it alone no longer starts the browser's background worker pool.
+
 Node.js discovery in WASM must probe through the remote process bridge;
 browser-local `which`, PATH lookup, and absolute-path resolution cannot inspect
 the server. Preserve the WASM branch of `SystemNode::discover` when merging
@@ -280,6 +284,12 @@ Keep upstream digest verification, staging, extraction, and executable handling
 in the native implementation; do not reintroduce browser download stubs or
 agent-specific installers. Downloads run outside the RPC receive loop so agent
 installation does not block filesystem and terminal requests.
+
+ACP v2 prompt responses acknowledge message insertion, not completion. Keep
+server-side activity tracking driven by `state_update` notifications as well as
+pending prompts; `running` and `requires_action` must retain agent/MCP processes
+across browser disconnects until an `idle` update arrives. Preserve v1's
+response-based completion and the regression tests for both response orders.
 
 `RemoteWatcher::add`/`remove` must forward additional subscriptions, particularly
 Git metadata and linked-worktree directories. The initial recursive project

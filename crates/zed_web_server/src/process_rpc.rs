@@ -115,6 +115,7 @@ struct AcpActivity {
     initialize_request: Option<Value>,
     initialize_response: Option<Value>,
     prompts: HashMap<String, String>,
+    active_sessions: HashSet<String>,
     suspended_sessions: HashSet<String>,
     deferred_output: VecDeque<(String, Vec<u8>)>,
     deferred_output_bytes: usize,
@@ -190,12 +191,19 @@ impl AcpActivity {
                     }
                     self.initialize_request = None;
                 }
-                if let Some(id) = value.get("id").map(Value::to_string) {
+                // ACP v2 returns a message receipt before foreground work ends.
+                // Keep that prompt active until the session reports idle.
+                if value
+                    .pointer("/result/messageId")
+                    .and_then(Value::as_str)
+                    .is_none()
+                    && let Some(id) = value.get("id").map(Value::to_string)
+                {
                     self.prompts.remove(&id);
                 }
             }
 
-            let suspended_session = value
+            let updated_session = value
                 .get("method")
                 .and_then(Value::as_str)
                 .is_some_and(|method| method == "session/update" || method == "session.update")
@@ -205,8 +213,29 @@ impl AcpActivity {
                         .or_else(|| value.pointer("/params/session_id"))
                         .and_then(Value::as_str)
                 })
-                .flatten()
-                .filter(|session_id| self.suspended_sessions.contains(*session_id));
+                .flatten();
+            if let Some(session_id) = updated_session
+                && value
+                    .pointer("/params/update/sessionUpdate")
+                    .and_then(Value::as_str)
+                    == Some("state_update")
+            {
+                match value
+                    .pointer("/params/update/state")
+                    .and_then(Value::as_str)
+                {
+                    Some("running" | "requires_action") => {
+                        self.active_sessions.insert(session_id.to_string());
+                    }
+                    Some("idle") => {
+                        self.active_sessions.remove(session_id);
+                        self.prompts.retain(|_, session| session != session_id);
+                    }
+                    _ => {}
+                }
+            }
+            let suspended_session =
+                updated_session.filter(|session_id| self.suspended_sessions.contains(*session_id));
             if let Some(session_id) = suspended_session {
                 self.defer_output(session_id.to_string(), with_newline(line));
             } else {
@@ -219,6 +248,12 @@ impl AcpActivity {
     fn suspend_active_sessions(&mut self) {
         self.suspended_sessions
             .extend(self.prompts.values().cloned());
+        self.suspended_sessions
+            .extend(self.active_sessions.iter().cloned());
+    }
+
+    fn running_session_ids(&self) -> impl Iterator<Item = &String> {
+        self.prompts.values().chain(self.active_sessions.iter())
     }
 
     fn defer_output(&mut self, session_id: String, frame: Vec<u8>) {
@@ -474,6 +509,7 @@ impl ProcessManager {
             }
             if let Ok(mut activity) = completed_activity.lock() {
                 activity.prompts.clear();
+                activity.active_sessions.clear();
             }
             notify(
                 &outgoing,
@@ -762,7 +798,7 @@ impl ProcessManager {
             .processes
             .values()
             .filter_map(|entry| entry.acp_activity.lock().ok())
-            .flat_map(|activity| activity.prompts.values().cloned().collect::<Vec<_>>())
+            .flat_map(|activity| activity.running_session_ids().cloned().collect::<Vec<_>>())
             .collect::<Vec<_>>();
         sessions.sort();
         sessions.dedup();
@@ -808,7 +844,7 @@ fn has_active_acp_prompt(entry: &ProcessEntry) -> bool {
     entry
         .acp_activity
         .lock()
-        .is_ok_and(|activity| !activity.prompts.is_empty())
+        .is_ok_and(|activity| activity.running_session_ids().next().is_some())
 }
 
 fn terminate_process(entry: ProcessEntry) {
@@ -1507,6 +1543,65 @@ mod tests {
         activity.route_output(br#"{"jsonrpc":"2.0","id":17,"result":{"stopReason":"end_turn"}}"#);
         activity.route_output(b"\n");
         assert!(activity.prompts.is_empty());
+    }
+
+    #[test]
+    fn tracks_v2_prompt_receipt_until_idle_in_either_response_order() {
+        for idle_before_receipt in [false, true] {
+            let mut activity = AcpActivity::default();
+            activity.feed_input(
+                b"{\"id\":17,\"method\":\"session/prompt\",\"params\":{\"sessionId\":\"v2-session\"}}\n",
+            );
+            let receipt = b"{\"id\":17,\"result\":{\"messageId\":\"message-1\"}}\n";
+            let idle = b"{\"method\":\"session/update\",\"params\":{\"sessionId\":\"v2-session\",\"update\":{\"sessionUpdate\":\"state_update\",\"state\":\"idle\",\"stopReason\":\"end_turn\"}}}\n";
+            if idle_before_receipt {
+                activity.route_output(idle);
+                activity.route_output(receipt);
+            } else {
+                activity.route_output(receipt);
+                assert_eq!(
+                    activity.running_session_ids().cloned().collect::<Vec<_>>(),
+                    ["v2-session"]
+                );
+                activity.suspend_active_sessions();
+                assert!(activity.suspended_sessions.contains("v2-session"));
+                assert!(activity.route_output(idle).is_empty());
+            }
+            assert!(activity.running_session_ids().next().is_none());
+        }
+    }
+
+    #[test]
+    fn v2_state_updates_keep_restored_and_blocked_sessions_active() -> anyhow::Result<()> {
+        let mut activity = AcpActivity::default();
+        for state in ["running", "requires_action", "unknown", "idle"] {
+            let update = json!({
+                "method": "session/update",
+                "params": {
+                    "sessionId": "restored-session",
+                    "update": { "sessionUpdate": "state_update", "state": state },
+                },
+            });
+            let mut frame = serde_json::to_vec(&update)?;
+            frame.push(b'\n');
+            activity.route_output(&frame);
+            assert_eq!(
+                activity.running_session_ids().next().is_some(),
+                state != "idle"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_prompt_does_not_leave_the_session_active() {
+        let mut activity = AcpActivity::default();
+        activity.feed_input(
+            b"{\"id\":17,\"method\":\"session/prompt\",\"params\":{\"sessionId\":\"v2-session\"}}\n",
+        );
+        activity
+            .route_output(b"{\"id\":17,\"error\":{\"code\":-32603,\"message\":\"rejected\"}}\n");
+        assert!(activity.running_session_ids().next().is_none());
     }
 
     #[test]

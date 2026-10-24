@@ -13,7 +13,7 @@ path = "src/main.rs"
 # Core app shell
 gpui.workspace = true
 gpui_platform.workspace = true
-gpui_web.workspace = true
+gpui_web = { workspace = true, features = ["multithreaded"] }
 workspace.workspace = true
 client.workspace = true
 project.workspace = true

@@ -33,7 +33,7 @@ deepseek = { workspace = true, features = ["schemars"] }
 extension.workspace = true
 fs.workspace = true
 futures.workspace = true
-google_ai = { workspace = true, features = ["schemars"] }
+google_ai.workspace = true
 gpui.workspace = true
 http_client.workspace = true
 language_model.workspace = true

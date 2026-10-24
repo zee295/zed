@@ -25,6 +25,10 @@ async function openWorkspace(page, baseURL) {
   page.on("console", (message) => {
     if (message.type() === "error") errors.push(message.text());
   });
+  const ready = page.waitForEvent("console", {
+    predicate: (message) => message.text().includes("zed_web_workspace: docks ready"),
+    timeout: 90_000,
+  });
   await page.goto(baseURL);
   await expect(page).toHaveTitle(/Zed Remote . Workspace/, {
     timeout: 90_000,
@@ -37,6 +41,7 @@ async function openWorkspace(page, baseURL) {
   const bounds = await canvas.boundingBox();
   expect(bounds?.width).toBeGreaterThan(500);
   expect(bounds?.height).toBeGreaterThan(300);
+  await ready;
   return errors;
 }
 
@@ -293,6 +298,7 @@ test("boots GPUI and reconnects after an offline transition", async ({
   await authenticate(context, baseURL);
   const page = await context.newPage();
   const errors = await openWorkspace(page, baseURL);
+  expect(errors).toEqual([]);
 
   await context.setOffline(true);
   await expect
@@ -302,9 +308,12 @@ test("boots GPUI and reconnects after an offline transition", async ({
   await expect
     .poll(() => page.evaluate(() => self.__zedRpcConnectionState))
     .toBe("open");
+  // Background SQL can still be in flight when the browser goes offline.
   expect(errors.filter((error) =>
     !error.includes("WebSocket") &&
-    !error.includes("ERR_INTERNET_DISCONNECTED")
+    !error.includes("ERR_INTERNET_DISCONNECTED") &&
+    !(error.includes("NetworkError: Failed to execute 'send' on 'XMLHttpRequest'") &&
+      error.includes(`${baseURL}/sql`))
   )).toEqual([]);
   await context.close();
 });

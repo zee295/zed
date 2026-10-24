@@ -202,7 +202,6 @@ mod remote {
 
     #[derive(Deserialize)]
     struct IconThemeContributionResponse {
-        #[allow(dead_code)]
         relative_path: String,
         content: String,
     }
@@ -1261,7 +1260,11 @@ mod remote {
                             .iter()
                             .map(|icon_theme| Arc::from(icon_theme.name.as_str())),
                     );
-                    if let Err(error) = registry.load_icon_theme(icon_theme_family, &asset_root) {
+                    if let Err(error) = registry.load_icon_theme(
+                        &asset_root.join(contribution.relative_path),
+                        &asset_root,
+                        contribution.content.into_bytes(),
+                    ) {
                         log::error!(
                             "failed to load icon theme contribution for extension {}: {error:#}",
                             extension_id
