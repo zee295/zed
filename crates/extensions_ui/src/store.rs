@@ -324,7 +324,9 @@ mod remote {
         let parsed_runs = if label.code.is_empty() {
             Vec::new()
         } else {
-            language.highlight_text(&label.code.as_str().into(), 0..label.code.len())
+            language
+                .highlight_text(label.code.as_str(), 0..label.code.len())
+                .collect::<Vec<_>>()
         };
         let mut text = String::new();
         let mut runs = Vec::<(Range<usize>, HighlightId)>::new();

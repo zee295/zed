@@ -1218,11 +1218,11 @@ fn reset(fs: &FsRpc, params: &Value) -> Result<Value> {
 }
 
 fn checkout_files(fs: &FsRpc, params: &Value) -> Result<Value> {
-    let mut args = vec![
-        "checkout".to_string(),
-        string(params, "commit").to_string(),
-        "--".to_string(),
-    ];
+    let mut args = vec!["checkout".to_string()];
+    if let Some(commit) = params.get("commit").and_then(Value::as_str) {
+        args.push(commit.to_string());
+    }
+    args.push("--".to_string());
     args.extend(string_array(params, "paths"));
     null_owned_command(fs, params, args)
 }
@@ -1551,6 +1551,44 @@ fn default_branch(fs: &FsRpc, params: &Value) -> Result<Value> {
 #[cfg(test)]
 mod ref_tests {
     use super::*;
+
+    #[test]
+    fn discard_unstaged_changes_preserves_the_index() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let fs = FsRpc::new(root.path().to_path_buf(), true)?;
+        let mut params = json!({"repo_path": "/workspace", "paths": ["file.txt"], "commit": null});
+        git(&fs, &params, &["init"])?;
+        let path = root.path().join("file.txt");
+        std::fs::write(&path, "committed\n")?;
+        git(&fs, &params, &["add", "file.txt"])?;
+        git(
+            &fs,
+            &params,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )?;
+        std::fs::write(&path, "staged\n")?;
+        git(&fs, &params, &["add", "file.txt"])?;
+        std::fs::write(&path, "unstaged\n")?;
+        dispatch(&fs, "GitRepository::checkout_files", &params)?;
+        assert_eq!(std::fs::read_to_string(&path)?, "staged\n");
+        assert_eq!(git_text(&fs, &params, &["show", ":file.txt"])?, "staged\n");
+        params["commit"] = json!("HEAD");
+        dispatch(&fs, "GitRepository::checkout_files", &params)?;
+        assert_eq!(std::fs::read_to_string(&path)?, "committed\n");
+        assert_eq!(
+            git_text(&fs, &params, &["show", ":file.txt"])?,
+            "committed\n"
+        );
+        Ok(())
+    }
 
     #[test]
     fn create_ref_never_overwrites_an_existing_ref() -> Result<()> {

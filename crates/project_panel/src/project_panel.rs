@@ -2750,7 +2750,7 @@ impl ProjectPanel {
 
                 let task = panel.update(cx, |_panel, cx| {
                     repository.update(cx, |repo, cx| {
-                        repo.checkout_files("HEAD", vec![repo_path], cx)
+                        repo.checkout_files(Some("HEAD"), vec![repo_path], cx)
                     })
                 })?;
 
@@ -8017,7 +8017,7 @@ impl Render for ProjectPanel {
                                     cx,
                                 )
                                 .flex_grow_1()
-                                .on_scroll_wheel({
+                                .on_scroll({
                                     let scroll_handle = self.scroll_handle.clone();
                                     let entity_id = cx.entity().entity_id();
                                     move |event, window, cx| {

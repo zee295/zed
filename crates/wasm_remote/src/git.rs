@@ -676,7 +676,7 @@ impl GitRepository for RemoteGitRepository {
 
     fn checkout_files(
         &self,
-        commit: String,
+        commit: Option<String>,
         paths: Vec<RepoPath>,
         env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {

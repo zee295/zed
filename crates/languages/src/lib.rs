@@ -17,7 +17,7 @@ pub use language::*;
 
 use crate::json::JsonTaskProvider;
 #[cfg(feature = "python-support")]
-use crate::python::{BasedPyrightLspAdapter, RuffLspAdapter};
+use crate::python::{BasedPyrightLspAdapter, PyreflyLspAdapter, RuffLspAdapter};
 
 mod bash;
 #[cfg(feature = "native-adapters")]
@@ -102,6 +102,8 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
     let basedpyright_lsp_adapter = Arc::new(BasedPyrightLspAdapter::new(node.clone()));
     #[cfg(feature = "python-support")]
     let ruff_lsp_adapter = Arc::new(RuffLspAdapter::new(fs.clone()));
+    #[cfg(feature = "python-support")]
+    let pyrefly_lsp_adapter = Arc::new(PyreflyLspAdapter::new(fs.clone()));
     #[cfg(feature = "python-support")]
     let python_toolchain_provider = Arc::new(python::PythonToolchainProvider::new(fs.clone()));
     #[cfg(feature = "native-adapters")]
@@ -206,6 +208,7 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
                 ty_lsp_adapter,
                 py_lsp_adapter,
                 python_lsp_adapter,
+                pyrefly_lsp_adapter,
             ],
             context: Some(python_context_provider),
             toolchain: Some(python_toolchain_provider),
