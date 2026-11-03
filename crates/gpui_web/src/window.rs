@@ -493,7 +493,7 @@ impl WebWindowInner {
                 |callback| {
                     callback(RequestFrameOptions {
                         require_presentation: false,
-                        force_render: false,
+                        force_render: this.pending_physical_size.get().is_some(),
                         signal_at: None,
                         signal_source: FrameRequestSource::NativeCallback,
                     })
@@ -1377,10 +1377,19 @@ impl PlatformWindow for WebWindow {
                 self.inner.canvas.set_height(height);
             }
 
-            self.inner.renderer.borrow_mut().update_drawable_size(Size {
-                width: DevicePixels(width as i32),
-                height: DevicePixels(height as i32),
-            });
+            let resized = self
+                .inner
+                .renderer
+                .borrow_mut()
+                .try_update_drawable_size(Size {
+                    width: DevicePixels(width as i32),
+                    height: DevicePixels(height as i32),
+                });
+            if !resized {
+                self.inner.pending_physical_size.set(Some((width, height)));
+                self.inner.wake_frame_loop();
+                return;
+            }
         }
 
         self.inner.renderer.borrow_mut().draw(scene);

@@ -994,11 +994,27 @@ impl WgpuRenderer {
     /// Records the new drawable size and reconfigures the surface when one is present.
     /// The size is kept even without GPU resources so that recovery restores it.
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
+        self.try_update_drawable_size(size);
+    }
+
+    /// Returns false when a browser must yield before reconfiguring the surface.
+    pub fn try_update_drawable_size(&mut self, size: Size<DevicePixels>) -> bool {
         let width = size.width.0 as u32;
         let height = size.height.0 as u32;
 
         if width == self.surface_config.width && height == self.surface_config.height {
-            return;
+            return true;
+        }
+
+        // WebGL surface reconfiguration also waits internally. Poll without
+        // blocking and let another animation frame retry once the queue is idle.
+        #[cfg(target_family = "wasm")]
+        if let Some(core) = self.core_mut() {
+            match core.resources.device.poll(wgpu::PollType::Poll) {
+                Ok(status) if !status.is_queue_empty() => return false,
+                Err(error) => warn!("Failed to poll device during browser resize: {error:?}"),
+                _ => {}
+            }
         }
 
         let clamped_width = width.min(self.max_texture_size);
@@ -1014,7 +1030,7 @@ impl WgpuRenderer {
         self.surface_config.height = clamped_height.max(1);
 
         let Some(core) = self.core_mut() else {
-            return;
+            return true;
         };
         let resources = &mut core.resources;
 
@@ -1044,6 +1060,7 @@ impl WgpuRenderer {
         if let RendererState::Ready { surface, core } = &self.state {
             surface.configure(&core.resources.device, &self.surface_config);
         }
+        true
     }
 
     pub fn set_subpixel_layout(&mut self, is_bgr: bool) {
