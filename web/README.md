@@ -340,6 +340,12 @@ normal startup from repeatedly growing shared memory and retries generated
 grown buffer. Preserve both linker and postprocessor changes during upstream
 updates, then run `test-patch-wasm-bindgen-memory.sh` before the browser suite.
 
+Keep the browser renderer separate from mutable window/input state. Firefox
+can deliver focus and visibility events from inside WebGL calls; defer their
+GPUI callbacks until the current stack returns. Never synchronously wait for
+GPU completion during browser resize. Run the reentrant WebGL browser test
+with `ZED_WEB_TEST_BROWSER=firefox` as well as Chromium after graphics changes.
+
 Release images are tagged with both the web branch revision and the upstream
 base revision through `build-info.json`.
 

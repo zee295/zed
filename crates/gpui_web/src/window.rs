@@ -37,7 +37,6 @@ pub(crate) struct WebWindowCallbacks {
 }
 
 pub(crate) struct WebWindowMutableState {
-    pub(crate) renderer: WgpuRenderer,
     pub(crate) bounds: Bounds<Pixels>,
     pub(crate) scale_factor: f32,
     pub(crate) max_texture_dimension: u32,
@@ -61,6 +60,8 @@ pub(crate) struct WebWindowInner {
     pub(crate) is_mac: bool,
     pub(crate) touch_input: bool,
     pub(crate) state: RefCell<WebWindowMutableState>,
+    // WebGL calls may synchronously deliver DOM events that read window state.
+    renderer: RefCell<WgpuRenderer>,
     pub(crate) callbacks: RefCell<WebWindowCallbacks>,
     pub(crate) click_state: RefCell<ClickState>,
     pub(crate) touch_ids: RefCell<TouchIds>,
@@ -206,7 +207,6 @@ impl WebWindow {
         };
 
         let mutable_state = WebWindowMutableState {
-            renderer,
             bounds: initial_bounds,
             scale_factor: dpr,
             max_texture_dimension,
@@ -232,6 +232,7 @@ impl WebWindow {
             is_mac,
             touch_input,
             state: RefCell::new(mutable_state),
+            renderer: RefCell::new(renderer),
             callbacks: RefCell::new(WebWindowCallbacks::default()),
             click_state: RefCell::new(ClickState::default()),
             touch_ids: RefCell::new(TouchIds::default()),
@@ -421,6 +422,17 @@ impl WebWindow {
 }
 
 impl WebWindowInner {
+    pub(crate) fn defer_lifecycle_event(self: &Rc<Self>, callback: impl FnOnce(&Self) + 'static) {
+        // Firefox can deliver focus/visibility events from inside a WebGL call.
+        // Wait until rendering and the enclosing GPUI app update have returned.
+        let this = Rc::downgrade(self);
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Some(this) = this.upgrade() {
+                callback(&this);
+            }
+        });
+    }
+
     fn sample_viewport(&self) -> bool {
         match self
             .viewport
@@ -552,23 +564,25 @@ impl WebWindowInner {
             document.as_ref(),
             "visibilitychange",
             move |_event: JsValue| {
-                let visibility = document_visibility(&this.browser_window);
-                let is_visible = visibility.is_visible();
+                this.defer_lifecycle_event(|this| {
+                    let visibility = document_visibility(&this.browser_window);
+                    let is_visible = visibility.is_visible();
 
-                if !is_visible {
-                    this.cancel_active_touches();
-                }
-                let visibility_changed = {
-                    let mut state = this.state.borrow_mut();
-                    std::mem::replace(&mut state.visibility, visibility) != visibility
-                };
-                this.refresh_active_status();
-                if visibility_changed {
-                    this.with_callback(
-                        |callbacks| &mut callbacks.visibility_change,
-                        |callback| callback(visibility),
-                    );
-                }
+                    if !is_visible {
+                        this.cancel_active_touches();
+                    }
+                    let visibility_changed = {
+                        let mut state = this.state.borrow_mut();
+                        std::mem::replace(&mut state.visibility, visibility) != visibility
+                    };
+                    this.refresh_active_status();
+                    if visibility_changed {
+                        this.with_callback(
+                            |callbacks| &mut callbacks.visibility_change,
+                            |callback| callback(visibility),
+                        );
+                    }
+                });
             },
         ))
     }
@@ -1363,31 +1377,25 @@ impl PlatformWindow for WebWindow {
                 self.inner.canvas.set_height(height);
             }
 
-            let mut state = self.inner.state.borrow_mut();
-            state.renderer.update_drawable_size(Size {
+            self.inner.renderer.borrow_mut().update_drawable_size(Size {
                 width: DevicePixels(width as i32),
                 height: DevicePixels(height as i32),
             });
-            drop(state);
         }
 
-        self.inner.state.borrow_mut().renderer.draw(scene);
+        self.inner.renderer.borrow_mut().draw(scene);
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
-        self.inner.state.borrow().renderer.sprite_atlas().clone()
+        self.inner.renderer.borrow().sprite_atlas().clone()
     }
 
     fn is_subpixel_rendering_supported(&self) -> bool {
-        self.inner
-            .state
-            .borrow()
-            .renderer
-            .supports_dual_source_blending()
+        self.inner.renderer.borrow().supports_dual_source_blending()
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
-        self.inner.state.borrow().renderer.gpu_specs()
+        self.inner.renderer.borrow().gpu_specs()
     }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {}

@@ -1018,7 +1018,9 @@ impl WgpuRenderer {
         };
         let resources = &mut core.resources;
 
-        // Wait for any in-flight GPU work to complete before destroying textures
+        // Browsers must return to their event loop for GPU work to finish.
+        // wgpu retains in-flight texture resources until queued work completes.
+        #[cfg(not(target_family = "wasm"))]
         if let Err(e) = resources.device.poll(wgpu::PollType::Wait {
             submission_index: None,
             timeout: None,

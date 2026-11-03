@@ -296,6 +296,9 @@ impl WebWindowInner {
     pub(crate) fn cancel_active_touches(&self) {
         let touch_ids = self.touch_ids.borrow_mut().drain();
         self.touch_tap_candidate.set(None);
+        if touch_ids.is_empty() {
+            return;
+        }
         let position = self.state.borrow().mouse_position;
         for touch_id in touch_ids {
             self.dispatch_input(PlatformInput::Touch(TouchEvent {
@@ -1424,15 +1427,17 @@ impl WebWindowInner {
             if this.suppress_focus_status_events.get() {
                 return;
             }
-            this.refresh_active_status();
-            this.show_keyboard_accessory();
+            this.defer_lifecycle_event(|this| {
+                this.refresh_active_status();
+                this.show_keyboard_accessory();
+            });
         })
     }
 
     fn register_canvas_focus(self: &Rc<Self>) -> EventListenerHandle {
         let this = Rc::clone(self);
         self.listen("focus", move |_event: JsValue| {
-            this.refresh_active_status();
+            this.defer_lifecycle_event(Self::refresh_active_status);
         })
     }
 
@@ -1442,8 +1447,10 @@ impl WebWindowInner {
             if this.suppress_focus_status_events.get() {
                 return;
             }
-            this.refresh_active_status();
-            this.hide_keyboard_accessory();
+            this.defer_lifecycle_event(|this| {
+                this.refresh_active_status();
+                this.hide_keyboard_accessory();
+            });
         })
     }
 
@@ -1453,8 +1460,10 @@ impl WebWindowInner {
             self.browser_window.as_ref(),
             "blur",
             move |_event: JsValue| {
-                this.cancel_active_touches();
-                this.refresh_active_status();
+                this.defer_lifecycle_event(|this| {
+                    this.cancel_active_touches();
+                    this.refresh_active_status();
+                });
             },
         )
     }
@@ -1466,7 +1475,7 @@ impl WebWindowInner {
             "focus",
             move |_event: JsValue| {
                 if !this.suppress_focus_status_events.get() {
-                    this.refresh_active_status();
+                    this.defer_lifecycle_event(Self::refresh_active_status);
                 }
             },
         )

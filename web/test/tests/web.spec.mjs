@@ -639,6 +639,52 @@ test("resizes mobile docks without re-entering entity updates", async ({
   await context.close();
 });
 
+test("handles reentrant WebGL lifecycle events without freezing input", async ({ browser, baseURL }) => {
+  const context = await browser.newContext();
+  try {
+    await authenticate(context, baseURL);
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, "gpu", { value: undefined });
+      self.__zedGraphicsEvents = 0;
+      self.__zedInjectGraphicsEvents = true;
+      for (const method of ["clear", "clearBufferfv", "drawArrays", "drawArraysInstanced", "drawElementsInstanced"]) {
+        const original = WebGL2RenderingContext.prototype[method];
+        WebGL2RenderingContext.prototype[method] = function (...args) {
+          const result = original.apply(this, args);
+          if (self.__zedInjectGraphicsEvents && document.querySelector("textarea")) {
+            self.__zedInjectGraphicsEvents = false;
+            self.__zedGraphicsEvents++;
+            window.dispatchEvent(new Event("blur"));
+            document.dispatchEvent(new Event("visibilitychange"));
+            window.dispatchEvent(new Event("focus"));
+          }
+          return result;
+        };
+      }
+    });
+    const page = await context.newPage();
+    const failures = [];
+    page.on("pageerror", error => failures.push(error.message));
+    const errors = await openWorkspace(page, baseURL);
+    await expect.poll(() => page.evaluate(() => self.__zedGraphicsEvents)).toBeGreaterThan(0);
+    await page.evaluate(() => {
+      const canvas = document.querySelector("canvas");
+      canvas.dispatchEvent(new PointerEvent("pointerdown", {
+        pointerType: "touch", pointerId: 7, clientX: 500, clientY: 350, bubbles: true,
+      }));
+      self.__zedInjectGraphicsEvents = true;
+    });
+    await page.setViewportSize({ width: 1300, height: 850 });
+    await expect.poll(() => page.evaluate(() => self.__zedGraphicsEvents)).toBeGreaterThan(1);
+    await page.mouse.click(600, 350);
+    await page.keyboard.press("Escape");
+    await page.mouse.wheel(0, 200);
+    await page.screenshot({ path: test.info().outputPath("webgl-after-reentrant-events.png") });
+    expect(errors.filter(error => /panicked|RefCell|unreachable/.test(error))).toEqual([]);
+    expect(failures).toEqual([]);
+  } finally { await context.close(); }
+});
+
 test("handles viewport and input bursts without GPUI borrow errors", async ({
   browser,
   baseURL,
