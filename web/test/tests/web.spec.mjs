@@ -23,7 +23,10 @@ async function authenticate(context, baseURL) {
 async function openWorkspace(page, baseURL) {
   const errors = [];
   page.on("console", (message) => {
-    if (message.type() === "error") errors.push(message.text());
+    const text = message.text();
+    // The suite intentionally runs without an Anthropic account configured.
+    const missingAnthropicKey = /language_models::provider::anthropic\b.*: cannot fetch Anthropic models without an API key$/.test(text);
+    if (message.type() === "error" && !missingAnthropicKey) errors.push(text);
   });
   const ready = page.waitForEvent("console", {
     predicate: (message) => message.text().includes("zed_web_workspace: docks ready"),
