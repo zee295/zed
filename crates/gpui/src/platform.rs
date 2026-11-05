@@ -1,6 +1,7 @@
 mod app_menu;
 mod keyboard;
 mod keystroke;
+mod platform_info;
 
 #[cfg(all(target_os = "linux", feature = "wayland"))]
 #[expect(missing_docs)]
@@ -85,20 +86,6 @@ pub use app_menu::*;
 pub use keyboard::*;
 pub use keystroke::*;
 
-/// The operating system whose conventions GPUI should use for key bindings and labels.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub enum OperatingSystem {
-    /// An OS that could not be identified.
-    Unknown = 0,
-    /// macOS or an Apple device using macOS keyboard conventions.
-    Mac = 1,
-    /// Microsoft Windows.
-    Windows = 2,
-    /// Linux or another Unix-like desktop.
-    Linux = 3,
-}
-
 const fn compiled_operating_system() -> u8 {
     if cfg!(target_os = "macos") {
         OperatingSystem::Mac as u8
@@ -116,9 +103,17 @@ static OPERATING_SYSTEM: AtomicU8 = AtomicU8::new(compiled_operating_system());
 /// Returns the runtime operating system used for keyboard conventions.
 pub fn operating_system() -> OperatingSystem {
     match OPERATING_SYSTEM.load(Ordering::Relaxed) {
-        1 => OperatingSystem::Mac,
-        2 => OperatingSystem::Windows,
-        3 => OperatingSystem::Linux,
+        value if value == OperatingSystem::Mac as u8 || value == OperatingSystem::Ios as u8 => {
+            OperatingSystem::Mac
+        }
+        value if value == OperatingSystem::Windows as u8 => OperatingSystem::Windows,
+        value
+            if value == OperatingSystem::Linux as u8
+                || value == OperatingSystem::Android as u8
+                || value == OperatingSystem::FreeBsd as u8 =>
+        {
+            OperatingSystem::Linux
+        }
         _ => OperatingSystem::Unknown,
     }
 }
@@ -408,8 +403,13 @@ bitflags::bitflags! {
     }
 }
 
+pub use platform_info::{OperatingSystem, PlatformInfo, PlatformTarget};
+
 #[expect(missing_docs)]
 pub trait Platform: 'static {
+    /// Returns the host OS and application target reported by this backend.
+    fn platform_info(&self) -> PlatformInfo;
+
     fn background_executor(&self) -> BackgroundExecutor;
     fn foreground_executor(&self) -> ForegroundExecutor;
     fn text_system(&self) -> Arc<dyn PlatformTextSystem>;
@@ -557,6 +557,14 @@ pub trait Platform: 'static {
     fn on_thermal_state_change(&self, callback: Box<dyn FnMut()>);
     fn prevent_idle_sleep(&self, reason: &str) -> Task<Result<ActivityGuard>>;
 
+    /// Returns the operating system's power mode, or [`PowerMode::Unknown`]
+    /// when the platform cannot determine it.
+    fn power_mode(&self) -> PowerMode {
+        PowerMode::Unknown
+    }
+    /// Registers a callback invoked when the reported power mode changes.
+    fn on_power_mode_change(&self, _callback: Box<dyn FnMut()>) {}
+
     /// Sets the application's process-wide identity and user-visible name.
     ///
     /// The identifier is used for platform identity mechanisms such as the
@@ -644,6 +652,22 @@ pub trait Platform: 'static {
     fn write_to_find_pasteboard(&self, item: ClipboardItem);
 
     fn write_credentials(&self, url: &str, username: &str, password: &[u8]) -> Task<Result<()>>;
+
+    /// Atomically writes credentials unless an item with this URL and username exists.
+    ///
+    /// Returns `true` if written, or `false` if the existing item was left unchanged.
+    #[cfg(target_os = "macos")]
+    fn write_credentials_if_not_exists(
+        &self,
+        _url: &str,
+        _username: &str,
+        _password: &[u8],
+    ) -> Task<Result<bool>> {
+        Task::ready(Err(anyhow::anyhow!(
+            "this platform does not support atomic credential writes"
+        )))
+    }
+
     fn read_credentials(&self, url: &str) -> Task<Result<Option<(String, Vec<u8>)>>>;
     fn delete_credentials(&self, url: &str) -> Task<Result<()>>;
 
@@ -726,6 +750,20 @@ pub struct SystemNotificationResponse {
     /// The pressed action button's [`SystemNotificationAction::id`], or
     /// `None` when the user activated the notification body itself.
     pub action_id: Option<SharedString>,
+}
+
+/// The operating system's preference for energy use versus performance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerMode {
+    /// The platform cannot determine the mode, or cannot distinguish the
+    /// active mode from other non-low-power modes.
+    Unknown,
+    /// The system prioritizes reducing energy use.
+    LowPower,
+    /// The system balances energy use and performance.
+    Balanced,
+    /// The system prioritizes performance over energy use.
+    HighPower,
 }
 
 /// Thermal state of the system

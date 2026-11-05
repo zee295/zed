@@ -730,7 +730,7 @@ impl Terminal {
 
     fn exit_status_from_v1(status: acp_v1::TerminalExitStatus) -> acp_v2::TerminalExitStatus {
         acp_v2::TerminalExitStatus::new()
-            .exit_code(status.exit_code)
+            .exit_code(status.exit_code.map(i64::from))
             .signal(status.signal)
             .meta(status.meta)
     }
@@ -932,7 +932,7 @@ impl Terminal {
     }
 
     // This method is adapted from `portable_pty::ExitStatus::from`, version 0.9.0
-    fn transform_exit_status(exit_status: ExitStatus) -> (u32, Option<String>) {
+    fn transform_exit_status(exit_status: ExitStatus) -> (i64, Option<String>) {
         #[cfg(unix)]
         {
             use std::os::unix::process::ExitStatusExt;
@@ -946,16 +946,13 @@ impl Terminal {
                     signame.to_string_lossy().to_string()
                 };
 
-                return (
-                    exit_status.code().map(|c| c as u32).unwrap_or(1),
-                    Some(signal),
-                );
+                return (exit_status.code().map(i64::from).unwrap_or(1), Some(signal));
             }
         }
 
         let code = exit_status
             .code()
-            .map(|c| c as u32)
+            .map(i64::from)
             .unwrap_or_else(|| if exit_status.success() { 0 } else { 1 });
 
         (code, None)

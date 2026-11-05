@@ -170,9 +170,7 @@ pub fn default_keymap_path() -> &'static str {
     match gpui::operating_system() {
         gpui::OperatingSystem::Mac => "keymaps/default-macos.json",
         gpui::OperatingSystem::Windows => "keymaps/default-windows.json",
-        gpui::OperatingSystem::Linux | gpui::OperatingSystem::Unknown => {
-            "keymaps/default-linux.json"
-        }
+        _ => "keymaps/default-linux.json",
     }
 }
 

@@ -3274,6 +3274,9 @@ impl QueryCursor {
 }
 
 impl<'tree> QueryMatch<'_, 'tree> {
+    pub fn captures(&self) -> &[QueryCapture<'tree>] {
+        self.captures
+    }
     #[must_use]
     pub const fn id(&self) -> u32 {
         self.id

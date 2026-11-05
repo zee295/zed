@@ -24,4 +24,4 @@ rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 rustflags = ["--cfg", "getrandom_backend=\"wasm_js\""]
 
 [env]
-MACOSX_DEPLOYMENT_TARGET = "10.15.7"
+MACOSX_DEPLOYMENT_TARGET = "12.0"

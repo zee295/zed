@@ -1222,7 +1222,7 @@ pub struct DocumentFilter {
 
     /// A glob pattern, like `*.{ts,js}`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pattern: Option<String>,
+    pub pattern: Option<GlobPattern>,
 }
 
 /// A document selector is the combination of one or many document filters.
@@ -1625,10 +1625,19 @@ impl<T> TagSupport<T> {
     }
 }
 
+#[derive(Debug, Eq, PartialEq, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextDocumentFilterClientCapabilities {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relative_pattern_support: Option<bool>,
+}
+
 /// Text document specific client capabilities.
 #[derive(Debug, Eq, PartialEq, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TextDocumentClientCapabilities {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filters: Option<TextDocumentFilterClientCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub synchronization: Option<TextDocumentSyncClientCapabilities>,
     /// Capabilities specific to the `textDocument/completion`

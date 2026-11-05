@@ -5,7 +5,7 @@ use std::{
     fmt::{Display, Write},
 };
 
-use crate::PlatformKeyboardMapper;
+use crate::{OperatingSystem, PlatformKeyboardMapper};
 
 /// This is a helper trait so that we can simplify the implementation of some functions
 pub trait AsKeystroke {
@@ -112,12 +112,27 @@ impl Keystroke {
         target.inner.modifiers == self.modifiers && target.inner.key == self.key
     }
 
-    /// key syntax is:
-    /// [secondary-][ctrl-][alt-][shift-][cmd-][fn-]key[->key_char]
-    /// key_char syntax is only used for generating test events,
-    /// secondary means "cmd" on macOS and "ctrl" on other platforms
-    /// when matching a key with an key_char set will be matched without it.
-    pub fn parse(source: &str) -> std::result::Result<Self, InvalidKeystrokeError> {
+    /// Parses a static keystroke with explicit, platform-independent modifiers.
+    ///
+    /// Syntax: `[ctrl-][alt-][shift-][cmd-][fn-]key[->key_char]`.
+    /// The `key_char` suffix is used for generating test events.
+    /// Use [`Self::parse_with_os`] for dynamic input or the `secondary-` alias.
+    pub fn parse(source: &'static str) -> std::result::Result<Self, InvalidKeystrokeError> {
+        Self::parse_internal(source, None)
+    }
+
+    /// Parses a keystroke, resolving `secondary-` using the supplied host OS.
+    pub fn parse_with_os(
+        source: &str,
+        os: OperatingSystem,
+    ) -> std::result::Result<Self, InvalidKeystrokeError> {
+        Self::parse_internal(source, Some(os))
+    }
+
+    fn parse_internal(
+        source: &str,
+        os: Option<OperatingSystem>,
+    ) -> std::result::Result<Self, InvalidKeystrokeError> {
         let mut modifiers = Modifiers::none();
         let mut key = None;
         let mut key_char = None;
@@ -141,7 +156,10 @@ impl Keystroke {
                 continue;
             }
             if component.eq_ignore_ascii_case("secondary") {
-                if crate::operating_system() == crate::OperatingSystem::Mac {
+                let os = os.ok_or_else(|| InvalidKeystrokeError {
+                    keystroke: source.to_owned(),
+                })?;
+                if os == OperatingSystem::Mac {
                     modifiers.platform = true;
                 } else {
                     modifiers.control = true;
@@ -219,9 +237,18 @@ impl Keystroke {
         })
     }
 
-    /// Produces a representation of this key that Parse can understand.
-    pub fn unparse(&self) -> String {
-        unparse(&self.modifiers, &self.key)
+    /// Serializes this keystroke with the supplied host OS's modifier spelling.
+    pub fn unparse(&self, os: OperatingSystem) -> String {
+        unparse(&self.modifiers, &self.key, os)
+    }
+
+    /// Formats this keystroke using the supplied host OS's key labels.
+    pub fn display(&self, os: OperatingSystem) -> KeystrokeDisplay<'_> {
+        KeystrokeDisplay {
+            modifiers: &self.modifiers,
+            key: &self.key,
+            os,
+        }
     }
 
     /// Returns true if this keystroke left
@@ -264,6 +291,15 @@ impl Keystroke {
 }
 
 impl KeybindingKeystroke {
+    /// Formats this binding using the supplied host OS's key labels.
+    pub fn display(&self, os: OperatingSystem) -> KeystrokeDisplay<'_> {
+        KeystrokeDisplay {
+            modifiers: self.modifiers(),
+            key: self.key(),
+            os,
+        }
+    }
+
     #[cfg(target_os = "windows")]
     #[expect(missing_docs)]
     pub fn new(inner: Keystroke, display_modifiers: Modifiers, display_key: String) -> Self {
@@ -357,15 +393,15 @@ impl KeybindingKeystroke {
         self.inner.key = key;
     }
 
-    /// Produces a representation of this key that Parse can understand.
-    pub fn unparse(&self) -> String {
+    /// Serializes this binding with the supplied host OS's modifier spelling.
+    pub fn unparse(&self, os: OperatingSystem) -> String {
         #[cfg(target_os = "windows")]
         {
-            unparse(&self.display_modifiers, &self.display_key)
+            unparse(&self.display_modifiers, &self.display_key, os)
         }
         #[cfg(not(target_os = "windows"))]
         {
-            unparse(&self.inner.modifiers, &self.inner.key)
+            unparse(&self.inner.modifiers, &self.inner.key, os)
         }
     }
 
@@ -429,17 +465,17 @@ fn is_printable_key(key: &str) -> bool {
     )
 }
 
-impl std::fmt::Display for Keystroke {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        display_modifiers(&self.modifiers, f)?;
-        display_key(&self.key, f)
-    }
+/// A keystroke formatted with an explicit host operating system.
+pub struct KeystrokeDisplay<'a> {
+    modifiers: &'a Modifiers,
+    key: &'a str,
+    os: OperatingSystem,
 }
 
-impl std::fmt::Display for KeybindingKeystroke {
+impl std::fmt::Display for KeystrokeDisplay<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        display_modifiers(self.modifiers(), f)?;
-        display_key(self.key(), f)
+        display_modifiers(self.modifiers, self.os, f)?;
+        display_key(self.key, self.os, f)
     }
 }
 
@@ -480,8 +516,8 @@ impl Modifiers {
     ///
     /// On macOS, this is the command key.
     /// On Linux and Windows, this is the control key.
-    pub fn secondary(&self) -> bool {
-        if crate::operating_system() == crate::OperatingSystem::Mac {
+    pub fn secondary(&self, cx: &crate::App) -> bool {
+        if cx.platform_info().is_mac() {
             self.platform
         } else {
             self.control
@@ -510,9 +546,9 @@ impl Modifiers {
         }
     }
 
-    /// A Returns [`Modifiers`] with just the secondary key pressed.
-    pub fn secondary_key() -> Modifiers {
-        if crate::operating_system() == crate::OperatingSystem::Mac {
+    /// Returns [`Modifiers`] with just the secondary key pressed.
+    pub fn secondary_key(cx: &crate::App) -> Modifiers {
+        if cx.platform_info().is_mac() {
             Modifiers {
                 platform: true,
                 ..Default::default()
@@ -678,61 +714,60 @@ impl<T: AsKeystroke + ?Sized> AsKeystroke for &T {
     }
 }
 
-fn display_modifiers(modifiers: &Modifiers, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    let operating_system = crate::operating_system();
-    let is_mac = operating_system == crate::OperatingSystem::Mac;
+fn display_modifiers(
+    modifiers: &Modifiers,
+    os: OperatingSystem,
+    f: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
     if modifiers.control {
-        if is_mac {
-            f.write_char('^')?;
+        f.write_str(if os == OperatingSystem::Mac {
+            "^"
         } else {
-            write!(f, "ctrl-")?;
-        }
+            "ctrl-"
+        })?;
     }
     if modifiers.alt {
-        if is_mac {
-            f.write_char('⌥')?;
+        f.write_str(if os == OperatingSystem::Mac {
+            "⌥"
         } else {
-            write!(f, "alt-")?;
-        }
+            "alt-"
+        })?;
     }
     if modifiers.platform {
-        match operating_system {
-            crate::OperatingSystem::Mac => f.write_char('⌘')?,
-            crate::OperatingSystem::Windows => f.write_char('⊞')?,
-            crate::OperatingSystem::Linux | crate::OperatingSystem::Unknown => f.write_char('❖')?,
-        }
+        f.write_str(match os {
+            OperatingSystem::Mac => "⌘",
+            OperatingSystem::Windows => "⊞",
+            OperatingSystem::Linux | OperatingSystem::FreeBsd => "❖",
+            OperatingSystem::Ios | OperatingSystem::Android | OperatingSystem::Unknown => "cmd-",
+        })?;
     }
     if modifiers.shift {
-        if is_mac {
-            f.write_char('⇧')?;
+        f.write_str(if os == OperatingSystem::Mac {
+            "⇧"
         } else {
-            write!(f, "shift-")?;
-        }
+            "shift-"
+        })?;
     }
     Ok(())
 }
 
-fn display_key(key: &str, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    let mac_key = match key {
-        "backspace" => Some('⌫'),
-        "up" => Some('↑'),
-        "down" => Some('↓'),
-        "left" => Some('←'),
-        "right" => Some('→'),
-        "tab" => Some('⇥'),
-        "escape" => Some('⎋'),
-        "shift" => Some('⇧'),
-        "control" => Some('⌃'),
-        "alt" => Some('⌥'),
-        "platform" => Some('⌘'),
-        _ => None,
-    };
-    if crate::operating_system() == crate::OperatingSystem::Mac {
-        if let Some(key) = mac_key {
-            return f.write_char(key);
-        }
-    }
+fn display_key(
+    key: &str,
+    os: OperatingSystem,
+    f: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
     let key = match key {
+        "backspace" if os == OperatingSystem::Mac => '⌫',
+        "up" if os == OperatingSystem::Mac => '↑',
+        "down" if os == OperatingSystem::Mac => '↓',
+        "left" if os == OperatingSystem::Mac => '←',
+        "right" if os == OperatingSystem::Mac => '→',
+        "tab" if os == OperatingSystem::Mac => '⇥',
+        "escape" if os == OperatingSystem::Mac => '⎋',
+        "shift" if os == OperatingSystem::Mac => '⇧',
+        "control" if os == OperatingSystem::Mac => '⌃',
+        "alt" if os == OperatingSystem::Mac => '⌥',
+        "platform" if os == OperatingSystem::Mac => '⌘',
         key if key.len() == 1 => key.chars().next().unwrap().to_ascii_uppercase(),
         key => return f.write_str(key),
     };
@@ -740,7 +775,7 @@ fn display_key(key: &str, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 }
 
 #[inline]
-fn unparse(modifiers: &Modifiers, key: &str) -> String {
+fn unparse(modifiers: &Modifiers, key: &str, os: OperatingSystem) -> String {
     let mut result = String::new();
     if modifiers.function {
         result.push_str("fn-");
@@ -752,13 +787,14 @@ fn unparse(modifiers: &Modifiers, key: &str) -> String {
         result.push_str("alt-");
     }
     if modifiers.platform {
-        match crate::operating_system() {
-            crate::OperatingSystem::Mac => result.push_str("cmd-"),
-            crate::OperatingSystem::Windows => result.push_str("win-"),
-            crate::OperatingSystem::Linux | crate::OperatingSystem::Unknown => {
-                result.push_str("super-")
-            }
-        }
+        result.push_str(match os {
+            OperatingSystem::Windows => "win-",
+            OperatingSystem::Linux
+            | OperatingSystem::FreeBsd
+            | OperatingSystem::Android
+            | OperatingSystem::Unknown => "super-",
+            OperatingSystem::Mac | OperatingSystem::Ios => "cmd-",
+        });
     }
     if modifiers.shift {
         result.push_str("shift-");

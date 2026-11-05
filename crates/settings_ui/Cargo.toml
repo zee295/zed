@@ -81,6 +81,7 @@ extension_host.workspace = true
 extensions_ui.workspace = true
 
 [dev-dependencies]
+credentials_provider = { workspace = true, features = ["test-support"] }
 fs = { workspace = true, features = ["test-support"] }
 futures.workspace = true
 gpui = { workspace = true, features = ["test-support"] }

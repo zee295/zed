@@ -6,9 +6,9 @@ use git::repository::{
     AskPassDelegate, Branch, BranchesScanResult, CommitData, CommitDataReader, CommitDetails,
     CommitDiff, CommitFile, CommitOptions, CreateWorktreeTarget, DiffStatType, DiffType,
     FetchOptions, FileHistoryChangedFileSets, GitCommitTemplate, GitRepository,
-    GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder, LogSource, PushOptions, Remote,
-    RemoteCommandOutput, RepoPath, ResetMode, SearchCommitArgs, Upstream, UpstreamTracking,
-    UpstreamTrackingStatus, Worktree,
+    InitialGraphCommitData, LogOrder, LogSource, PushOptions, Remote, RemoteCommandOutput,
+    RepoPath, ResetMode, SearchCommitArgs, Upstream, UpstreamTracking, UpstreamTrackingStatus,
+    Worktree,
 };
 use git::stash::GitStash;
 use git::status::{DiffTreeType, GitDiffStat, GitStatus, TreeDiff, parse_numstat};
@@ -1278,40 +1278,6 @@ impl GitRepository for RemoteGitRepository {
         .boxed()
     }
 
-    fn checkpoint(&self) -> BoxFuture<'static, Result<GitRepositoryCheckpoint>> {
-        let client = self.client.clone();
-        let repo_path = self.repo_path.clone();
-        async move {
-            let response: CheckpointResponse = client
-                .call(
-                    "GitRepository::checkpoint",
-                    &json!({ "repo_path": repo_path.to_string_lossy() }),
-                )
-                .await?;
-            Ok(GitRepositoryCheckpoint {
-                commit_sha: response.commit_sha.parse()?,
-            })
-        }
-        .boxed()
-    }
-
-    fn restore_checkpoint(&self, checkpoint: GitRepositoryCheckpoint) -> BoxFuture<'_, Result<()>> {
-        let client = self.client.clone();
-        let repo_path = self.repo_path.clone();
-        async move {
-            client
-                .call_void(
-                    "GitRepository::restore_checkpoint",
-                    &json!({
-                        "repo_path": repo_path.to_string_lossy(),
-                        "commit_sha": checkpoint.commit_sha.to_string(),
-                    }),
-                )
-                .await
-        }
-        .boxed()
-    }
-
     fn create_archive_checkpoint(&self) -> BoxFuture<'_, Result<(String, String)>> {
         let client = self.client.clone();
         let repo_path = self.repo_path.clone();
@@ -1341,50 +1307,6 @@ impl GitRepository for RemoteGitRepository {
                         "repo_path": repo_path.to_string_lossy(),
                         "staged_sha": staged_sha,
                         "unstaged_sha": unstaged_sha,
-                    }),
-                )
-                .await
-        }
-        .boxed()
-    }
-
-    fn compare_checkpoints(
-        &self,
-        left: GitRepositoryCheckpoint,
-        right: GitRepositoryCheckpoint,
-    ) -> BoxFuture<'_, Result<bool>> {
-        let client = self.client.clone();
-        let repo_path = self.repo_path.clone();
-        async move {
-            client
-                .call(
-                    "GitRepository::compare_checkpoints",
-                    &json!({
-                        "repo_path": repo_path.to_string_lossy(),
-                        "left": left.commit_sha.to_string(),
-                        "right": right.commit_sha.to_string(),
-                    }),
-                )
-                .await
-        }
-        .boxed()
-    }
-
-    fn diff_checkpoints(
-        &self,
-        base_checkpoint: GitRepositoryCheckpoint,
-        target_checkpoint: GitRepositoryCheckpoint,
-    ) -> BoxFuture<'_, Result<String>> {
-        let client = self.client.clone();
-        let repo_path = self.repo_path.clone();
-        async move {
-            client
-                .call(
-                    "GitRepository::diff_checkpoints",
-                    &json!({
-                        "repo_path": repo_path.to_string_lossy(),
-                        "base": base_checkpoint.commit_sha.to_string(),
-                        "target": target_checkpoint.commit_sha.to_string(),
                     }),
                 )
                 .await
