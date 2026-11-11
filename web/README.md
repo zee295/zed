@@ -346,6 +346,12 @@ GPUI callbacks until the current stack returns. Never synchronously wait for
 GPU completion during browser resize. Run the reentrant WebGL browser test
 with `ZED_WEB_TEST_BROWSER=firefox` as well as Chromium after graphics changes.
 
+Keep the browser app's `ForegroundExecutor` bound to its `AppCell`. Every task
+poll (including priority and idle tasks) must wait while the app is borrowed,
+then wake when that borrow ends. Deferring DOM callbacks alone does not protect
+ACP startup and session updates from reentrant foreground task execution.
+Preserve the executor borrow regression tests during upstream merges.
+
 Release images are tagged with both the web branch revision and the upstream
 base revision through `build-info.json`.
 

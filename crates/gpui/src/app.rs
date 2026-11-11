@@ -91,6 +91,18 @@ pub struct AppCell {
 }
 
 impl AppCell {
+    #[cfg(any(target_family = "wasm", test))]
+    pub(crate) fn defer_task_if_borrowed(&self, waker: &std::task::Waker) -> bool {
+        if self.app.try_borrow_mut().is_ok() {
+            return false;
+        }
+        let waker = waker.clone();
+        self.deferred_updates
+            .borrow_mut()
+            .push(Box::new(move |_| waker.wake()));
+        true
+    }
+
     #[cold]
     #[track_caller]
     fn borrow_failed(&self, kind: &str) -> ! {
@@ -1036,7 +1048,11 @@ impl App {
                 active_drag: None,
                 platform_owned_drag: None,
                 background_executor,
-                foreground_executor,
+                foreground_executor: {
+                    #[cfg(any(target_family = "wasm", test))]
+                    let foreground_executor = foreground_executor.with_app(this.clone());
+                    foreground_executor
+                },
                 #[cfg(feature = "profiler")]
                 foreground_journal,
                 #[cfg(all(feature = "profiler", not(target_family = "wasm")))]

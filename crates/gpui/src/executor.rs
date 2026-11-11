@@ -27,6 +27,8 @@ pub struct BackgroundExecutor {
 pub struct ForegroundExecutor {
     inner: scheduler::LocalExecutor,
     dispatcher: Arc<dyn PlatformDispatcher>,
+    #[cfg(any(target_family = "wasm", test))]
+    app: Option<std::rc::Weak<crate::AppCell>>,
     #[cfg(feature = "profiler")]
     foreground_runnables: Option<crate::profiler::journal::ForegroundRunnableCounter>,
     not_send: PhantomData<Rc<()>>,
@@ -312,6 +314,8 @@ impl ForegroundExecutor {
                 return Self {
                     inner,
                     dispatcher,
+                    #[cfg(any(target_family = "wasm", test))]
+                    app: None,
                     #[cfg(feature = "profiler")]
                     foreground_runnables: Some(platform_scheduler.foreground_runnable_counter()),
                     not_send: PhantomData,
@@ -343,9 +347,41 @@ impl ForegroundExecutor {
         Self {
             inner,
             dispatcher,
+            #[cfg(any(target_family = "wasm", test))]
+            app: None,
             #[cfg(feature = "profiler")]
             foreground_runnables,
             not_send: PhantomData,
+        }
+    }
+
+    #[cfg(any(target_family = "wasm", test))]
+    pub(crate) fn with_app(mut self, app: std::rc::Weak<crate::AppCell>) -> Self {
+        self.app = Some(app);
+        self
+    }
+
+    fn guard_app_borrow<F: Future>(&self, future: F) -> impl Future<Output = F::Output> + use<F> {
+        #[cfg(any(target_family = "wasm", test))]
+        let app = self.app.clone();
+        async move {
+            #[cfg(any(target_family = "wasm", test))]
+            {
+                let mut future = std::pin::pin!(future);
+                futures::future::poll_fn(move |cx| {
+                    // Browsers can pump queued tasks from inside a platform call.
+                    // ACP and other foreground futures must not reborrow that App.
+                    if let Some(app) = app.as_ref().and_then(std::rc::Weak::upgrade)
+                        && app.defer_task_if_borrowed(cx.waker())
+                    {
+                        return std::task::Poll::Pending;
+                    }
+                    future.as_mut().poll(cx)
+                })
+                .await
+            }
+            #[cfg(not(any(target_family = "wasm", test)))]
+            future.await
         }
     }
 
@@ -355,7 +391,8 @@ impl ForegroundExecutor {
     where
         R: 'static,
     {
-        self.inner.spawn(future.boxed_local())
+        self.inner
+            .spawn(self.guard_app_borrow(future).boxed_local())
     }
 
     /// Enqueues the given Task to run on the main thread with the given priority.
@@ -369,7 +406,7 @@ impl ForegroundExecutor {
         R: 'static,
     {
         // Priority is ignored for foreground tasks - they run in order on the main thread
-        self.inner.spawn(future)
+        self.inner.spawn(self.guard_app_borrow(future))
     }
 
     /// On platforms with dedicated support, enqueues the given future to run
@@ -393,14 +430,16 @@ impl ForegroundExecutor {
         let dispatcher = self.dispatcher.clone();
         #[cfg(feature = "profiler")]
         let foreground_runnables = self.foreground_runnables.clone();
-        self.inner
-            .spawn_with_dispatch(future.boxed_local(), move |runnable| {
+        self.inner.spawn_with_dispatch(
+            self.guard_app_borrow(future).boxed_local(),
+            move |runnable| {
                 #[cfg(feature = "profiler")]
                 if let Some(foreground_runnables) = &foreground_runnables {
                     foreground_runnables.queued();
                 }
                 dispatcher.dispatch_on_main_thread_when_idle(runnable, timeout);
-            })
+            },
+        )
     }
 
     /// The time remaining in the current idle slice, when called from a task
@@ -606,5 +645,62 @@ mod test {
             *task_ran.borrow(),
             "Task should run normally when app is alive"
         );
+    }
+
+    #[test]
+    fn foreground_tasks_wait_for_app_borrows() {
+        for mutable in [false, true] {
+            for mode in 0..3 {
+                let (dispatcher, _, app) = create_test_app();
+                let async_cx = app.borrow().to_async();
+                let executor = async_cx.foreground_executor().clone();
+                let task_ran = Rc::new(RefCell::new(false));
+                let future = {
+                    let task_ran = task_ran.clone();
+                    async move { async_cx.update(|_| *task_ran.borrow_mut() = true) }
+                };
+                match mode {
+                    0 => executor.spawn(future),
+                    1 => executor.spawn_with_priority(Priority::High, future),
+                    _ => executor.spawn_when_idle(None, future),
+                }
+                .detach();
+
+                let shared_borrow = (!mutable).then(|| app.borrow());
+                let mutable_borrow = mutable.then(|| app.borrow_mut());
+                dispatcher.run_until_parked();
+                assert!(!*task_ran.borrow());
+                drop(shared_borrow);
+                drop(mutable_borrow);
+                dispatcher.run_until_parked();
+                assert!(*task_ran.borrow());
+            }
+        }
+    }
+
+    #[test]
+    fn foreground_tasks_recheck_app_borrows_after_waking() {
+        let (dispatcher, _, app) = create_test_app();
+        let async_cx = app.borrow().to_async();
+        let task_ran = Rc::new(RefCell::new(false));
+        let (sender, receiver) = futures::channel::oneshot::channel::<()>();
+        async_cx
+            .spawn({
+                let task_ran = task_ran.clone();
+                async move |cx| {
+                    receiver.await.expect("resume task");
+                    cx.update(|_| *task_ran.borrow_mut() = true);
+                }
+            })
+            .detach();
+        dispatcher.run_until_parked();
+
+        let app_borrow = app.borrow_mut();
+        sender.send(()).expect("wake task");
+        dispatcher.run_until_parked();
+        assert!(!*task_ran.borrow());
+        drop(app_borrow);
+        dispatcher.run_until_parked();
+        assert!(*task_ran.borrow());
     }
 }
